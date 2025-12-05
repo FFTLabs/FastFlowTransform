@@ -1,18 +1,17 @@
 # tests/unit/test_testing_unit.py
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
+from fastflowtransform.executors.base import BaseExecutor
 from fastflowtransform.testing.base import (
     TestFailure,
-    _exec,
     _fail,
     _pretty_sql,
     _scalar,
     accepted_values,
-    freshness,
     greater_equal,
     non_negative_sum,
     not_null,
@@ -38,6 +37,29 @@ class _FakeResult:
 
     def fetchall(self) -> list[tuple]:
         return self._rows
+
+
+class _FakeExecutor:
+    """
+    Minimal executor-like helper for tests.
+
+    - execute_test_sql: returns handler(sql)
+    - execute: forwards to execute_test_sql so _scalar/_exec paths work
+    - optional compute_freshness_delay_minutes hook when provided
+    """
+
+    def __init__(self, handler: Any, freshness_handler: Any | None = None):
+        self.handler = handler
+        self.freshness_handler = freshness_handler
+        self.calls: list[Any] = []
+
+    def execute_test_sql(self, sql: Any) -> Any:
+        self.calls.append(sql)
+        return self.handler(sql)
+
+    def execute(self, sql: Any) -> Any:
+        # allow _exec to call .execute on non-executor objects
+        return self.execute_test_sql(sql)
 
 
 # ---------------------------------------------------------------------------
@@ -74,151 +96,22 @@ def test_sql_list_various_types():
 
 
 # ---------------------------------------------------------------------------
-# _exec: branch 1 - connection has .execute
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.unit
-def test_exec_direct_non_sqlalchemy():
-    calls: list[Any] = []
-
-    class FakeCon:
-        def execute(self, sql):
-            calls.append(sql)
-            return _FakeResult([(1,)])
-
-    con = FakeCon()
-    res = _exec(con, "select 1")
-    assert isinstance(res, _FakeResult)
-    assert calls == ["select 1"]
-
-
-@pytest.mark.unit
-def test_exec_direct_sqlalchemy_like_string(monkeypatch):
-    # simulate a SA-like connection (module name contains "sqlalchemy")
-    class FakeSACon:
-        __module__ = "sqlalchemy.engine.mock"
-
-        def __init__(self):
-            self.calls: list[Any] = []
-
-        def execute(self, stmt, params=None):
-            # sqlalchemy.text(...) should have been called
-            self.calls.append((stmt, params))
-            return _FakeResult([(1,)])
-
-    con = FakeSACon()
-    res = _exec(con, "select 1")
-    assert isinstance(res, _FakeResult)
-    # first arg should be a TextClause
-    assert len(con.calls) == 1
-    assert str(con.calls[0][0]).strip().lower().startswith("select 1")
-
-
-@pytest.mark.unit
-def test_exec_direct_sqlalchemy_like_tuple_params():
-    class FakeSACon:
-        __module__ = "sqlalchemy.engine.mock"
-
-        def __init__(self):
-            self.calls: list[Any] = []
-
-        def execute(self, stmt, params=None):
-            self.calls.append((stmt, params))
-            return _FakeResult([(1,)])
-
-    con = FakeSACon()
-    res = _exec(con, ("select :x", {"x": 10}))
-    assert isinstance(res, _FakeResult)
-    assert len(con.calls) == 1
-    sql_obj, params = con.calls[0]
-    assert "select :x" in str(sql_obj).lower()
-    assert params == {"x": 10}
-
-
-# ---------------------------------------------------------------------------
-# _exec: branch 2 - no .execute, but .begin() (SQLAlchemy fallback)
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.unit
-def test_exec_fallback_begin_with_sequence():
-    executed: list[str] = []
-
-    class FakeCtx:
-        def __init__(self, outer):
-            self.outer = outer
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-        def execute(self, stmt, params=None):
-            # stmt may be TextClause
-            if hasattr(stmt, "text"):
-                executed.append(stmt.text)
-            else:
-                executed.append(str(stmt))
-            return _FakeResult([(1,)])
-
-    class FakeCon:
-        def begin(self):
-            return FakeCtx(self)
-
-    con = FakeCon()
-    res = _exec(con, ["select 1", "select 2"])
-    assert isinstance(res, _FakeResult)
-    assert executed == ["select 1", "select 2"]
-
-
-@pytest.mark.unit
-def test_exec_fallback_unsupported_type_raises():
-    class FakeCtx:
-        def __enter__(self):
-            """Enter."""
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            """Exit."""
-            return False
-
-        def execute(self, *_a, **_k):
-            return _FakeResult([])
-
-    class FakeCon:
-        def begin(self):
-            return FakeCtx()
-
-    con = FakeCon()
-    with pytest.raises(TypeError):
-        _exec(con, object())
-
-
-# ---------------------------------------------------------------------------
 # _scalar
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
 def test_scalar_returns_first_value():
-    class FakeCon:
-        def execute(self, sql):
-            return _FakeResult([(42, "x")])
-
-    v = _scalar(FakeCon(), "select 42")
+    execu = _FakeExecutor(lambda sql: _FakeResult([(42, "x")]))
+    v = _scalar(cast(BaseExecutor, execu), "select 42")
     expected_value = 42
     assert v == expected_value
 
 
 @pytest.mark.unit
 def test_scalar_returns_none_on_empty():
-    class FakeCon:
-        def execute(self, sql):
-            return _FakeResult([])
-
-    v = _scalar(FakeCon(), "select 42")
+    execu = _FakeExecutor(lambda sql: _FakeResult([]))
+    v = _scalar(cast(BaseExecutor, execu), "select 42")
     assert v is None
 
 
@@ -231,38 +124,20 @@ def test_scalar_returns_none_on_empty():
 def test_accepted_values_ok():
     # first call: count(*) = 0 → ok
     # second call (sample) should not be executed
-    class FakeCon:
-        def __init__(self):
-            self.calls = 0
-
-        def execute(self, sql):
-            self.calls += 1
-            if "count(*)" in sql:
-                return _FakeResult([(0,)])
-            return _FakeResult([])
-
-    con = FakeCon()
-    accepted_values(con, "tbl", "col", values=["a", "b"])
-    assert con.calls == 1
+    execu = _FakeExecutor(
+        lambda sql: _FakeResult([(0,)]) if "count(*)" in sql else _FakeResult([]),
+    )
+    accepted_values(cast(BaseExecutor, execu), "tbl", "col", values=["a", "b"])
+    assert len(execu.calls) == 1
 
 
 @pytest.mark.unit
 def test_accepted_values_fail_collects_samples():
-    class FakeCon:
-        def __init__(self):
-            self.queries: list[str] = []
-
-        def execute(self, sql):
-            self.queries.append(sql)
-            if "count(*)" in sql:
-                return _FakeResult([(3,)])
-            if "distinct" in sql:
-                return _FakeResult([("X",), ("Y",)])
-            return _FakeResult([])
-
-    con = FakeCon()
+    execu = _FakeExecutor(
+        lambda sql: _FakeResult([(3,)]) if "count(*)" in sql else _FakeResult([("X",), ("Y",)]),
+    )
     with pytest.raises(TestFailure) as exc:
-        accepted_values(con, "x.tbl", "kind", values=["A", "B"])
+        accepted_values(cast(BaseExecutor, execu), "x.tbl", "kind", values=["A", "B"])
     msg = str(exc.value)
     assert "x.tbl.kind has 3 value(s) outside accepted set" in msg
     # should include sample values
@@ -276,33 +151,26 @@ def test_accepted_values_fail_collects_samples():
 
 @pytest.mark.unit
 def test_not_null_ok():
-    class FakeCon:
-        def execute(self, sql):
-            return _FakeResult([(0,)])
-
+    execu = _FakeExecutor(lambda sql: _FakeResult([(0,)]))
     # should not raise
-    not_null(FakeCon(), "tbl", "col")
+    not_null(cast(BaseExecutor, execu), "tbl", "col")
 
 
 @pytest.mark.unit
 def test_not_null_fails_on_nulls():
-    class FakeCon:
-        def execute(self, sql):
-            return _FakeResult([(2,)])
-
+    execu = _FakeExecutor(lambda sql: _FakeResult([(2,)]))
     with pytest.raises(TestFailure) as exc:
-        not_null(FakeCon(), "tbl", "col")
+        not_null(cast(BaseExecutor, execu), "tbl", "col")
     assert "has 2 NULL-values" in str(exc.value)
 
 
 @pytest.mark.unit
 def test_not_null_wraps_db_error():
-    class FakeCon:
-        def execute(self, sql):
-            raise RuntimeError("undefinedcolumn: foo HAVING")
-
+    execu = _FakeExecutor(
+        lambda sql: (_ for _ in ()).throw(RuntimeError("undefinedcolumn: foo HAVING"))
+    )
     with pytest.raises(TestFailure) as exc:
-        not_null(FakeCon(), "tbl", "col")
+        not_null(cast(BaseExecutor, execu), "tbl", "col")
     msg = str(exc.value).lower()
     assert "error in tbl.col" in msg
     assert "undefinedcolumn" in msg
@@ -311,21 +179,15 @@ def test_not_null_wraps_db_error():
 
 @pytest.mark.unit
 def test_unique_ok():
-    class FakeCon:
-        def execute(self, sql):
-            return _FakeResult([(0,)])
-
-    unique(FakeCon(), "tbl", "col")
+    execu = _FakeExecutor(lambda sql: _FakeResult([(0,)]))
+    unique(cast(BaseExecutor, execu), "tbl", "col")
 
 
 @pytest.mark.unit
 def test_unique_fails():
-    class FakeCon:
-        def execute(self, sql):
-            return _FakeResult([(5,)])
-
+    execu = _FakeExecutor(lambda sql: _FakeResult([(5,)]))
     with pytest.raises(TestFailure) as exc:
-        unique(FakeCon(), "tbl", "col")
+        unique(cast(BaseExecutor, execu), "tbl", "col")
     assert "contains 5 duplicates" in str(exc.value)
 
 
@@ -336,92 +198,50 @@ def test_unique_fails():
 
 @pytest.mark.unit
 def test_greater_equal_ok():
-    class FakeCon:
-        def execute(self, sql):
-            # no rows with < threshold
-            return _FakeResult([(0,)])
-
-    greater_equal(FakeCon(), "tbl", "amount", threshold=10)
+    execu = _FakeExecutor(lambda sql: _FakeResult([(0,)]))
+    greater_equal(cast(BaseExecutor, execu), "tbl", "amount", threshold=10)
 
 
 @pytest.mark.unit
 def test_greater_equal_fails():
-    class FakeCon:
-        def execute(self, sql):
-            return _FakeResult([(3,)])
-
+    execu = _FakeExecutor(lambda sql: _FakeResult([(3,)]))
     with pytest.raises(TestFailure) as exc:
-        greater_equal(FakeCon(), "tbl", "amount", threshold=10)
+        greater_equal(cast(BaseExecutor, execu), "tbl", "amount", threshold=10)
     assert "has 3 values < 10" in str(exc.value)
 
 
 @pytest.mark.unit
 def test_non_negative_sum_ok():
-    class FakeCon:
-        def execute(self, sql):
-            return _FakeResult([(0,)])
-
-    non_negative_sum(FakeCon(), "tbl", "amount")
+    execu = _FakeExecutor(lambda sql: _FakeResult([(0,)]))
+    non_negative_sum(cast(BaseExecutor, execu), "tbl", "amount")
 
 
 @pytest.mark.unit
 def test_non_negative_sum_fails():
-    class FakeCon:
-        def execute(self, sql):
-            return _FakeResult([(-5,)])
-
+    execu = _FakeExecutor(lambda sql: _FakeResult([(-5,)]))
     with pytest.raises(TestFailure) as exc:
-        non_negative_sum(FakeCon(), "tbl", "amount")
+        non_negative_sum(cast(BaseExecutor, execu), "tbl", "amount")
     assert "is negative: -5" in str(exc.value)
 
 
 @pytest.mark.unit
 def test_row_count_between_ok():
-    class FakeCon:
-        def execute(self, sql):
-            return _FakeResult([(5,)])
-
-    row_count_between(FakeCon(), "tbl", min_rows=1, max_rows=10)
+    execu = _FakeExecutor(lambda sql: _FakeResult([(5,)]))
+    row_count_between(cast(BaseExecutor, execu), "tbl", min_rows=1, max_rows=10)
 
 
 @pytest.mark.unit
 def test_row_count_between_too_few():
-    class FakeCon:
-        def execute(self, sql):
-            return _FakeResult([(0,)])
-
+    execu = _FakeExecutor(lambda sql: _FakeResult([(0,)]))
     with pytest.raises(TestFailure):
-        row_count_between(FakeCon(), "tbl", min_rows=1)
+        row_count_between(cast(BaseExecutor, execu), "tbl", min_rows=1)
 
 
 @pytest.mark.unit
 def test_row_count_between_too_many():
-    class FakeCon:
-        def execute(self, sql):
-            return _FakeResult([(50,)])
-
+    execu = _FakeExecutor(lambda sql: _FakeResult([(50,)]))
     with pytest.raises(TestFailure):
-        row_count_between(FakeCon(), "tbl", min_rows=1, max_rows=10)
-
-
-@pytest.mark.unit
-def test_freshness_ok():
-    class FakeCon:
-        def execute(self, sql):
-            # pretend last update was 3 min ago
-            return _FakeResult([(3.0,)])
-
-    freshness(FakeCon(), "tbl", "ts", max_delay_minutes=5)
-
-
-@pytest.mark.unit
-def test_freshness_too_old():
-    class FakeCon:
-        def execute(self, sql):
-            return _FakeResult([(99.0,)])
-
-    with pytest.raises(TestFailure):
-        freshness(FakeCon(), "tbl", "ts", max_delay_minutes=10)
+        row_count_between(cast(BaseExecutor, execu), "tbl", min_rows=1, max_rows=10)
 
 
 # ---------------------------------------------------------------------------
@@ -431,13 +251,9 @@ def test_freshness_too_old():
 
 @pytest.mark.unit
 def test_reconcile_equal_exact_ok():
-    class FakeCon:
-        def execute(self, sql):
-            # both scalar_where calls will read this
-            return _FakeResult([(10,)])
-
+    execu = _FakeExecutor(lambda sql: _FakeResult([(10,)]))
     reconcile_equal(
-        FakeCon(),
+        cast(BaseExecutor, execu),
         left={"table": "a", "expr": "sum(x)"},
         right={"table": "b", "expr": "sum(y)"},
     )
@@ -445,18 +261,15 @@ def test_reconcile_equal_exact_ok():
 
 @pytest.mark.unit
 def test_reconcile_equal_abs_tolerance_ok():
-    class FakeCon:
-        def __init__(self):
-            self.calls = 0
+    calls: list[Any] = []
 
-        def execute(self, sql):
-            self.calls += 1
-            if self.calls == 1:
-                return _FakeResult([(10.0,)])
-            return _FakeResult([(11.0,)])
+    def handler(sql):
+        calls.append(sql)
+        return _FakeResult([(10.0,)]) if len(calls) == 1 else _FakeResult([(11.0,)])
 
+    execu = _FakeExecutor(handler)
     reconcile_equal(
-        FakeCon(),
+        cast(BaseExecutor, execu),
         left={"table": "a", "expr": "v"},
         right={"table": "b", "expr": "v"},
         abs_tolerance=1.5,
@@ -465,19 +278,16 @@ def test_reconcile_equal_abs_tolerance_ok():
 
 @pytest.mark.unit
 def test_reconcile_equal_fails():
-    class FakeCon:
-        def __init__(self):
-            self.calls = 0
+    calls: list[Any] = []
 
-        def execute(self, sql):
-            self.calls += 1
-            if self.calls == 1:
-                return _FakeResult([(10.0,)])
-            return _FakeResult([(20.0,)])
+    def handler(sql):
+        calls.append(sql)
+        return _FakeResult([(10.0,)]) if len(calls) == 1 else _FakeResult([(20.0,)])
 
+    execu = _FakeExecutor(handler)
     with pytest.raises(TestFailure):
         reconcile_equal(
-            FakeCon(),
+            cast(BaseExecutor, execu),
             left={"table": "a", "expr": "v"},
             right={"table": "b", "expr": "v"},
         )
@@ -485,19 +295,15 @@ def test_reconcile_equal_fails():
 
 @pytest.mark.unit
 def test_reconcile_ratio_within_ok():
-    class FakeCon:
-        def __init__(self):
-            self.calls = 0
+    calls: list[Any] = []
 
-        def execute(self, sql):
-            self.calls += 1
-            if self.calls == 1:
-                return _FakeResult([(100.0,)])
-            return _FakeResult([(50.0,)])
+    def handler(sql):
+        calls.append(sql)
+        return _FakeResult([(100.0,)]) if len(calls) == 1 else _FakeResult([(50.0,)])
 
-    # ratio = 100 / 50 = 2.0
+    execu = _FakeExecutor(handler)
     reconcile_ratio_within(
-        FakeCon(),
+        cast(BaseExecutor, execu),
         left={"table": "l", "expr": "x"},
         right={"table": "r", "expr": "y"},
         min_ratio=1.5,
@@ -507,15 +313,13 @@ def test_reconcile_ratio_within_ok():
 
 @pytest.mark.unit
 def test_reconcile_ratio_within_fails():
-    class FakeCon:
-        def execute(self, sql):
-            if "from l" in sql:
-                return _FakeResult([(10.0,)])
-            return _FakeResult([(100.0,)])
+    execu = _FakeExecutor(
+        lambda sql: _FakeResult([(10.0,)]) if "from l" in sql else _FakeResult([(100.0,)])
+    )
 
     with pytest.raises(TestFailure):
         reconcile_ratio_within(
-            FakeCon(),
+            cast(BaseExecutor, execu),
             left={"table": "l", "expr": "x"},
             right={"table": "r", "expr": "y"},
             min_ratio=0.5,
@@ -525,18 +329,15 @@ def test_reconcile_ratio_within_fails():
 
 @pytest.mark.unit
 def test_reconcile_diff_within_ok():
-    class FakeCon:
-        def __init__(self):
-            self.calls = 0
+    calls: list[Any] = []
 
-        def execute(self, sql):
-            self.calls += 1
-            if self.calls == 1:
-                return _FakeResult([(50.0,)])
-            return _FakeResult([(53.0,)])
+    def handler(sql):
+        calls.append(sql)
+        return _FakeResult([(50.0,)]) if len(calls) == 1 else _FakeResult([(53.0,)])
 
+    execu = _FakeExecutor(handler)
     reconcile_diff_within(
-        FakeCon(),
+        cast(BaseExecutor, execu),
         left={"table": "l", "expr": "x"},
         right={"table": "r", "expr": "y"},
         max_abs_diff=5.0,
@@ -545,15 +346,13 @@ def test_reconcile_diff_within_ok():
 
 @pytest.mark.unit
 def test_reconcile_diff_within_fails():
-    class FakeCon:
-        def execute(self, sql):
-            if "from l" in sql:
-                return _FakeResult([(10.0,)])
-            return _FakeResult([(25.0,)])
+    execu = _FakeExecutor(
+        lambda sql: _FakeResult([(10.0,)]) if "from l" in sql else _FakeResult([(25.0,)])
+    )
 
     with pytest.raises(TestFailure):
         reconcile_diff_within(
-            FakeCon(),
+            cast(BaseExecutor, execu),
             left={"table": "l", "expr": "x"},
             right={"table": "r", "expr": "y"},
             max_abs_diff=5.0,
@@ -562,13 +361,9 @@ def test_reconcile_diff_within_fails():
 
 @pytest.mark.unit
 def test_reconcile_coverage_ok():
-    class FakeCon:
-        def execute(self, sql):
-            # anti-join count(*) == 0
-            return _FakeResult([(0,)])
-
+    execu = _FakeExecutor(lambda sql: _FakeResult([(0,)]))
     reconcile_coverage(
-        FakeCon(),
+        cast(BaseExecutor, execu),
         source={"table": "src", "key": "id"},
         target={"table": "tgt", "key": "id"},
     )
@@ -576,13 +371,11 @@ def test_reconcile_coverage_ok():
 
 @pytest.mark.unit
 def test_reconcile_coverage_fails():
-    class FakeCon:
-        def execute(self, sql):
-            return _FakeResult([(3,)])
+    execu = _FakeExecutor(lambda sql: _FakeResult([(3,)]))
 
     with pytest.raises(TestFailure):
         reconcile_coverage(
-            FakeCon(),
+            cast(BaseExecutor, execu),
             source={"table": "src", "key": "id"},
             target={"table": "tgt", "key": "id"},
         )
@@ -590,12 +383,10 @@ def test_reconcile_coverage_fails():
 
 @pytest.mark.unit
 def test_relationships_ok():
-    class FakeCon:
-        def execute(self, sql):
-            return _FakeResult([(0,)])
+    execu = _FakeExecutor(lambda sql: _FakeResult([(0,)]))
 
     relationships(
-        FakeCon(),
+        cast(BaseExecutor, execu),
         table="fact_events",
         field="user_id",
         to_table="dim_users",
@@ -605,13 +396,11 @@ def test_relationships_ok():
 
 @pytest.mark.unit
 def test_relationships_fails_on_orphans():
-    class FakeCon:
-        def execute(self, sql):
-            return _FakeResult([(5,)])
+    execu = _FakeExecutor(lambda sql: _FakeResult([(5,)]))
 
     with pytest.raises(TestFailure):
         relationships(
-            FakeCon(),
+            cast(BaseExecutor, execu),
             table="fact_events",
             field="user_id",
             to_table="dim_users",
@@ -621,13 +410,11 @@ def test_relationships_fails_on_orphans():
 
 @pytest.mark.unit
 def test_relationships_wraps_db_errors():
-    class FakeCon:
-        def execute(self, sql):
-            raise RuntimeError("no such column")
+    execu = _FakeExecutor(lambda sql: (_ for _ in ()).throw(RuntimeError("no such column")))
 
     with pytest.raises(TestFailure) as exc:
         relationships(
-            FakeCon(),
+            cast(BaseExecutor, execu),
             table="fact_events",
             field="user_id",
             to_table="dim_users",

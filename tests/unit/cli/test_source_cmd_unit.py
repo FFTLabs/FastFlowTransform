@@ -84,7 +84,7 @@ def test_cli_freshness_error_exit(monkeypatch, capsys):
 
     monkeypatch.setattr(source_cmd, "_prepare_context", fake_prepare_context, raising=True)
 
-    def fake_run_source_freshness(executor, con, engine):
+    def fake_run_source_freshness(executor, engine):
         return [
             SourceFreshnessResult(
                 source_name="crm",

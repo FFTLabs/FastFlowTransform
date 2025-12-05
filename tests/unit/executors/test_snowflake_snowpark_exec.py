@@ -10,7 +10,6 @@ from typing import Any
 import pytest
 
 import fastflowtransform.executors.snowflake_snowpark as sf_mod
-from fastflowtransform.executors.snowflake_snowpark import _SFResult
 
 # ---------------------------------------------------------------------------
 # 1) Install a fake snowflake.snowpark BEFORE importing the executor module
@@ -147,7 +146,6 @@ import fastflowtransform.executors.snowflake_snowpark as sf_exec_mod  # noqa: E4
 from fastflowtransform.core import Node  # noqa: E402
 from fastflowtransform.executors.snowflake_snowpark import (  # noqa: E402
     SnowflakeSnowparkExecutor,
-    _SFCursorShim,
 )
 
 
@@ -184,8 +182,6 @@ def sf_exec(monkeypatch):
 def test_init_sets_db_schema_and_con(sf_exec):
     assert sf_exec.database == "DB1"
     assert sf_exec.schema == "SC1"
-    # con must be present
-    assert isinstance(sf_exec.con, _SFCursorShim)
 
 
 @pytest.mark.unit
@@ -577,9 +573,8 @@ def test_sfcursorshim_execute_returns_rows(sf_exec):
     sf_exec.session.sql = fake_sql  # type: ignore[assignment]
 
     # ACT
-    res = sf_exec.con.execute("SELECT 1")
-
-    # ASSERT
-    assert isinstance(res, _SFResult)
+    res = sf_exec.execute_test_sql("SELECT 1")
     assert res.fetchall() == [(1, "x"), (2, "y")]
+
+    res = sf_exec.execute_test_sql("SELECT 1")
     assert res.fetchone() == (1, "x")

@@ -114,6 +114,24 @@ class ProfileConfigError(FastFlowTransformError):
         super().__init__(message.replace("\n", " ").strip())
 
 
+class ContractsConfigError(FastFlowTransformError):
+    """
+    Raised when a contracts.yml (project-level or per-table) is malformed.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        path: str | None = None,
+        hint: str | None = None,
+        code: str = "CONTRACTS_PARSE",
+    ):
+        prefix = f"{path}: " if path else ""
+        super().__init__(prefix + message, code=code, hint=hint)
+        self.path = path
+
+
 class ModelExecutionError(Exception):
     """Raised when a model fails to execute/render on the engine.
     Carries friendly context for CLI formatting.

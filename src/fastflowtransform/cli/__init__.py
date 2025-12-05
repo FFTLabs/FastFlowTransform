@@ -8,7 +8,6 @@ from fastflowtransform.cache import FingerprintCache
 from fastflowtransform.cli.bootstrap import (
     CLIContext,
     _die,
-    _get_test_con,
     _load_project_and_env,
     _make_executor,
     _parse_cli_vars,
@@ -170,7 +169,6 @@ __all__ = [
     "_build_predicates",
     "_compile_selector",
     "_die",
-    "_get_test_con",
     "_infer_sql_ref_aliases",
     "_load_project_and_env",
     "_make_executor",

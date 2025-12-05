@@ -19,7 +19,7 @@ def test_mix_multiple_tests_per_column(tmp_path: Path):
     )
     (tmp_path / "models" / "u.yml").write_text(
         """
-version: 2
+version: 1
 models:
   - name: u.ff
     columns:
@@ -39,7 +39,7 @@ models:
     ex = DuckExecutor(":memory:")
     ex.run_sql(REGISTRY.get_node("u.ff"), env)
     specs = load_schema_tests(tmp_path)
-    res = _run_dq_tests(ex.con, specs, ex)
+    res = _run_dq_tests(ex, specs)
     # Both should fail with error severity
     assert any((not r.ok) and r.kind == "unique" for r in res)
     assert any((not r.ok) and r.kind == "accepted_values" for r in res)

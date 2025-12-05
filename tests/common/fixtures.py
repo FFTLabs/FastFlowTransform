@@ -45,13 +45,9 @@ except ModuleNotFoundError:  # pragma: no cover - import guard
 
 # Snowflake
 try:
-    from fastflowtransform.executors.snowflake_snowpark import (
-        SnowflakeSnowparkExecutor,
-        _SFCursorShim,
-    )
+    from fastflowtransform.executors.snowflake_snowpark import SnowflakeSnowparkExecutor
 except ModuleNotFoundError:  # pragma: no cover
     SnowflakeSnowparkExecutor = None  # type: ignore[assignment]
-    _SFCursorShim = None  # type: ignore[assignment]
 
 
 # ---- Jinja env ----------------------------------------------------------------
@@ -450,11 +446,6 @@ def snowflake_executor_fake() -> Any:
     # Fake Snowflake session and cursor shim.
     session = FakeSnowflakeSession()
     ex.session = session
-    if _SFCursorShim is not None:
-        ex.con = _SFCursorShim(session)  # type: ignore[arg-type]
-    else:
-        # Cheap fallback if for some reason the shim isn't available
-        ex.con = SimpleNamespace(execute=lambda sql, params=None: None)
 
     return ex
 

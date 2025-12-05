@@ -25,7 +25,7 @@ class MinPositiveShareParams(BaseModel):
 
 @dq_test("min_positive_share", params_model=MinPositiveShareParams)
 def min_positive_share(
-    con: Any,
+    executor: Any,
     table: str,
     column: str | None,
     params: dict[str, Any],
@@ -48,8 +48,8 @@ def min_positive_share(
     else:
         pos_sql = f"select count(*) from {table} where {column} > 0"
 
-    total = testing._scalar(con, total_sql)
-    positives = testing._scalar(con, pos_sql)
+    total = testing._scalar(executor, total_sql)
+    positives = testing._scalar(executor, pos_sql)
 
     example_sql = f"{pos_sql};  -- positives\n{total_sql}; -- total"
 

@@ -2,20 +2,22 @@
 import json
 from collections.abc import Callable, Iterable
 from time import perf_counter
-from typing import Any
+from typing import Any, cast
 
 import pandas as pd
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import ProgrammingError, SQLAlchemyError
+from sqlalchemy.sql import Executable
+from sqlalchemy.sql.elements import ClauseElement
 
 from fastflowtransform.core import Node
 from fastflowtransform.errors import ModelExecutionError, ProfileConfigError
 from fastflowtransform.executors._budget_runner import run_sql_with_budget
-from fastflowtransform.executors._shims import SAConnShim
 from fastflowtransform.executors._snapshot_sql_mixin import SnapshotSqlMixin
 from fastflowtransform.executors._sql_identifier import SqlIdentifierMixin
-from fastflowtransform.executors.base import BaseExecutor
+from fastflowtransform.executors._test_utils import make_fetchable
+from fastflowtransform.executors.base import BaseExecutor, _scalar
 from fastflowtransform.executors.budget import BudgetGuard
 from fastflowtransform.executors.query_stats import QueryStats
 from fastflowtransform.meta import ensure_meta_table, upsert_meta
@@ -54,8 +56,39 @@ class PostgresExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[pd.Dat
                     f"Failed to ensure schema '{self.schema}' exists: {exc}"
                 ) from exc
 
-        # ⇣ fastflowtransform.testing expects executor.con.execute("SQL")
-        self.con = SAConnShim(self.engine, schema=self.schema)
+    def execute_test_sql(self, stmt: Any) -> Any:
+        """
+        Execute lightweight SQL for DQ tests using a transactional connection.
+        """
+
+        def _run_one(s: Any, conn: Connection) -> Any:
+            statement_len = 2
+            if (
+                isinstance(s, tuple)
+                and len(s) == statement_len
+                and isinstance(s[0], str)
+                and isinstance(s[1], dict)
+            ):
+                return conn.execute(text(s[0]), s[1])
+            if isinstance(s, str):
+                return conn.execute(text(s))
+            if isinstance(s, ClauseElement):
+                return conn.execute(cast(Executable, s))
+            if isinstance(s, Iterable) and not isinstance(s, (bytes, bytearray, str)):
+                res = None
+                for item in s:
+                    res = _run_one(item, conn)
+                return res
+            return conn.execute(text(str(s)))
+
+        with self.engine.begin() as conn:
+            self._set_search_path(conn)
+            return make_fetchable(_run_one(stmt, conn))
+
+    def compute_freshness_delay_minutes(self, table: str, ts_col: str) -> tuple[float | None, str]:
+        sql = f"select date_part('epoch', now() - max({ts_col})) / 60.0 as delay_min from {table}"
+        delay = _scalar(self, sql)
+        return (float(delay) if delay is not None else None, sql)
 
     def _execute_sql_core(
         self,
@@ -274,7 +307,7 @@ class PostgresExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[pd.Dat
     def _qualified(self, relname: str, schema: str | None = None) -> str:
         return self._qualify_identifier(relname, schema=schema)
 
-    def _set_search_path(self, conn: Connection | SAConnShim) -> None:
+    def _set_search_path(self, conn: Connection) -> None:
         if self.schema:
             conn.execute(text(f"SET LOCAL search_path = {self._q_ident(self.schema)}"))
 
@@ -636,3 +669,37 @@ class PostgresExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[pd.Dat
                     conn.execute(text(f"DROP VIEW IF EXISTS {qualified} CASCADE"))
                 else:  # table
                     conn.execute(text(f"DROP TABLE IF EXISTS {qualified} CASCADE"))
+
+    def introspect_column_physical_type(self, table: str, column: str) -> str | None:
+        """
+        Postgres: read `data_type` from information_schema.columns for the
+        current schema (or an explicit schema if table is qualified).
+        """
+        if "." in table:
+            schema, table_name = table.split(".", 1)
+        else:
+            schema, table_name = None, table
+
+        if schema:
+            sql = """
+            select data_type
+            from information_schema.columns
+            where lower(table_schema) = lower(:schema)
+              and lower(table_name)   = lower(:table)
+              and lower(column_name)  = lower(:column)
+            limit 1
+            """
+            params = {"schema": schema, "table": table_name, "column": column}
+        else:
+            sql = """
+            select data_type
+            from information_schema.columns
+            where table_schema = current_schema()
+              and lower(table_name)  = lower(:table)
+              and lower(column_name) = lower(:column)
+            limit 1
+            """
+            params = {"table": table_name, "column": column}
+
+        rows = self._execute_sql(sql, params).fetchall()
+        return rows[0][0] if rows else None

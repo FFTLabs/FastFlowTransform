@@ -18,7 +18,7 @@ def test_schema_yaml_runs_basic_checks(tmp_path: Path):
     )
     (tmp_path / "models" / "users.yml").write_text(
         """
-version: 2
+version: 1
 models:
   - name: users.ff
     tags: [batch]
@@ -44,7 +44,7 @@ models:
     specs = load_schema_tests(tmp_path)
     specs = _apply_legacy_tag_filter(specs, ["batch"], legacy_token=True)
 
-    results = _run_dq_tests(ex.con, specs, ex)
+    results = _run_dq_tests(ex, specs)
 
     error_fails = [r for r in results if (not r.ok) and r.severity != "warn"]
     assert error_fails == []

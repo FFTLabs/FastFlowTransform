@@ -17,7 +17,8 @@ from fastflowtransform.core import Node
 from fastflowtransform.executors._budget_runner import run_sql_with_budget
 from fastflowtransform.executors._snapshot_sql_mixin import SnapshotSqlMixin
 from fastflowtransform.executors._sql_identifier import SqlIdentifierMixin
-from fastflowtransform.executors.base import BaseExecutor
+from fastflowtransform.executors._test_utils import make_fetchable
+from fastflowtransform.executors.base import BaseExecutor, _scalar
 from fastflowtransform.executors.budget import BudgetGuard
 from fastflowtransform.meta import ensure_meta_table, upsert_meta
 
@@ -85,6 +86,40 @@ class DuckExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[pd.DataFra
             safe_schema = _q(self.schema)
             self._execute_sql(f"create schema if not exists {safe_schema}")
             self._execute_sql(f"set schema '{self.schema}'")
+
+    def execute_test_sql(self, stmt: Any) -> Any:
+        """
+        Execute lightweight SQL for DQ tests using the underlying DuckDB connection.
+        """
+
+        def _run_one(s: Any) -> Any:
+            statement_len = 2
+            if (
+                isinstance(s, tuple)
+                and len(s) == statement_len
+                and isinstance(s[0], str)
+                and isinstance(s[1], dict)
+            ):
+                return self.con.execute(s[0], s[1])
+            if isinstance(s, str):
+                return self.con.execute(s)
+            if isinstance(s, Iterable) and not isinstance(s, (bytes, bytearray, str)):
+                res = None
+                for item in s:
+                    res = _run_one(item)
+                return res
+            return self.con.execute(str(s))
+
+        return make_fetchable(_run_one(stmt))
+
+    def compute_freshness_delay_minutes(self, table: str, ts_col: str) -> tuple[float | None, str]:
+        now_expr = "cast(now() as timestamp)"
+        sql = (
+            f"select date_part('epoch', {now_expr} - max({ts_col})) "
+            f"/ 60.0 as delay_min from {table}"
+        )
+        delay = _scalar(self, sql)
+        return (float(delay) if delay is not None else None, sql)
 
     def _execute_sql(self, sql: str, *args: Any, **kwargs: Any) -> duckdb.DuckDBPyConnection:
         """
@@ -666,3 +701,43 @@ class DuckExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[pd.DataFra
             self._execute_sql(f"drop view if exists {target}")
         with suppress(Exception):
             self._execute_sql(f"drop table if exists {target}")
+
+    def introspect_column_physical_type(self, table: str, column: str) -> str | None:
+        """
+        DuckDB: read `data_type` from information_schema.columns.
+        """
+        if "." in table:
+            schema, table_name = table.split(".", 1)
+        else:
+            schema, table_name = None, table
+
+        table_lower = table_name.lower()
+        column_lower = column.lower()
+
+        if schema:
+            rows = self._execute_sql(
+                """
+                select data_type
+                from information_schema.columns
+                where lower(table_name)  = lower(?)
+                  and lower(table_schema)= lower(?)
+                  and lower(column_name) = lower(?)
+                order by table_schema, ordinal_position
+                limit 1
+                """,
+                [table_lower, schema.lower(), column_lower],
+            ).fetchall()
+        else:
+            rows = self._execute_sql(
+                """
+                select data_type
+                from information_schema.columns
+                where lower(table_name)  = lower(?)
+                  and lower(column_name) = lower(?)
+                order by table_schema, ordinal_position
+                limit 1
+                """,
+                [table_lower, column_lower],
+            ).fetchall()
+
+        return rows[0][0] if rows else None

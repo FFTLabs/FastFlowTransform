@@ -21,6 +21,7 @@ from fastflowtransform.executors._spark_imports import (
     get_spark_functions,
     get_spark_window,
 )
+from fastflowtransform.executors._test_utils import make_fetchable, rows_to_tuples
 from fastflowtransform.executors.base import BaseExecutor
 from fastflowtransform.executors.budget import BudgetGuard
 from fastflowtransform.logging import echo, echo_debug
@@ -269,8 +270,6 @@ class DatabricksSparkExecutor(BaseExecutor[SDF]):
                 builder = builder.config(catalog_key, _DELTA_CATALOG)
 
         self.spark = self._user_spark or builder.getOrCreate()
-        # Lightweight testing shim so tests can call executor.con.execute("SQL")
-        self.con = _SparkConnShim(self.spark)
         self._registered_path_sources: dict[str, dict[str, Any]] = {}
         self.warehouse_dir = warehouse_path
         self.catalog = catalog
@@ -426,6 +425,33 @@ class DatabricksSparkExecutor(BaseExecutor[SDF]):
         the guard is effectively disabled.
         """
         return self._spark_plan_bytes(sql)
+
+    def execute_test_sql(self, stmt: Any) -> Any:
+        """
+        Execute lightweight SQL for DQ tests via Spark and return fetchable rows.
+        """
+
+        def _run_one(s: Any) -> Any:
+            if isinstance(s, str):
+                return rows_to_tuples(self.spark.sql(s).collect())
+            if isinstance(s, Iterable) and not isinstance(s, (bytes, bytearray, str)):
+                res = None
+                for item in s:
+                    res = _run_one(item)
+                return res
+            return rows_to_tuples(self.spark.sql(str(s)).collect())
+
+        return make_fetchable(_run_one(stmt))
+
+    def compute_freshness_delay_minutes(self, table: str, ts_col: str) -> tuple[float | None, str]:
+        sql = (
+            f"select (unix_timestamp(current_timestamp()) - unix_timestamp(max({ts_col}))) / 60.0 "
+            f"as delay_min from {table}"
+        )
+        res = self.execute_test_sql(sql)
+        row = getattr(res, "fetchone", lambda: None)()
+        val = row[0] if row else None
+        return (float(val) if val is not None else None, sql)
 
     def _execute_sql(self, sql: str) -> SDF:
         """
@@ -1293,45 +1319,21 @@ class DatabricksSparkExecutor(BaseExecutor[SDF]):
         with suppress(Exception):
             self._execute_sql(f"DROP TABLE IF EXISTS {ident}")
 
+    def introspect_column_physical_type(self, table: str, column: str) -> str | None:
+        """
+        Spark: use DataFrame schema for `table` and return the Spark SQL type
+        (simpleString) for the given column, uppercased.
+        """
+        physical = self._physical_identifier(table)
+        df = self.spark.table(physical)
 
-# ────────────────────────── local helpers / shim ──────────────────────────
-class _SparkResult:
-    """Tiny result shim to mimic duckdb/psycopg fetch API in tests."""
-
-    def __init__(self, rows: list[tuple]):
-        self._rows = rows
-
-    def fetchall(self) -> list[tuple]:
-        return self._rows
-
-    def fetchone(self) -> tuple | None:
-        return self._rows[0] if self._rows else None
-
-
-class _SparkConnShim:  # pragma: no cover
-    """Provide .execute(sql) with fetch* for test utilities."""
-
-    def __init__(self, spark: SparkSession):
-        self._spark = spark
-
-    def execute(self, sql: str, params: Any | None = None) -> _SparkResult:
-        if params:
-            # Minimal positional param interpolation for tests is intentionally not implemented.
-            # All internal calls use plain SQL strings for Spark.
-            raise NotImplementedError("SparkConnShim does not support parametrized SQL")
-        df = self._spark.sql(sql)
-        rows = [tuple(r) for r in df.collect()]
-        return _SparkResult(rows)
-
-
-def _split_db_table(qualified: str) -> tuple[str | None, str]:
-    """
-    Split "db.table" → (db, table); backticks allowed.
-    Returns (None, name) if unqualified.
-    """
-    s = qualified.strip("`")
-    parts = s.split(".")
-    part_len = 2
-    if len(parts) >= part_len:
-        return parts[-2], parts[-1]
-    return None, s
+        col_lower = column.lower()
+        for field in df.schema.fields:
+            if field.name.lower() == col_lower:
+                dt = field.dataType
+                try:
+                    # e.g. "bigint", "string", "timestamp"
+                    return dt.simpleString().upper()
+                except Exception:
+                    return str(dt)
+        return None

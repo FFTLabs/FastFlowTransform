@@ -1,0 +1,19 @@
+version: 1
+
+defaults:
+  columns:
+    - match:
+        name: ".*_id$"
+      type: integer
+      nullable: false
+
+    - match:
+        name: "created_at"
+      type: timestamp
+      nullable: false
+
+    - match:
+        name: ".*_ts$"
+      type: timestamp
+      nullable: true
+      description: "Timestamp-like but allowed to be null in some pipelines"

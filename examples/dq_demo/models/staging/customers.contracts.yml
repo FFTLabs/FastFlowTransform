@@ -1,0 +1,46 @@
+version: 1
+table: customers
+
+columns:
+  customer_id:
+    type: integer
+    nullable: false
+    physical:
+      duckdb: integer
+      postgres: integer
+      bigquery: INT64
+      snowflake_snowpark: NUMBER
+      databricks_spark: INT
+
+  name:
+    type: string
+    nullable: false
+    physical:
+      duckdb: VARCHAR
+      postgres: text
+      bigquery: STRING
+      snowflake_snowpark: TEXT
+      databricks_spark: STRING
+
+  status:
+    type: string
+    nullable: false
+    enum:
+      - active
+      - inactive
+    physical:
+      duckdb: VARCHAR
+      postgres: text
+      bigquery: STRING
+      snowflake_snowpark: TEXT
+      databricks_spark: STRING
+
+  created_at:
+    type: timestamp
+    nullable: false
+    physical:
+      duckdb: TIMESTAMP
+      postgres: timestamp without time zone
+      bigquery: TIMESTAMP
+      snowflake_snowpark: TIMESTAMP_NTZ
+      databricks_spark: TIMESTAMP

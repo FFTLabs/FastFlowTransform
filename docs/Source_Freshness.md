@@ -33,7 +33,7 @@ Freshness rules are attached to source tables in your metadata (conceptually alo
 A minimal example:
 
 ```yaml
-version: 2
+version: 1
 sources:
   - name: crm
     schema: raw

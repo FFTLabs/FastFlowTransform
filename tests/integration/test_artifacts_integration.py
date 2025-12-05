@@ -22,7 +22,7 @@ def test_artifacts_all_written(tmp_path: Path):
         "create or replace table m as select 1 as id", encoding="utf-8"
     )
     (tmp_path / "sources.yml").write_text(
-        "version: 2\nsources: []\n",
+        "version: 1\nsources: []\n",
         encoding="utf-8",
     )
 

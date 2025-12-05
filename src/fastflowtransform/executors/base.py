@@ -84,6 +84,12 @@ def _load_callable(path: str) -> Callable[..., Any]:
     return fn
 
 
+def _scalar(executor: BaseExecutor, sql: Any) -> Any:
+    """Execute SQL and return the first column of the first row (or None)."""
+    row = executor.execute_test_sql(sql).fetchone()
+    return None if row is None else row[0]
+
+
 # Frame type (pandas.DataFrame, pyspark.sql.DataFrame, snowflake.snowpark.DataFrame, ...)
 TFrame = TypeVar("TFrame")
 
@@ -430,6 +436,28 @@ class BaseExecutor[TFrame](ABC):
         """
         Engine-specific SQL execution hook used by shared helpers (snapshots, pruning, etc.).
         Concrete executors override this with their own signatures and semantics.
+        """
+        raise NotImplementedError
+
+    def execute_test_sql(self, stmt: Any) -> Any:  # pragma: no cover - abstract
+        """
+        Execute a lightweight SQL statement for DQ tests.
+
+        Implementations should accept:
+          - str
+          - (str, params dict)
+          - ClauseElement (optional, where supported)
+          - Sequence of the above (executed sequentially; return last result)
+        and return an object supporting .fetchone() / .fetchall().
+        """
+        raise NotImplementedError
+
+    def compute_freshness_delay_minutes(self, table: str, ts_col: str) -> tuple[float | None, str]:
+        """
+        Compute delay in minutes between now and max(ts_col) for a relation.
+
+        Returns (delay_minutes, sql_used).
+        Default implementation is not provided; executors implement engine-specific logic.
         """
         raise NotImplementedError
 
@@ -1089,6 +1117,20 @@ class BaseExecutor[TFrame](ABC):
         Default: no-op.
         """
         return
+
+    # ── Column schema introspection hook ────────────────────────────────
+    def introspect_column_physical_type(self, table: str, column: str) -> str | None:
+        """
+        Return the engine's physical data type for `table.column`, or None
+        if it cannot be determined.
+
+        Subclasses should override this. Default implementation raises so
+        callers can surface a clear "engine not supported" message.
+        """
+        raise NotImplementedError(
+            f"Column physical type introspection is not implemented for "
+            f"engine '{self.engine_name}'."
+        )
 
     ENGINE_NAME: str = "generic"
 

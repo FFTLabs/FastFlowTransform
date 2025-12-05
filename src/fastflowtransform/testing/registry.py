@@ -7,6 +7,7 @@ from typing import Any, Protocol
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from fastflowtransform.core import REGISTRY
+from fastflowtransform.executors.base import BaseExecutor
 from fastflowtransform.logging import get_logger
 from fastflowtransform.testing import base as testing
 from fastflowtransform.testing.base import _scalar
@@ -26,18 +27,13 @@ class Runner(Protocol):
     __name__: str
 
     def __call__(
-        self, con: Any, table: str, column: str | None, params: dict[str, Any]
+        self, executor: BaseExecutor, table: str, column: str | None, params: dict[str, Any]
     ) -> tuple[bool, str | None, str | None]: ...
 
 
 # ---------------------------------------------------------------------------
 # Helper
 # ---------------------------------------------------------------------------
-
-
-def _example_where(where: str | None) -> str:
-    """Return a ' where (...)' suffix if where is provided, otherwise empty string."""
-    return f" where ({where})" if where else ""
 
 
 def _format_param_validation_error(
@@ -71,7 +67,7 @@ def _format_param_validation_error(
 
 
 def run_not_null(
-    con: Any, table: str, column: str | None, params: dict[str, Any]
+    executor: Any, table: str, column: str | None, params: dict[str, Any]
 ) -> tuple[bool, str | None, str | None]:
     where = params.get("where")
     example = f"select count(*) from {table} where {column} is null" + (
@@ -82,14 +78,14 @@ def run_not_null(
         return False, "missing required parameter: column", example
     col = column
     try:
-        testing.not_null(con, table, col, where=where)
+        testing.not_null(executor, table, col, where=where)
         return True, None, example
     except testing.TestFailure as e:
         return False, str(e), example
 
 
 def run_unique(
-    con: Any, table: str, column: str | None, params: dict[str, Any]
+    executor: Any, table: str, column: str | None, params: dict[str, Any]
 ) -> tuple[bool, str | None, str | None]:
     where = params.get("where")
     example = (
@@ -101,14 +97,14 @@ def run_unique(
         return False, "missing required parameter: column", example
     col = column
     try:
-        testing.unique(con, table, col, where=where)
+        testing.unique(executor, table, col, where=where)
         return True, None, example
     except testing.TestFailure as e:
         return False, str(e), example
 
 
 def run_accepted_values(
-    con: Any, table: str, column: str | None, params: dict[str, Any]
+    executor: Any, table: str, column: str | None, params: dict[str, Any]
 ) -> tuple[bool, str | None, str | None]:
     """Runner for testing.accepted_values."""
     values = params.get("values") or []
@@ -133,14 +129,14 @@ def run_accepted_values(
 
     col = column
     try:
-        testing.accepted_values(con, table, col, values=values, where=where)
+        testing.accepted_values(executor, table, col, values=values, where=where)
         return True, None, example
     except testing.TestFailure as e:
         return False, str(e), example
 
 
 def run_greater_equal(
-    con: Any, table: str, column: str | None, params: dict[str, Any]
+    executor: Any, table: str, column: str | None, params: dict[str, Any]
 ) -> tuple[bool, str | None, str | None]:
     """Runner for testing.greater_equal (column >= threshold)."""
     threshold = float(params.get("threshold", 0.0))
@@ -151,14 +147,117 @@ def run_greater_equal(
     example = f"select count(*) from {table} where {column} < {threshold}"
     col = column
     try:
-        testing.greater_equal(con, table, col, threshold=threshold)
+        testing.greater_equal(executor, table, col, threshold=threshold)
+        return True, None, example
+    except testing.TestFailure as e:
+        return False, str(e), example
+
+
+def run_between(
+    executor: Any, table: str, column: str | None, params: dict[str, Any]
+) -> tuple[bool, str | None, str | None]:
+    """Runner for testing.between (inclusive numeric range)."""
+    if column is None:
+        example = f"select count(*) from {table} where <column> < <min> or <column> > <max>"
+        return False, "missing required parameter: column", example
+
+    min_val = params.get("min")
+    max_val = params.get("max")
+
+    if min_val is None and max_val is None:
+        example = f"-- between: no min/max provided for {table}.{column}"
+        return (
+            False,
+            "between test requires at least one of 'min' or 'max'",
+            example,
+        )
+
+    conds: list[str] = []
+    if min_val is not None:
+        conds.append(f"{column} < {min_val}")
+    if max_val is not None:
+        conds.append(f"{column} > {max_val}")
+    where_expr = " or ".join(conds)
+    example = f"select count(*) from {table} where {column} is not null and ({where_expr})"
+
+    col = column
+    try:
+        testing.between(
+            executor,
+            table,
+            col,
+            min_value=min_val,
+            max_value=max_val,
+        )
+        return True, None, example
+    except testing.TestFailure as e:
+        return False, str(e), example
+
+
+def run_regex_match(
+    executor: Any, table: str, column: str | None, params: dict[str, Any]
+) -> tuple[bool, str | None, str | None]:
+    """Runner for testing.regex_match (Python-side regex evaluation)."""
+    pattern = params.get("pattern") or params.get("regex")
+    where = params.get("where")
+
+    if column is None:
+        example = f"select {column or '<column>'} from {table}"
+        return False, "missing required parameter: column", example
+
+    if not pattern:
+        example = f"select {column} from {table}  -- pattern missing"
+        return False, "missing required parameter: pattern", example
+
+    example = f"select {column} from {table}"
+    if where:
+        example += f" where ({where})"
+
+    col = column
+    try:
+        testing.regex_match(
+            executor,
+            table,
+            col,
+            pattern=str(pattern),
+            where=where,
+        )
+        return True, None, example
+    except testing.TestFailure as e:
+        return False, str(e), example
+
+
+def run_column_physical_type(
+    executor: Any, table: str, column: str | None, params: dict[str, Any]
+) -> tuple[bool, str | None, str | None]:
+    """
+    Runner for testing.column_physical_type (schema/DDL assertion).
+
+    Params:
+      - physical: string or mapping {engine_key: type, default: type}
+    """
+    physical_cfg = params.get("physical")
+
+    if column is None:
+        example = "-- column_physical_type: column parameter is required"
+        return False, "missing required parameter: column", example
+
+    if physical_cfg is None:
+        # Nothing to enforce; treat as noop (passes).
+        example = f"-- column_physical_type: no 'physical' configured for {table}.{column}"
+        return True, None, example
+
+    example = f"-- physical type check for {table}.{column} via information_schema.columns"
+
+    try:
+        testing.column_physical_type(executor, table, column, physical_cfg)
         return True, None, example
     except testing.TestFailure as e:
         return False, str(e), example
 
 
 def run_non_negative_sum(
-    con: Any, table: str, column: str | None, params: dict[str, Any]
+    executor: Any, table: str, column: str | None, params: dict[str, Any]
 ) -> tuple[bool, str | None, str | None]:
     """Runner for testing.non_negative_sum."""
     if column is None:
@@ -168,7 +267,7 @@ def run_non_negative_sum(
     example = f"select coalesce(sum({column}), 0) from {table}"
     col = column
     try:
-        testing.non_negative_sum(con, table, col)
+        testing.non_negative_sum(executor, table, col)
         return True, None, example
     except testing.TestFailure as e:
         return False, str(e), example
@@ -180,7 +279,7 @@ def run_non_negative_sum(
 
 
 def run_row_count_between(
-    con: Any, table: str, column: str | None, params: dict[str, Any]
+    executor: Any, table: str, column: str | None, params: dict[str, Any]
 ) -> tuple[bool, str | None, str | None]:
     """Runner for testing.row_count_between."""
     min_rows = int(params.get("min_rows", 1))
@@ -189,14 +288,14 @@ def run_row_count_between(
 
     example = f"select count(*) from {table}"
     try:
-        testing.row_count_between(con, table, min_rows=min_rows, max_rows=max_rows)
+        testing.row_count_between(executor, table, min_rows=min_rows, max_rows=max_rows)
         return True, None, example
     except testing.TestFailure as e:
         return False, str(e), example
 
 
 def run_freshness(
-    con: Any, table: str, column: str | None, params: dict[str, Any]
+    executor: Any, table: str, column: str | None, params: dict[str, Any]
 ) -> tuple[bool, str | None, str | None]:
     """Runner for testing.freshness (max timestamp delay in minutes)."""
     if column is None:
@@ -222,7 +321,7 @@ def run_freshness(
 
     col = column
     try:
-        testing.freshness(con, table, col, max_delay_minutes=max_delay_int)
+        testing.freshness(executor, table, col, max_delay_minutes=max_delay_int)
         return True, None, example
     except testing.TestFailure as e:
         return False, str(e), example
@@ -291,7 +390,7 @@ where p.k is null
 
 
 def run_reconcile_equal(
-    con: Any, table: str, column: str | None, params: dict[str, Any]
+    executor: Any, table: str, column: str | None, params: dict[str, Any]
 ) -> tuple[bool, str | None, str | None]:
     """Runner for testing.reconcile_equal (left == right within tolerances)."""
     left = params.get("left")
@@ -307,7 +406,7 @@ def run_reconcile_equal(
 
     try:
         testing.reconcile_equal(
-            con,
+            executor,
             left=left,
             right=right,
             abs_tolerance=abs_tol,
@@ -319,7 +418,7 @@ def run_reconcile_equal(
 
 
 def run_reconcile_ratio_within(
-    con: Any, table: str, column: str | None, params: dict[str, Any]
+    executor: Any, table: str, column: str | None, params: dict[str, Any]
 ) -> tuple[bool, str | None, str | None]:
     """Runner for testing.reconcile_ratio_within (min_ratio <= L/R <= max_ratio)."""
     left = params.get("left")
@@ -339,7 +438,7 @@ def run_reconcile_ratio_within(
 
     try:
         testing.reconcile_ratio_within(
-            con,
+            executor,
             left=left,
             right=right,
             min_ratio=float(min_ratio),
@@ -351,7 +450,7 @@ def run_reconcile_ratio_within(
 
 
 def run_reconcile_diff_within(
-    con: Any, table: str, column: str | None, params: dict[str, Any]
+    executor: Any, table: str, column: str | None, params: dict[str, Any]
 ) -> tuple[bool, str | None, str | None]:
     """Runner for testing.reconcile_diff_within (|L - R| <= max_abs_diff)."""
     left = params.get("left")
@@ -370,7 +469,7 @@ def run_reconcile_diff_within(
 
     try:
         testing.reconcile_diff_within(
-            con,
+            executor,
             left=left,
             right=right,
             max_abs_diff=float(max_abs_diff),
@@ -381,7 +480,7 @@ def run_reconcile_diff_within(
 
 
 def run_reconcile_coverage(
-    con: Any, table: str, column: str | None, params: dict[str, Any]
+    executor: Any, table: str, column: str | None, params: dict[str, Any]
 ) -> tuple[bool, str | None, str | None]:
     """Runner for testing.reconcile_coverage (anti-join count == 0)."""
     source = params.get("source")
@@ -397,7 +496,7 @@ def run_reconcile_coverage(
 
     try:
         testing.reconcile_coverage(
-            con,
+            executor,
             source=source,
             target=target,
             source_where=source_where,
@@ -409,7 +508,7 @@ def run_reconcile_coverage(
 
 
 def run_relationships(
-    con: Any, table: str, column: str | None, params: dict[str, Any]
+    executor: Any, table: str, column: str | None, params: dict[str, Any]
 ) -> tuple[bool, str | None, str | None]:
     """Runner for testing.relationships (FK-style anti join)."""
     field = params.get("field") or column
@@ -429,7 +528,7 @@ def run_relationships(
 
     try:
         testing.relationships(
-            con,
+            executor,
             table=table,
             field=field,
             to_table=to_table,
@@ -471,6 +570,10 @@ TESTS: dict[str, Runner] = {
     "reconcile_ratio_within": run_reconcile_ratio_within,
     "reconcile_diff_within": run_reconcile_diff_within,
     "reconcile_coverage": run_reconcile_coverage,
+    # Contracts helpers
+    "between": run_between,
+    "regex_match": run_regex_match,
+    "column_physical_type": run_column_physical_type,
 }
 
 
@@ -557,7 +660,7 @@ def register_sql_test(
     META_KEYS = {"type", "table", "column", "severity", "tags", "name"}
 
     def _runner(
-        con: Any, table: str, column: str | None, params: dict[str, Any]
+        executor: Any, table: str, column: str | None, params: dict[str, Any]
     ) -> tuple[bool, str | None, str | None]:
         # 1) Strip generic test metadata and validate params if a schema is provided
         raw_params: dict[str, Any] = dict(params or {})
@@ -596,7 +699,7 @@ def register_sql_test(
             ) from exc
 
         # 3) Execute the SQL: convention here is "fail if count(*) > 0"
-        n = _scalar(con, sql)
+        n = _scalar(executor, sql)
         ok = int(n or 0) == 0
         msg: str | None = None if ok else f"{kind} failed: {n} offending row(s)"
         example_sql = sql

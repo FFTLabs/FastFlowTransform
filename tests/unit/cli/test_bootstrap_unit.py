@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import datetime
 from pathlib import Path
-from types import SimpleNamespace
 from typing import cast
 
 import pytest
@@ -244,31 +243,3 @@ def test_resolve_project_path_missing_models(tmp_path: Path):
     # no models/ → should raise
     with pytest.raises(bootstrap.typer.BadParameter):
         bootstrap._resolve_project_path(str(tmp_path))
-
-
-# ---------------------------------------------------------------------------
-# _get_test_con - just smoke test
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.unit
-def test_get_test_con_prefers_executor_con():
-    class ExecWithCon:
-        def __init__(self):
-            self.con = SimpleNamespace(execute=lambda *_: "ok")
-
-    ex = ExecWithCon()
-    con = bootstrap._get_test_con(ex)
-    assert con.execute("SELECT 1") == "ok"
-
-
-@pytest.mark.unit
-def test_get_test_con_falls_back_to_executor():
-    class ExecSimple:
-        def run(self):
-            return "ran"
-
-    ex = ExecSimple()
-    con = bootstrap._get_test_con(ex)
-    # we just get the executor back
-    assert con is ex

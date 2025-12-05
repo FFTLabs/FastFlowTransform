@@ -1,12 +1,13 @@
 # fastflowtransform/executors/bigquery/base.py
 from __future__ import annotations
 
-from typing import TypeVar
+from collections.abc import Iterable
+from typing import Any, TypeVar
 
 from fastflowtransform.core import Node, relation_for
 from fastflowtransform.executors._budget_runner import run_sql_with_budget
-from fastflowtransform.executors._shims import BigQueryConnShim
 from fastflowtransform.executors._snapshot_sql_mixin import SnapshotSqlMixin
+from fastflowtransform.executors._test_utils import make_fetchable
 from fastflowtransform.executors.base import BaseExecutor
 from fastflowtransform.executors.bigquery._bigquery_mixin import BigQueryIdentifierMixin
 from fastflowtransform.executors.budget import BudgetGuard
@@ -54,13 +55,62 @@ class BigQueryBaseExecutor(BigQueryIdentifierMixin, SnapshotSqlMixin, BaseExecut
             project=self.project,
             location=self.location,
         )
-        # Testing-API: con.execute(...)
-        self.con = BigQueryConnShim(
-            self.client,
-            location=self.location,
-            project=self.project,
-            dataset=self.dataset,
+
+    def execute_test_sql(self, stmt: Any) -> Any:
+        """
+        Execute lightweight SQL for DQ tests using the BigQuery client.
+        """
+
+        def _infer_param_type(value: Any) -> str:
+            if isinstance(value, bool):
+                return "BOOL"
+            if isinstance(value, int) and not isinstance(value, bool):
+                return "INT64"
+            if isinstance(value, float):
+                return "FLOAT64"
+            return "STRING"
+
+        def _run_job(sql: str, params: dict[str, Any] | None = None) -> Any:
+            job_config = bigquery.QueryJobConfig()
+            if self.dataset:
+                job_config.default_dataset = bigquery.DatasetReference(self.project, self.dataset)
+            if params:
+                job_config.query_parameters = [
+                    bigquery.ScalarQueryParameter(k, _infer_param_type(v), v)
+                    for k, v in params.items()
+                ]
+            return self.client.query(sql, job_config=job_config, location=self.location)
+
+        def _run_one(s: Any) -> Any:
+            statement_len = 2
+            if (
+                isinstance(s, tuple)
+                and len(s) == statement_len
+                and isinstance(s[0], str)
+                and isinstance(s[1], dict)
+            ):
+                return _run_job(s[0], s[1]).result()
+            if isinstance(s, str):
+                # Use guarded execution path for simple statements
+                return self._execute_sql(s).result()
+            if isinstance(s, Iterable) and not isinstance(s, (bytes, bytearray, str)):
+                res = None
+                for item in s:
+                    res = _run_one(item)
+                return res
+            return _run_job(str(s)).result()
+
+        return make_fetchable(_run_one(stmt))
+
+    def compute_freshness_delay_minutes(self, table: str, ts_col: str) -> tuple[float | None, str]:
+        sql = (
+            f"select cast(TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), max({ts_col}), MINUTE) as float64) "
+            f"as delay_min from {table}"
         )
+        res = self.execute_test_sql(sql)
+        delay = getattr(res, "fetchone", lambda: None)()
+        val = delay[0] if delay else None
+        return (float(val) if val is not None else None, sql)
 
     def _execute_sql(self, sql: str) -> _TrackedQueryJob:
         """
@@ -333,3 +383,54 @@ class BigQueryBaseExecutor(BigQueryIdentifierMixin, SnapshotSqlMixin, BaseExecut
         Execute one SQL statement for pre/post/on_run hooks.
         """
         self._execute_sql(sql).result()
+
+    def introspect_column_physical_type(self, table: str, column: str) -> str | None:
+        """
+        BigQuery: read DATA_TYPE from INFORMATION_SCHEMA.COLUMNS, handling qualified names.
+        """
+        project = self.project
+        dataset = self.dataset
+        table_name = table
+
+        parts = table.split(".")
+        if len(parts) == 3:
+            project, dataset, table_name = parts
+        elif len(parts) == 2:
+            dataset, table_name = parts
+
+        table_name = table_name.strip("`")
+        dataset = dataset.strip("`") if dataset else dataset
+        project = project.strip("`") if project else project
+
+        if not table_name:
+            return None
+
+        sql = """
+        select data_type
+        from `{catalog}.{schema}.INFORMATION_SCHEMA.COLUMNS`
+        where lower(table_name) = lower(@t)
+          and lower(column_name) = lower(@c)
+        limit 1
+        """
+        sql = sql.format(
+            catalog=project or self.project,
+            schema=dataset or self.dataset,
+        )
+
+        job = self.client.query(
+            sql,
+            job_config=bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ScalarQueryParameter("t", "STRING", table_name),
+                    bigquery.ScalarQueryParameter("c", "STRING", column),
+                ],
+                default_dataset=bigquery.DatasetReference(
+                    project or self.project, dataset or self.dataset
+                ),
+            ),
+            location=self.location,
+        )
+        rows = list(job.result())
+        if not rows:
+            return None
+        return rows[0][0]

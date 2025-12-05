@@ -1,0 +1,12 @@
+version: 1
+table: orders
+
+columns:
+  order_id:
+    type: integer
+
+  customer_id:
+    type: integer
+
+  order_ts:
+    type: timestamp

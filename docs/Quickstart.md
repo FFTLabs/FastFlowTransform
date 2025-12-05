@@ -47,7 +47,7 @@ pip install -e .[full]
 ```bash
 mkdir -p demo/{models,seeds}
 cat <<'YAML' > demo/sources.yml
-version: 2
+version: 1
 
 sources:
   - name: raw

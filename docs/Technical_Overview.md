@@ -142,7 +142,7 @@ CLI (Typer)
 ├── Executors (executors/*)
 │   ├── BaseExecutor (SQL rendering, dependency loading, materialization, requires guard)
 │   ├── DuckExecutor (DuckDB)
-│   ├── PostgresExecutor (SQLAlchemy, shims)
+│   ├── PostgresExecutor (SQLAlchemy)
 │   ├── BigQueryExecutor (pandas)
 │   ├── BigQueryBFExecutor (BigQuery DataFrames / bigframes)
 │   ├── DatabricksSparkExecutor (PySpark, without pandas)
@@ -256,7 +256,6 @@ class BaseExecutor(ABC):
 
 **Postgres (`postgres.py`)**
 
-- `_SAConnShim` (compatible with `testing._exec`).
 - `run_sql` renders SQL and rewrites `CREATE OR REPLACE TABLE` to `DROP + CREATE AS`.
 - `_read_relation` uses pandas, handles schemas, and provides clear guidance.
 - `_materialize_relation` writes via `to_sql(if_exists="replace")`.

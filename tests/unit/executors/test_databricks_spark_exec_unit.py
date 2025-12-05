@@ -9,10 +9,6 @@ import pytest
 
 from fastflowtransform.core import REGISTRY, Node
 from fastflowtransform.executors import databricks_spark as mod
-from fastflowtransform.executors.databricks_spark import (
-    _SparkConnShim,
-    _split_db_table,
-)
 from fastflowtransform.table_formats.spark_iceberg import IcebergFormatHandler
 
 
@@ -38,14 +34,6 @@ def test_non_delta_leaves_catalog_unset(exec_factory):
     _, fake_builder, _ = exec_factory(table_format="parquet")
     catalog_values = _config_values(fake_builder, "spark.sql.catalog.spark_catalog")
     assert catalog_values == []
-
-
-@pytest.mark.unit
-@pytest.mark.databricks_spark
-def test_split_db_table_unit():
-    assert _split_db_table("db.tbl") == ("db", "tbl")
-    assert _split_db_table("`db`.`tbl`") == ("db`", "`tbl")
-    assert _split_db_table("tbl") == (None, "tbl")
 
 
 @pytest.mark.unit
@@ -325,19 +313,6 @@ def test_on_node_built_raises_on_meta_failure(exec_minimal, monkeypatch):
 
     with pytest.raises(RuntimeError):
         exec_minimal.on_node_built(node, "demo_tbl", "abc123")
-
-
-@pytest.mark.unit
-@pytest.mark.databricks_spark
-def test_spark_conn_shim_execute_runs_select(monkeypatch):
-    """_SparkConnShim.execute should return rows collected from spark.sql."""
-    fake_spark = MagicMock()
-    fake_spark.sql.return_value.collect.return_value = [("a",), ("b",)]
-    shim = _SparkConnShim(fake_spark)
-
-    res = shim.execute("SELECT 'a'")
-    assert res.fetchall() == [("a",), ("b",)]
-    assert res.fetchone() == ("a",)
 
 
 @pytest.mark.unit

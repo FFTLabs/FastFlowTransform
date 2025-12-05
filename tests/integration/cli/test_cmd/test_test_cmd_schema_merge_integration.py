@@ -32,7 +32,7 @@ tests:
     )
     (tmp_path / "models" / "users.yml").write_text(
         """
-version: 2
+version: 1
 models:
   - name: users.ff
     tags: [schema]
@@ -64,9 +64,9 @@ models:
     schema_specs = load_schema_tests(tmp_path)
 
     legacy_only = _apply_legacy_tag_filter(legacy + schema_specs, ["legacy"], legacy_token=True)
-    res_legacy = _run_dq_tests(ex.con, legacy_only, ex)
+    res_legacy = _run_dq_tests(ex, legacy_only)
     assert all(r.ok for r in res_legacy)
 
     schema_only = _apply_legacy_tag_filter(legacy + schema_specs, ["schema"], legacy_token=True)
-    res_schema = _run_dq_tests(ex.con, schema_only, ex)
+    res_schema = _run_dq_tests(ex, schema_only)
     assert all(r.ok or r.severity == "warn" for r in res_schema)

@@ -144,7 +144,7 @@ Allowed values are case-insensitive strings or tuples. If the engine does not ma
 
 ```yaml
 # sources.yml
-version: 2
+version: 1
 
 sources:
   - name: crm

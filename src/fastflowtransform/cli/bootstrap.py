@@ -16,7 +16,6 @@ from jinja2 import Environment
 from fastflowtransform.config.budgets import BudgetsConfig, load_budgets_config
 from fastflowtransform.core import REGISTRY
 from fastflowtransform.errors import DependencyNotFoundError
-from fastflowtransform.executors._shims import BigQueryConnShim, SAConnShim
 from fastflowtransform.executors.base import BaseExecutor
 from fastflowtransform.logging import echo
 from fastflowtransform.settings import (
@@ -36,7 +35,7 @@ class CLIContext:
     profile: Profile
     budgets_cfg: BudgetsConfig | None = None
 
-    def make_executor(self) -> tuple[Any, Callable, Callable]:
+    def make_executor(self) -> tuple[BaseExecutor, Callable, Callable]:
         executor, run_sql, run_py = _make_executor(self.profile, self.jinja_env)
         self._configure_budget_limit(executor)
         return executor, run_sql, run_py
@@ -316,30 +315,7 @@ def _parse_cli_vars(pairs: list[str]) -> dict[str, object]:
     return out
 
 
-def _get_test_con(executor: Any) -> Any:
-    """
-    Return a connection with .execute(...) that understands sequences and (sql, params).
-    Reuse shims on the executor or build an appropriate one when needed.
-    """
-    if hasattr(executor, "engine"):
-        try:
-            return SAConnShim(executor.engine, schema=getattr(executor, "schema", None))
-        except Exception:
-            pass
-    if hasattr(executor, "client") and hasattr(executor, "dataset"):
-        try:
-            return BigQueryConnShim(executor.client, executor.dataset, executor.location)
-        except Exception:
-            try:
-                return BigQueryConnShim(executor.client, getattr(executor, "location", None))
-            except Exception:
-                pass
-    if hasattr(executor, "con") and hasattr(executor.con, "execute"):
-        return executor.con
-    return executor
-
-
-def _make_executor(prof: Profile, jenv: Environment) -> tuple[Any, Callable, Callable]:
+def _make_executor(prof: Profile, jenv: Environment) -> tuple[BaseExecutor, Callable, Callable]:
     ex: BaseExecutor
     if prof.engine == "duckdb":
         DuckExecutor = _import_optional(

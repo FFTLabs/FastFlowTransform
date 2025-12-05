@@ -6,7 +6,7 @@ Schema-bound tests live in `models/*.yml` or `models/**/schema.yml` and compleme
 
 ```yaml
 # examples/r1_demo/models/users_enriched.yml
-version: 2
+version: 1
 models:
   - name: users_enriched
     description: "Adds gmail flag"

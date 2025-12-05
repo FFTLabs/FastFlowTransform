@@ -13,6 +13,7 @@ from fastflowtransform.core import Node, relation_for
 from fastflowtransform.executors._budget_runner import run_sql_with_budget
 from fastflowtransform.executors._snapshot_sql_mixin import SnapshotSqlMixin
 from fastflowtransform.executors._sql_identifier import SqlIdentifierMixin
+from fastflowtransform.executors._test_utils import make_fetchable, rows_to_tuples
 from fastflowtransform.executors.base import BaseExecutor
 from fastflowtransform.executors.budget import BudgetGuard
 from fastflowtransform.executors.query_stats import QueryStats
@@ -39,8 +40,32 @@ class SnowflakeSnowparkExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecut
         self.allow_create_schema: bool = bool(cfg["allow_create_schema"])
         self._ensure_schema()
 
-        # Provide a tiny testing shim so tests can call executor.con.execute("SQL")
-        self.con = _SFCursorShim(self.session)
+    def execute_test_sql(self, stmt: Any) -> Any:
+        """
+        Execute lightweight SQL for DQ tests via Snowpark and return fetchable rows.
+        """
+
+        def _run_one(s: Any) -> Any:
+            if isinstance(s, str):
+                return rows_to_tuples(self._execute_sql(s).collect())
+            if isinstance(s, Iterable) and not isinstance(s, (bytes, bytearray, str)):
+                res = None
+                for item in s:
+                    res = _run_one(item)
+                return res
+            return rows_to_tuples(self._execute_sql(str(s)).collect())
+
+        return make_fetchable(_run_one(stmt))
+
+    def compute_freshness_delay_minutes(self, table: str, ts_col: str) -> tuple[float | None, str]:
+        sql = (
+            f"select DATEDIFF('minute', max({ts_col}), CURRENT_TIMESTAMP())::float as delay_min "
+            f"from {table}"
+        )
+        res = self.execute_test_sql(sql)
+        row = getattr(res, "fetchone", lambda: None)()
+        val = row[0] if row else None
+        return (float(val) if val is not None else None, sql)
 
     # ---------- Cost estimation & central execution ----------
 
@@ -625,35 +650,27 @@ class SnowflakeSnowparkExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecut
         with suppress(Exception):
             self.session.sql(f"DROP TABLE IF EXISTS {qualified}").collect()
 
+    def introspect_column_physical_type(self, table: str, column: str) -> str | None:
+        """
+        Snowflake: read DATA_TYPE from database.information_schema.columns.
+        """
+        db_ident = self._q(self.database)
+        schema_lit = self.schema.replace("'", "''").upper()
+        table_name = table.split(".")[-1]
+        table_lit = table_name.replace("'", "''").upper()
+        col_lit = column.replace("'", "''").upper()
 
-# ────────────────────────── local testing shim ───────────────────────────
-class _SFCursorShim:
-    """Very small shim to expose .execute(...).fetch* for tests."""
+        sql = f"""
+        select data_type
+        from {db_ident}.information_schema.columns
+        where upper(table_schema) = '{schema_lit}'
+          and upper(table_name)   = '{table_lit}'
+          and upper(column_name)  = '{col_lit}'
+        limit 1
+        """
 
-    def __init__(self, session: Session):
-        self._session = session
-
-    def execute(self, sql: str, params: Any | None = None) -> _SFResult:
-        if params:
-            # Parametrized SQL not needed in our internal calls
-            raise NotImplementedError("Snowflake shim does not support parametrized SQL")
-        rows = self._session.sql(sql).collect()
-
-        if rows:
-            cols = list(rows[0].asDict().keys())
-            as_tuples = [tuple(row.asDict()[c] for c in cols) for row in rows]
-        else:
-            as_tuples = []
-
-        return _SFResult(as_tuples)
-
-
-class _SFResult:
-    def __init__(self, rows: list[tuple]):
-        self._rows = rows
-
-    def fetchall(self) -> list[tuple]:
-        return self._rows
-
-    def fetchone(self) -> tuple | None:
-        return self._rows[0] if self._rows else None
+        rows = self._execute_sql(sql).collect()
+        if not rows:
+            return None
+        # first column of first row
+        return str(rows[0][0]) if rows[0] and rows[0][0] is not None else None

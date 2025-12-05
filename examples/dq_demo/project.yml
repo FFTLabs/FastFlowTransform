@@ -10,21 +10,10 @@ seeds: {}
 tests:
   # --- Single-table checks ----------------------------------------------------
 
-  - type: not_null
+  - type: row_count_between
     table: customers
-    column: customer_id
-    tags: [example:dq_demo, batch]
-
-  - type: unique
-    table: customers
-    column: customer_id
-    tags: [example:dq_demo, batch]
-
-  - type: accepted_values
-    table: customers
-    column: status
-    values: [active, inactive]
-    severity: warn          # demo of warn vs error
+    min_rows: 1
+    max_rows: 100
     tags: [example:dq_demo, batch]
 
   - type: greater_equal
@@ -36,12 +25,6 @@ tests:
   - type: non_negative_sum
     table: orders
     column: amount
-    tags: [example:dq_demo, batch]
-
-  - type: row_count_between
-    table: customers
-    min_rows: 1
-    max_rows: 100
     tags: [example:dq_demo, batch]
 
   - type: relationships

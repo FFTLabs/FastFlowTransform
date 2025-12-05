@@ -4,8 +4,6 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from typing import Any
 
-from sqlalchemy import text as _sa_text
-
 from fastflowtransform.core import relation_for
 from fastflowtransform.errors import ModelExecutionError
 
@@ -69,30 +67,6 @@ def _is_merge_not_supported_error(exc: Exception) -> bool:
 
 
 # ---------- Helper ----------
-
-
-def _exec_sql(exe: Any, sql: str) -> None:
-    """Best-effort SQL execution across engines (DuckDB/PG/Snowflake/BQ shims)."""
-    # Prefer an engine-provided '_execute_sql' hook if available.
-    hook = getattr(exe, "_execute_sql", None)
-    if callable(hook):
-        hook(sql)
-        return
-
-    if hasattr(exe, "con") and hasattr(exe.con, "execute"):  # DuckDB / BQ shim etc.
-        exe.con.execute(sql)
-        return
-    if hasattr(exe, "engine"):  # SQLAlchemy Engine
-        with exe.engine.begin() as conn:
-            conn.execute(_sa_text(sql))
-        return
-    if hasattr(exe, "execute"):  # BigQuery-like shim
-        exe.execute(sql)
-        return
-    if hasattr(exe, "run_sql_raw"):
-        exe.run_sql_raw(sql)
-        return
-    raise RuntimeError("No suitable raw-SQL execution path on executor")
 
 
 def _safe_exists(executor: Any, relation: Any) -> bool:
@@ -181,7 +155,7 @@ def _full_refresh_table(executor: Any, relation: Any, rendered_sql: str) -> None
     try:
         executor.create_table_as(relation, rendered_sql)
     except Exception:
-        _exec_sql(executor, f"create or replace table {target} as {rendered_sql}")
+        executor._execute_sql(f"create or replace table {target} as {rendered_sql}")
 
 
 UniqueKey = str | Sequence[str] | None
