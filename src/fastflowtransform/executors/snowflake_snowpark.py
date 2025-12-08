@@ -674,3 +674,34 @@ class SnowflakeSnowparkExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecut
             return None
         # first column of first row
         return str(rows[0][0]) if rows[0] and rows[0][0] is not None else None
+
+    def load_seed(
+        self, table: str, df: pd.DataFrame, schema: str | None = None
+    ) -> tuple[bool, str, bool]:
+        target_db = self.database
+        target_schema = schema or self.schema
+
+        if not target_db or not target_schema:
+            raise RuntimeError("Snowflake seeding requires database and schema.")
+
+        created_schema = False
+        if self.allow_create_schema:
+            self.session.sql(
+                f'CREATE SCHEMA IF NOT EXISTS "{target_db}"."{target_schema}"'
+            ).collect()
+            created_schema = True
+
+        self.session.write_pandas(
+            df,
+            table_name=table,
+            database=target_db,
+            schema=target_schema,
+            auto_create_table=True,
+            quote_identifiers=False,
+            overwrite=True,
+            use_logical_type=True,
+        )
+
+        full_name = f'"{target_db}"."{target_schema}"."{table}"'
+
+        return True, full_name, created_schema

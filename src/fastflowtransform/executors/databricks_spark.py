@@ -1269,6 +1269,47 @@ class DatabricksSparkExecutor(BaseExecutor[SDF]):
             # Reuse your existing single-statement executor
             self._execute_sql(stmt)
 
+    def load_seed(
+        self, table: str, df: pd.DataFrame, schema: str | None = None
+    ) -> tuple[bool, str, bool]:
+        cleaned_table = self._strip_quotes(table)
+        parts = self._identifier_parts(cleaned_table)
+
+        created_schema = False
+        if schema and len(parts) == 1:
+            schema_part = self._strip_quotes(schema)
+            if schema_part:
+                # Ensure database exists when a separate schema is provided.
+                self._execute_sql(f"CREATE DATABASE IF NOT EXISTS {self._q_ident(schema_part)}")
+                created_schema = True
+                parts = [schema_part, parts[0]]
+
+        if not parts:
+            raise ValueError(f"Invalid Spark table identifier: {table}")
+
+        target_identifier = ".".join(parts)
+        target_sql = self._sql_identifier(target_identifier)
+        format_handler = getattr(self, "_format_handler", None)
+
+        storage_meta = storage.get_seed_storage(target_identifier)
+
+        sdf = self.spark.createDataFrame(df)
+
+        allows_unmanaged = bool(getattr(format_handler, "allows_unmanaged_paths", lambda: True)())
+
+        if storage_meta.get("path") and allows_unmanaged:
+            try:
+                self._write_to_storage_path(target_identifier, sdf, storage_meta)
+            except Exception as exc:  # pragma: no cover
+                raise RuntimeError(f"Spark seed load failed for {target_sql}: {exc}") from exc
+        else:
+            try:
+                self._save_df_as_table(target_identifier, sdf, storage={"path": None})
+            except Exception as exc:  # pragma: no cover
+                raise RuntimeError(f"Spark seed load failed for {target_sql}: {exc}") from exc
+
+        return True, target_identifier, created_schema
+
         # ---- Unit-test helpers -------------------------------------------------
 
     def utest_load_relation_from_rows(self, relation: str, rows: list[dict]) -> None:

@@ -371,6 +371,30 @@ class PostgresExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[pd.Dat
             )
         )
 
+    def load_seed(
+        self, table: str, df: pd.DataFrame, schema: str | None = None
+    ) -> tuple[bool, str, bool]:
+        target_schema = schema or self.schema
+        qualified = self._qualify_identifier(table, schema=target_schema)
+
+        drop_sql = f"DROP TABLE IF EXISTS {qualified} CASCADE"
+        with self.engine.begin() as conn:
+            conn.exec_driver_sql(drop_sql)
+
+        df.to_sql(
+            table,
+            self.engine,
+            if_exists="replace",
+            index=False,
+            schema=target_schema,
+            method="multi",
+        )
+
+        with self.engine.begin() as conn:
+            conn.exec_driver_sql(f"ANALYZE {qualified}")
+
+        return True, qualified, False
+
     # ---------- Python view helper ----------
     def _create_or_replace_view_from_table(
         self, view_name: str, backing_table: str, node: Node

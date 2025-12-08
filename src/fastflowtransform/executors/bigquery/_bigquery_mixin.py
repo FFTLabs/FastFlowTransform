@@ -54,6 +54,19 @@ class BigQueryIdentifierMixin(SqlIdentifierMixin):
     ) -> str:
         return self._qualify_identifier(relation, schema=dataset, catalog=project)
 
+    def _qualified_api_identifier(
+        self, relation: str, project: str | None = None, dataset: str | None = None
+    ) -> str:
+        """
+        Build an API-safe identifier (project.dataset.table) without backticks.
+        """
+        return self._qualify_identifier(
+            relation,
+            schema=dataset,
+            catalog=project,
+            quote=False,
+        )
+
     def _ensure_dataset(self) -> None:
         ds_id = f"{self.project}.{self.dataset}"
         try:

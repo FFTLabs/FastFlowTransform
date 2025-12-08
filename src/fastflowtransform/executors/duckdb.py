@@ -741,3 +741,29 @@ class DuckExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[pd.DataFra
             ).fetchall()
 
         return rows[0][0] if rows else None
+
+    def load_seed(
+        self, table: str, df: pd.DataFrame, schema: str | None = None
+    ) -> tuple[bool, str, bool]:
+        target_schema = schema or self.schema
+        created_schema = False
+
+        # Qualify identifier with optional schema/catalog
+        qualified = self._qualify_identifier(table, schema=target_schema, catalog=self.catalog)
+
+        if target_schema and "." not in table:
+            safe_schema = _q(target_schema)
+            self._execute_sql(f"create schema if not exists {safe_schema}")
+            created_schema = True
+
+        tmp = f"_ff_seed_{uuid.uuid4().hex[:8]}"
+        self.con.register(tmp, df)
+        try:
+            self._execute_sql(f'create or replace table {qualified} as select * from "{tmp}"')
+        finally:
+            with suppress(Exception):
+                self.con.unregister(tmp)
+            with suppress(Exception):
+                self._execute_sql(f'drop view if exists "{tmp}"')
+
+        return True, qualified, created_schema

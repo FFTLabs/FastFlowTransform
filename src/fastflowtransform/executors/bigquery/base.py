@@ -434,3 +434,23 @@ class BigQueryBaseExecutor(BigQueryIdentifierMixin, SnapshotSqlMixin, BaseExecut
         if not rows:
             return None
         return rows[0][0]
+
+    def load_seed(self, table: str, df: Any, schema: str | None = None) -> tuple[bool, str, bool]:
+        dataset_id = schema or self.dataset
+
+        table_id = self._qualified_api_identifier(
+            table,
+            project=self.project,
+            dataset=dataset_id,
+        )
+        full_name = table_id
+        self._ensure_dataset()
+
+        job_config = bigquery.LoadJobConfig(
+            write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE
+        )
+
+        load_job = self.client.load_table_from_dataframe(df, table_id, job_config=job_config)
+        load_job.result()
+
+        return True, full_name, False

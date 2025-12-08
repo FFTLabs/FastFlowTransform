@@ -18,7 +18,7 @@ The command is non-interactive, refuses to overwrite existing directories, and l
 python3 -m venv .venv
 . .venv/bin/activate  # or source .venv/bin/activate
 pip install --upgrade pip
-pip install -e .      # run from the repo root; use `uv pip install --editable .` if you prefer uv
+pip install fastflowtransform
 fft --help
 ```
 
@@ -26,20 +26,20 @@ Choose extras if you target other engines (combine as needed):
 
 ```bash
 # Postgres
-pip install -e .[postgres]
+pip install "fastflowtransform[postgres]"
 
 # BigQuery (pandas) or BigFrames
-pip install -e .[bigquery]     # pandas
-pip install -e .[bigquery_bf]  # BigFrames
+pip install "fastflowtransform[bigquery]"     # pandas
+pip install "fastflowtransform[bigquery_bf]"  # BigFrames
 
 # Databricks/Spark + Delta
-pip install -e .[spark]
+pip install "fastflowtransform[spark]"
 
 # Snowflake Snowpark
-pip install -e .[snowflake]
+pip install "fastflowtransform[snowflake]"
 
 # Everything
-pip install -e .[full]
+pip install "fastflowtransform[full]"
 ```
 
 ## 2. Create project layout
@@ -106,7 +106,6 @@ You should see log lines similar to `✓ L01 [DUCK] users.ff`. The resulting tab
 ## 7. Next steps
 
 - Add `project.yml` for reusable `vars:` and metadata
-- Explore `fft docs` to generate HTML documentation
 - Use engine profiles under `profiles.yml` to target Postgres, BigQuery, or Databricks (path-based sources supported via `format` + `location` overrides)
 - Render the DAG site for this project: `fft dag demo --env dev --html` (find it under `demo/site/dag/index.html`)
 

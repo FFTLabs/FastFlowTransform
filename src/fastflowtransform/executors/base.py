@@ -1132,6 +1132,18 @@ class BaseExecutor[TFrame](ABC):
             f"engine '{self.engine_name}'."
         )
 
+    # ── Seed loading hook ───────────────────────────────────────────────
+    def load_seed(
+        self, table: str, df: Any, schema: str | None = None
+    ) -> tuple[bool, str, bool]:  # pragma: no cover - interface
+        """
+        Materialize a seed DataFrame into the target engine. Executors that
+        support seeds should override and return True when handled.
+        """
+        raise NotImplementedError(
+            f"Seeding is not implemented for executor engine '{self.engine_name}'."
+        )
+
     ENGINE_NAME: str = "generic"
 
     @property
