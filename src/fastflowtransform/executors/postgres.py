@@ -305,7 +305,7 @@ class PostgresExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[pd.Dat
         return self._q_ident(ident)
 
     def _qualified(self, relname: str, schema: str | None = None) -> str:
-        return self._qualify_identifier(relname, schema=schema)
+        return self._format_identifier(relname, purpose="physical", schema=schema)
 
     def _set_search_path(self, conn: Connection) -> None:
         if self.schema:
@@ -699,10 +699,8 @@ class PostgresExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[pd.Dat
         Postgres: read `data_type` from information_schema.columns for the
         current schema (or an explicit schema if table is qualified).
         """
-        if "." in table:
-            schema, table_name = table.split(".", 1)
-        else:
-            schema, table_name = None, table
+        schema, table_name = self._normalize_table_identifier(table)
+        column_name = self._normalize_column_identifier(column)
 
         if schema:
             sql = """
@@ -713,7 +711,7 @@ class PostgresExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[pd.Dat
               and lower(column_name)  = lower(:column)
             limit 1
             """
-            params = {"schema": schema, "table": table_name, "column": column}
+            params = {"schema": schema, "table": table_name, "column": column_name}
         else:
             sql = """
             select data_type
@@ -723,7 +721,7 @@ class PostgresExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[pd.Dat
               and lower(column_name) = lower(:column)
             limit 1
             """
-            params = {"table": table_name, "column": column}
+            params = {"table": table_name, "column": column_name}
 
         rows = self._execute_sql(sql, params).fetchall()
         return rows[0][0] if rows else None

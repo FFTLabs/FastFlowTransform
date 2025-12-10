@@ -7,9 +7,9 @@ from typing import Any, TypeVar
 from fastflowtransform.core import Node, relation_for
 from fastflowtransform.executors._budget_runner import run_sql_with_budget
 from fastflowtransform.executors._snapshot_sql_mixin import SnapshotSqlMixin
+from fastflowtransform.executors._sql_identifier import SqlIdentifierMixin
 from fastflowtransform.executors._test_utils import make_fetchable
 from fastflowtransform.executors.base import BaseExecutor
-from fastflowtransform.executors.bigquery._bigquery_mixin import BigQueryIdentifierMixin
 from fastflowtransform.executors.budget import BudgetGuard
 from fastflowtransform.executors.query_stats import _TrackedQueryJob
 from fastflowtransform.meta import ensure_meta_table, upsert_meta
@@ -18,7 +18,7 @@ from fastflowtransform.typing import BadRequest, Client, NotFound, bigquery
 TFrame = TypeVar("TFrame")
 
 
-class BigQueryBaseExecutor(BigQueryIdentifierMixin, SnapshotSqlMixin, BaseExecutor[TFrame]):
+class BigQueryBaseExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[TFrame]):
     """
     Shared BigQuery executor logic (SQL, incremental, meta, DQ helpers).
 
@@ -55,6 +55,73 @@ class BigQueryBaseExecutor(BigQueryIdentifierMixin, SnapshotSqlMixin, BaseExecut
             project=self.project,
             location=self.location,
         )
+
+    # ---- Identifier helpers ----
+    def _bq_quote(self, value: str) -> str:
+        return value.replace("`", "\\`")
+
+    def _quote_identifier(self, ident: str) -> str:
+        return self._bq_quote(ident)
+
+    def _default_schema(self) -> str | None:
+        return self.dataset
+
+    def _default_catalog(self) -> str | None:
+        return self.project
+
+    def _should_include_catalog(
+        self, catalog: str | None, schema: str | None, *, explicit: bool
+    ) -> bool:
+        # BigQuery always expects a project + dataset.
+        return True
+
+    def _qualify_identifier(
+        self,
+        ident: str,
+        *,
+        schema: str | None = None,
+        catalog: str | None = None,
+        quote: bool = True,
+    ) -> str:
+        proj = self._clean_part(catalog) or self._default_catalog()
+        dset = self._clean_part(schema) or self._default_schema()
+        normalized = self._normalize_identifier(ident)
+        parts = [proj, dset, normalized]
+        if not quote:
+            return ".".join(p for p in parts if p)
+        return f"`{'.'.join(self._bq_quote(p) for p in parts if p)}`"
+
+    def _qualified_identifier(
+        self, relation: str, project: str | None = None, dataset: str | None = None
+    ) -> str:
+        return self._qualify_identifier(relation, schema=dataset, catalog=project)
+
+    def _qualified_api_identifier(
+        self, relation: str, project: str | None = None, dataset: str | None = None
+    ) -> str:
+        """
+        Build an API-safe identifier (project.dataset.table) without backticks.
+        """
+        return self._qualify_identifier(
+            relation,
+            schema=dataset,
+            catalog=project,
+            quote=False,
+        )
+
+    def _ensure_dataset(self) -> None:
+        ds_id = f"{self.project}.{self.dataset}"
+        try:
+            self.client.get_dataset(ds_id)
+            return
+        except NotFound:
+            if not getattr(self, "allow_create_dataset", False):
+                raise
+
+        ds_obj = bigquery.Dataset(ds_id)
+        if getattr(self, "location", None):
+            ds_obj.location = self.location
+        self.client.create_dataset(ds_obj, exists_ok=True)
 
     def execute_test_sql(self, stmt: Any) -> Any:
         """
@@ -173,9 +240,14 @@ class BigQueryBaseExecutor(BigQueryIdentifierMixin, SnapshotSqlMixin, BaseExecut
         Ensure tests use fully-qualified BigQuery identifiers in fft test.
         """
         table = super()._format_test_table(table)
-        if not isinstance(table, str) or not table.strip():
+        if not isinstance(table, str):
             return table
-        return self._qualified_identifier(table.strip())
+        stripped = table.strip()
+        if not stripped or stripped.startswith("`"):
+            return stripped
+        if "." in stripped:
+            return stripped
+        return self._qualified_identifier(stripped)
 
     # ---- SQL hooks ----
     def _this_identifier(self, node: Node) -> str:

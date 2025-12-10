@@ -17,7 +17,6 @@ from tests.common.mock.bigquery import (
     install_fake_bigquery,
 )
 
-import fastflowtransform.executors.bigquery._bigquery_mixin as bq_mix_mod
 import fastflowtransform.executors.bigquery.base as bq_base_mod
 import fastflowtransform.executors.bigquery.pandas as bq_exec_mod
 from fastflowtransform.core import Node
@@ -26,7 +25,7 @@ from fastflowtransform.executors.base import BaseExecutor
 
 @pytest.fixture
 def bq_exec(monkeypatch):
-    _ = install_fake_bigquery(monkeypatch, [bq_exec_mod, bq_mix_mod])
+    _ = install_fake_bigquery(monkeypatch, [bq_exec_mod])
 
     fake_client = FakeClient(project="p1", location="EU")
 
@@ -172,7 +171,7 @@ def test_format_source_reference(bq_exec):
 @pytest.mark.unit
 @pytest.mark.bigquery
 def test_ensure_dataset_respects_flag(monkeypatch):
-    _ = install_fake_bigquery(monkeypatch, [bq_exec_mod, bq_mix_mod])
+    _ = install_fake_bigquery(monkeypatch, [bq_exec_mod])
     fake_client = FakeClient(project="p1", location="EU")
 
     ex = bq_exec_mod.BigQueryExecutor(
@@ -190,7 +189,7 @@ def test_ensure_dataset_respects_flag(monkeypatch):
 @pytest.mark.unit
 @pytest.mark.bigquery
 def test_ensure_dataset_creates_when_allowed(monkeypatch):
-    _ = install_fake_bigquery(monkeypatch, [bq_exec_mod, bq_mix_mod])
+    _ = install_fake_bigquery(monkeypatch, [bq_exec_mod])
     fake_client = FakeClient(project="p1", location="EU")
 
     ex = bq_exec_mod.BigQueryExecutor(

@@ -35,4 +35,4 @@ def test_var_overrides_and_this_object(tmp_path: Path):
     row = ex.con.execute("select * from m").fetchone()
     assert row is not None
     assert row[0] == "2099-01-01"
-    assert row[1] == "m"
+    assert row[1] == '"m"'

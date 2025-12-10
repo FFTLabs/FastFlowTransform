@@ -85,9 +85,31 @@ class SqlIdentifierMixin:
             return ".".join(parts)
         return ".".join(self._quote_identifier(p) for p in parts)
 
+    # ---- Identifier normalization helpers -----------------------------------
+    def _normalize_table_identifier(self, table: str) -> tuple[str | None, str]:
+        """
+        Normalize a possibly qualified/quoted table identifier into (schema, table).
+
+        - Strip simple quoting (`"`/`` ` ``) from each part.
+        - Accept up to 3-part names (catalog.schema.table) and drop the catalog.
+        - Return (schema, table) with schema possibly None.
+        """
+        raw_parts = [p for p in table.split(".") if p]
+        parts = [p.strip().strip('`"') for p in raw_parts]
+
+        if len(parts) >= 2:
+            return parts[-2] or None, parts[-1]
+
+        table_name = parts[0] if parts else table
+        return None, table_name
+
+    def _normalize_column_identifier(self, column: str) -> str:
+        """Strip simple quoting from a column identifier."""
+        return column.strip().strip('`"')
+
     # ---- Shared formatting hooks -----------------------------------------
-    def _format_relation_for_ref(self, name: str) -> str:
-        return self._qualify_identifier(relation_for(name))
+    # def _format_relation_for_ref(self, name: str) -> str:
+    #     return self._qualify_identifier(relation_for(name))
 
     def _pick_schema(self, cfg: dict[str, Any]) -> str | None:
         for key in ("schema", "dataset"):
@@ -103,19 +125,79 @@ class SqlIdentifierMixin:
                 return candidate
         return self._default_catalog_for_source(schema)
 
+    # ---- Unified formatting entrypoint -----------------------------------
+    def _format_identifier(
+        self,
+        name: str,
+        *,
+        purpose: str,
+        schema: str | None = None,
+        catalog: str | None = None,
+        quote: bool = True,
+        source_cfg: dict[str, Any] | None = None,
+        source_name: str | None = None,
+        table_name: str | None = None,
+    ) -> str:
+        """
+        Central formatter for all identifier use-cases.
+
+        purpose:
+          - "ref" / "this" / "test" / "seed" / "physical": qualify `name`
+            using defaults and optional overrides.
+          - "source": qualify based on a resolved source config (identifier +
+            optional schema/catalog); rejects path-based sources here.
+        """
+        normalized = self._normalize_identifier(name)
+
+        if purpose == "source":
+            cfg = dict(source_cfg or {})
+            if cfg.get("location"):
+                raise NotImplementedError(
+                    f"{getattr(self, 'engine_name', 'unknown')} executor "
+                    "does not support path-based sources."
+                )
+
+            ident = cfg.get("identifier") or normalized
+            if not ident:
+                raise KeyError(
+                    f"Source {source_name or '<unknown>'}.{table_name or '<unknown>'} "
+                    "missing identifier"
+                )
+            sch = self._clean_part(schema) or self._pick_schema(cfg)
+            cat = self._clean_part(catalog) or self._pick_catalog(cfg, sch)
+            return self._qualify_identifier(ident, schema=sch, catalog=cat, quote=quote)
+
+        if purpose in {"ref", "this", "test", "seed", "physical"}:
+            sch = self._clean_part(schema)
+            cat = self._clean_part(catalog)
+            return self._qualify_identifier(normalized, schema=sch, catalog=cat, quote=quote)
+
+        raise ValueError(f"Unknown identifier purpose: {purpose!r}")
+
+    # ---- Default delegations using the unified formatter ------------------
+    def _format_relation_for_ref(self, name: str) -> str:
+        return self._format_identifier(name, purpose="ref")
+
     def _format_source_reference(
         self, cfg: dict[str, Any], source_name: str, table_name: str
     ) -> str:
-        if cfg.get("location"):
-            raise NotImplementedError(
-                f"{getattr(self, 'engine_name', 'unknown')} executor "
-                "does not support path-based sources."
-            )
+        return self._format_identifier(
+            cfg.get("identifier") or table_name,
+            purpose="source",
+            source_cfg=cfg,
+            source_name=source_name,
+            table_name=table_name,
+        )
 
-        ident = cfg.get("identifier")
-        if not ident:
-            raise KeyError(f"Source {source_name}.{table_name} missing identifier")
+    def _format_test_table(self, table: str | None) -> str | None:
+        table = super()._format_test_table(table)  # type: ignore[misc]
+        if not isinstance(table, str):
+            return table
+        return self._format_identifier(table, purpose="test")
 
-        schema = self._pick_schema(cfg)
-        catalog = self._pick_catalog(cfg, schema)
-        return self._qualify_identifier(ident, schema=schema, catalog=catalog)
+    def _this_identifier(self, node: Any) -> str:
+        """
+        Default {{ this }} identifier: reuse the formatter with logical name.
+        """
+        name = getattr(node, "name", node)
+        return self._format_identifier(str(name), purpose="this")

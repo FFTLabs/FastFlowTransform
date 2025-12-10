@@ -488,7 +488,7 @@ class DuckExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[pd.DataFra
         Return (catalog.)schema.relation if schema is set; otherwise just relation.
         When quoted=False, emit bare identifiers for APIs like con.table().
         """
-        return self._qualify_identifier(relation, quote=quoted)
+        return self._format_identifier(relation, purpose="physical", quote=quoted)
 
     def _read_relation(self, relation: str, node: Node, deps: Iterable[str]) -> pd.DataFrame:
         try:
@@ -706,13 +706,10 @@ class DuckExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[pd.DataFra
         """
         DuckDB: read `data_type` from information_schema.columns.
         """
-        if "." in table:
-            schema, table_name = table.split(".", 1)
-        else:
-            schema, table_name = None, table
+        schema, table_name = self._normalize_table_identifier(table)
 
         table_lower = table_name.lower()
-        column_lower = column.lower()
+        column_lower = self._normalize_column_identifier(column).lower()
 
         if schema:
             rows = self._execute_sql(

@@ -192,7 +192,7 @@ class SnowflakeSnowparkExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecut
 
     def _qualified(self, rel: str) -> str:
         # DATABASE.SCHEMA.TABLE  (no quotes)
-        return self._qualify_identifier(rel, quote=False)
+        return self._format_identifier(rel, purpose="physical", quote=False)
 
     def _ensure_schema(self) -> None:
         """
@@ -372,25 +372,28 @@ class SnowflakeSnowparkExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecut
         Identifier for {{ this }} in SQL models.
         Use fully-qualified DB.SCHEMA.TABLE so all build/read/test paths agree.
         """
-        return self._qualify_identifier(relation_for(node.name), quote=False)
+        return self._format_identifier(relation_for(node.name), purpose="this", quote=False)
 
     def _format_source_reference(
         self, cfg: dict[str, Any], source_name: str, table_name: str
     ) -> str:
-        if cfg.get("location"):
-            raise NotImplementedError("Snowflake executor does not support path-based sources.")
-
         ident = cfg.get("identifier")
         if not ident:
             raise KeyError(f"Source {source_name}.{table_name} missing identifier")
-
-        sch = self._pick_schema(cfg)
-        db = self._pick_catalog(cfg, sch)
-        if not db or not sch:
+        formatted = self._format_identifier(
+            ident,
+            purpose="source",
+            source_cfg=cfg,
+            source_name=source_name,
+            table_name=table_name,
+            quote=False,
+        )
+        # Ensure we resolved to DB.SCHEMA.TABLE; Snowflake needs both parts.
+        if "." not in formatted:
             raise KeyError(
                 f"Source {source_name}.{table_name} missing database/schema for Snowflake"
             )
-        return self._qualify_identifier(ident, schema=sch, catalog=db, quote=False)
+        return formatted
 
     def _create_or_replace_view(self, target_sql: str, select_body: str, node: Node) -> None:
         self._execute_sql(f"CREATE OR REPLACE VIEW {target_sql} AS {select_body}").collect()
@@ -406,7 +409,8 @@ class SnowflakeSnowparkExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecut
         self._execute_sql(f"CREATE OR REPLACE VIEW {view_id} AS SELECT * FROM {back_id}").collect()
 
     def _format_test_table(self, table: str | None) -> str | None:
-        formatted = super()._format_test_table(table)
+        # Bypass mixin qualification to avoid double-qualifying already dotted names.
+        formatted = BaseExecutor._format_test_table(self, table)
         if formatted is None:
             return None
 
@@ -416,7 +420,7 @@ class SnowflakeSnowparkExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecut
 
         # Otherwise, treat it as a logical relation name and fully-qualify it
         # with the executor's configured database/schema.
-        return self._qualified(formatted)
+        return self._format_identifier(formatted, purpose="test", quote=False)
 
     # ---- Meta hook ----
     def on_node_built(self, node: Node, relation: str, fingerprint: str) -> None:
