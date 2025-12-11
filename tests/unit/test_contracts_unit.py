@@ -14,7 +14,7 @@ from fastflowtransform.config.contracts import (
     ContractsFileModel,
     PhysicalTypeConfig,
 )
-from fastflowtransform.contracts import (
+from fastflowtransform.contracts.core import (
     _apply_column_defaults,
     _contract_tests_for_table,
     _discover_contract_paths,

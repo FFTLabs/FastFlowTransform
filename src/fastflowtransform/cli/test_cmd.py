@@ -24,7 +24,7 @@ from fastflowtransform.config.project import (
     BaseProjectTestConfig,
     parse_project_yaml_config,
 )
-from fastflowtransform.contracts import load_contract_tests
+from fastflowtransform.contracts.core import load_contract_tests
 from fastflowtransform.core import REGISTRY
 from fastflowtransform.dag import topo_sort
 from fastflowtransform.errors import ModelExecutionError

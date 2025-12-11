@@ -2,13 +2,15 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from fastflowtransform.config.loaders import NoDupLoader
 from fastflowtransform.errors import ContractsConfigError
+
+SchemaEnforcementMode = Literal["off", "verify", "cast"]
 
 
 class PhysicalTypeConfig(BaseModel):
@@ -131,6 +133,23 @@ class ColumnContractModel(BaseModel):
         )
 
 
+class TableSchemaEnforcementModel(BaseModel):
+    """
+    Per-table runtime schema enforcement configuration.
+
+    Example in *.contracts.yml:
+
+        enforce_schema:
+          mode: cast          # off | verify | cast
+          allow_extra_columns: false
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: SchemaEnforcementMode = "off"
+    allow_extra_columns: bool = True
+
+
 class ContractsFileModel(BaseModel):
     """
     One contracts file.
@@ -161,6 +180,11 @@ class ContractsFileModel(BaseModel):
     version: int = 1
     table: str = Field(..., description="Logical/physical table name the contract applies to")
     columns: dict[str, ColumnContractModel] = Field(default_factory=dict)
+
+    enforce_schema: TableSchemaEnforcementModel | None = Field(
+        default=None,
+        description="Optional runtime schema enforcement config for this table",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -281,6 +305,49 @@ class ContractsDefaultsModel(BaseModel):
     columns: list[ColumnDefaultsRuleModel] = Field(default_factory=list)
 
 
+class TableSchemaEnforcementOverrideModel(BaseModel):
+    """
+    Per-table override in project-level contracts.yml
+
+    Example:
+
+        enforcement:
+          tables:
+            customers:
+              mode: cast
+              allow_extra_columns: false
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: SchemaEnforcementMode | None = None
+    allow_extra_columns: bool | None = None
+
+
+class ProjectSchemaEnforcementModel(BaseModel):
+    """
+    Project-level schema enforcement defaults (contracts.yml).
+
+    Example:
+
+        version: 1
+
+        enforcement:
+          default_mode: verify          # off | verify | cast
+          allow_extra_columns: true
+          tables:
+            customers:
+              mode: cast
+              allow_extra_columns: false
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    default_mode: SchemaEnforcementMode = "off"
+    allow_extra_columns: bool = True
+    tables: dict[str, TableSchemaEnforcementOverrideModel] = Field(default_factory=dict)
+
+
 class ProjectContractsModel(BaseModel):
     """
     Top-level model for project-level contracts.yml.
@@ -293,6 +360,11 @@ class ProjectContractsModel(BaseModel):
 
     version: int = 1
     defaults: ContractsDefaultsModel = Field(default_factory=ContractsDefaultsModel)
+
+    enforcement: ProjectSchemaEnforcementModel | None = Field(
+        default=None,
+        description="Runtime schema enforcement defaults and per-table overrides",
+    )
 
 
 # ---- Parsers -----------------------------------------------------------------
