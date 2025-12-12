@@ -10,7 +10,7 @@ from typing import Any
 
 import typer
 
-from fastflowtransform.cli.bootstrap import _prepare_context
+from fastflowtransform.cli.bootstrap import _prepare_context, configure_executor_contracts
 from fastflowtransform.cli.options import (
     EngineOpt,
     EnvOpt,
@@ -464,13 +464,14 @@ def test(
     engine: EngineOpt = None,
     vars: VarsOpt = None,
     select: SelectOpt = None,
-    skip_build: SkipBuildOpt = False,
+    skip_build: SkipBuildOpt = True,
 ) -> None:
     ctx = _prepare_context(project, env_name, engine, vars)
     tokens, pred = _compile_selector(select)
     has_model_matches = any(pred(node) for node in REGISTRY.nodes.values())
     legacy_tag_only = _is_legacy_test_token(tokens) and not has_model_matches
     execu, run_sql, run_py = ctx.make_executor()
+    configure_executor_contracts(ctx.project, execu)
 
     model_pred = (lambda _n: True) if legacy_tag_only else pred
     # Run models; if a model fails, show friendly error then exit(1).

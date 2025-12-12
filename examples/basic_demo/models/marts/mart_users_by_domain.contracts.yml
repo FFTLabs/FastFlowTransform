@@ -1,0 +1,53 @@
+table: mart_users_by_domain
+
+columns:
+  email_domain:
+    type: string
+    nullable: false
+    unique: true
+    description: "Email domain (example.com, example.net, …)."
+    physical:
+      duckdb: VARCHAR
+      postgres: text
+      bigquery: STRING
+      databricks_spark: STRING
+      snowflake_snowpark: VARCHAR
+      default: STRING
+
+  user_count:
+    type: integer
+    nullable: false
+    min: 0
+    description: "Number of users per domain (COUNT(*))"
+    physical:
+      # COUNT(*) result types
+      duckdb: BIGINT
+      postgres: bigint
+      bigquery: INT64
+      databricks_spark: BIGINT
+      snowflake_snowpark: NUMBER
+      default: BIGINT
+
+  first_signup:
+    type: date
+    nullable: false
+    description: "Earliest signup date for this domain."
+    physical:
+      duckdb: DATE
+      postgres: date
+      bigquery: DATE
+      databricks_spark: DATE
+      snowflake_snowpark: DATE
+      default: DATE
+
+  last_signup:
+    type: date
+    nullable: false
+    description: "Latest signup date for this domain."
+    physical:
+      duckdb: DATE
+      postgres: date
+      bigquery: DATE
+      databricks_spark: DATE
+      snowflake_snowpark: DATE
+      default: DATE

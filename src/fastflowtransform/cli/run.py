@@ -27,7 +27,11 @@ from fastflowtransform.ci.changed_since import (
     compute_affected_models,
     get_changed_models,
 )
-from fastflowtransform.cli.bootstrap import CLIContext, _prepare_context
+from fastflowtransform.cli.bootstrap import (
+    CLIContext,
+    _prepare_context,
+    configure_executor_contracts,
+)
 from fastflowtransform.cli.options import (
     CacheMode,
     CacheOpt,
@@ -58,7 +62,6 @@ from fastflowtransform.config.budgets import (
     load_budgets_config,
 )
 from fastflowtransform.config.project import HookSpec
-from fastflowtransform.contracts.core import _load_project_contracts, load_contracts
 from fastflowtransform.core import REGISTRY, Node, relation_for
 from fastflowtransform.dag import levels as dag_levels
 from fastflowtransform.executors.base import BaseExecutor
@@ -1812,22 +1815,7 @@ def run(
     engine_.run_started_at = datetime.now(UTC).isoformat(timespec="seconds")
 
     # ---------- Runtime contracts: load + configure executor ----------
-    try:
-        project_dir = Path(ctx.project)
-    except TypeError:
-        project_dir = Path(str(ctx.project))
-
-    try:
-        contracts_by_table = load_contracts(project_dir)
-        project_contracts = _load_project_contracts(project_dir)
-    except Exception as exc:
-        # If contracts parsing blows up, you can either:
-        # - treat it as fatal (like budgets.yml), or
-        # - log a warning and continue without contracts.
-        # For now we log and proceed, contracts are optional.
-        warn(f"[contracts] Failed to load contracts from {project_dir}: {exc}")
-        contracts_by_table = {}
-        project_contracts = None
+    project_dir = Path(ctx.project)
 
     # engine_.shared is (executor, run_sql_fn, run_py_fn)
     try:
@@ -1835,9 +1823,7 @@ def run(
     except Exception:
         executor = None
 
-    if executor is not None and hasattr(executor, "configure_contracts"):
-        with suppress(Exception):
-            executor.configure_contracts(contracts_by_table, project_contracts)
+    configure_executor_contracts(project_dir, executor)
 
     bind_context(
         engine=ctx.profile.engine,

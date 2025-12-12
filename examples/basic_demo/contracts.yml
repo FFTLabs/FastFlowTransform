@@ -1,0 +1,37 @@
+# Project-level contracts for the basic_demo.
+
+defaults:
+  # Reusable column-level rules applied by regex.
+  columns:
+    # All *_id columns are non-null integers
+    - match:
+        name: ".*_id$"
+      type: integer
+      nullable: false
+
+    # All *_date columns are non-null dates
+    - match:
+        name: ".*_date$"
+      type: date
+      nullable: false
+
+    # email_domain is non-null everywhere
+    - match:
+        name: "^email_domain$"
+      type: string
+      nullable: false
+      description: "Normalized email domain (lowercased)."
+
+enforcement:
+  # Modes: off | verify | cast
+  default_mode: off
+  allow_extra_columns: true
+
+  tables:
+    mart_users_by_domain:
+      mode: verify            # only check schema, don't cast
+      allow_extra_columns: true
+
+    mart_latest_signup:
+      mode: cast              # cast into physical types, then verify
+      allow_extra_columns: true

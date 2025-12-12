@@ -1,0 +1,52 @@
+table: mart_latest_signup
+
+columns:
+  email_domain:
+    type: string
+    nullable: false
+    unique: true
+    description: "Email domain, one row per domain."
+    physical:
+      duckdb: VARCHAR
+      postgres: text
+      bigquery: STRING
+      databricks_spark: STRING
+      snowflake_snowpark: VARCHAR
+      default: STRING
+
+  latest_user_id:
+    type: integer
+    nullable: false
+    description: "User ID of the most recent signup on this domain."
+    physical:
+      duckdb: INTEGER
+      postgres: integer
+      bigquery: INT64
+      databricks_spark: INT
+      snowflake_snowpark: NUMBER
+      default: INTEGER
+
+  latest_email:
+    type: string
+    nullable: false
+    regex: "^.+@.+$"
+    description: "Email address of the most recent signup."
+    physical:
+      duckdb: VARCHAR
+      postgres: text
+      bigquery: STRING
+      databricks_spark: STRING
+      snowflake_snowpark: VARCHAR
+      default: STRING
+
+  latest_signup_date:
+    type: date
+    nullable: false
+    description: "Timestamp / date of the most recent signup."
+    physical:
+      duckdb: DATE
+      postgres: date
+      bigquery: DATE
+      databricks_spark: DATE
+      snowflake_snowpark: DATE
+      default: DATE

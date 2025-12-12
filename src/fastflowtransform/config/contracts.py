@@ -149,6 +149,16 @@ class TableSchemaEnforcementModel(BaseModel):
     mode: SchemaEnforcementMode = "off"
     allow_extra_columns: bool = True
 
+    @field_validator("mode", mode="before")
+    @classmethod
+    def _coerce_mode(cls, v: Any) -> Any:
+        # Allow bare `off` from YAML → False
+        if v is False:
+            return "off"
+        if isinstance(v, str):
+            return v.strip().lower()
+        return v
+
 
 class ContractsFileModel(BaseModel):
     """
@@ -346,6 +356,16 @@ class ProjectSchemaEnforcementModel(BaseModel):
     default_mode: SchemaEnforcementMode = "off"
     allow_extra_columns: bool = True
     tables: dict[str, TableSchemaEnforcementOverrideModel] = Field(default_factory=dict)
+
+    @field_validator("default_mode", mode="before")
+    @classmethod
+    def _coerce_default_mode(cls, v: Any) -> Any:
+        if v is False:
+            return "off"
+        # Same comment as above if you ever want to accept `true`.
+        if isinstance(v, str):
+            return v.strip().lower()
+        return v
 
 
 class ProjectContractsModel(BaseModel):

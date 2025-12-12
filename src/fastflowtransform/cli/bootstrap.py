@@ -4,6 +4,7 @@ from __future__ import annotations
 import importlib
 import os
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NoReturn, cast
@@ -14,10 +15,11 @@ from dotenv import dotenv_values
 from jinja2 import Environment
 
 from fastflowtransform.config.budgets import BudgetsConfig, load_budgets_config
+from fastflowtransform.contracts.core import _load_project_contracts, load_contracts
 from fastflowtransform.core import REGISTRY
 from fastflowtransform.errors import DependencyNotFoundError
 from fastflowtransform.executors.base import BaseExecutor
-from fastflowtransform.logging import echo
+from fastflowtransform.logging import echo, warn
 from fastflowtransform.settings import (
     EngineType,
     EnvSettings,
@@ -148,6 +150,29 @@ def _load_dotenv_layered(project_dir: Path, env_name: str) -> None:
     for key, value in merged.items():
         if key not in original_env and value is not None:
             os.environ.setdefault(key, value)
+
+
+def configure_executor_contracts(project_dir: Path, executor: BaseExecutor | None) -> None:
+    """
+    Load contracts from project_dir and attach them to the executor (if supported).
+
+    Mirrors the behaviour in `fft run`: parse per-table contracts and the
+    project-level contracts.yml; on parse errors, log a warning and continue
+    without contracts.
+    """
+    if executor is None or not hasattr(executor, "configure_contracts"):
+        return
+
+    try:
+        contracts_by_table = load_contracts(project_dir)
+        project_contracts = _load_project_contracts(project_dir)
+    except Exception as exc:
+        warn(f"[contracts] Failed to load contracts from {project_dir}: {exc}")
+        contracts_by_table = {}
+        project_contracts = None
+
+    with suppress(Exception):
+        executor.configure_contracts(contracts_by_table, project_contracts)
 
 
 def _resolve_profile(

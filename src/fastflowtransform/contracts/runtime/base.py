@@ -220,3 +220,21 @@ class BaseRuntimeContracts[E: ContractExecutor]:
         override this (e.g. DuckDB + pandas).
         """
         return df
+
+    def materialize_python(
+        self,
+        *,
+        ctx: RuntimeContractContext,
+        df: Any,
+    ) -> bool:
+        """
+        Optional hook for Python models.
+
+        Engines override this to take over materialization for Python
+        models (e.g. to enforce contracts via explicit CASTs).
+
+        Return True if you fully materialized ctx.physical_table yourself.
+        Return False to let the executor use its normal path
+        (_materialize_relation / _materialize_incremental).
+        """
+        return False

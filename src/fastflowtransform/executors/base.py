@@ -685,6 +685,8 @@ class BaseExecutor[TFrame](ABC):
         # ---------- Runtime contracts for Python models ----------
         runtime = getattr(self, "runtime_contracts", None)
         ctx = None
+        took_over = False
+
         if runtime is not None:
             contracts = getattr(self, "_ff_contracts", {}) or {}
             project_contracts = getattr(self, "_ff_project_contracts", None)
@@ -702,16 +704,23 @@ class BaseExecutor[TFrame](ABC):
                     project_contracts=project_contracts,
                     is_incremental=(mat == "incremental"),
                 )
-                # Allow runtime to coerce DataFrame types in cast mode
-                out = runtime.coerce_frame_schema(out, ctx)
+
+                # Optional pre-coercion (default is no-op).
+                if hasattr(runtime, "coerce_frame_schema"):
+                    out = runtime.coerce_frame_schema(out, ctx)
+
+                # Allow engine-specific runtime to take over Python materialization
+                if mat == "table" and hasattr(runtime, "materialize_python"):
+                    took_over = bool(runtime.materialize_python(ctx=ctx, df=out))
 
         # ---------- Materialization ----------
-        if mat == "incremental":
-            self._materialize_incremental(target, out, node, meta)
-        elif mat == "view":
-            self._materialize_view(target, out, node)
-        else:
-            self._materialize_relation(target, out, node)
+        if not took_over:
+            if mat == "incremental":
+                self._materialize_incremental(target, out, node, meta)
+            elif mat == "view":
+                self._materialize_view(target, out, node)
+            else:
+                self._materialize_relation(target, out, node)
 
         if ctx is not None and runtime is not None:
             runtime.verify_after_materialization(ctx=ctx)
