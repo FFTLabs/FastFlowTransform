@@ -1,10 +1,11 @@
-.PHONY: seed run_full run_incr dag test artifacts clean demo demo-open
+.PHONY: seed seed_step2 run_full run_incr dag test artifacts clean demo demo-open
 
 # --- Config -------------------------------------------------------------------
 
 DB ?= .local/incremental_demo.duckdb
 PROJECT ?= .
 UV ?= uv
+LOCAL_SEEDS_DIR = $(PROJECT)/.local/seeds
 
 # Engine selector (duckdb|postgres|databricks_spark|bigquery|snowflake_snowpark)
 ENGINE ?= duckdb
@@ -87,16 +88,21 @@ endif
 
 # --- Targets ------------------------------------------------------------------
 
-seed:
-	env $(BASE_ENV) $(UV) run fft seed "$(PROJECT)" --env $(PROFILE_ENV)
+seed_v1:
+	@mkdir -p "$(LOCAL_SEEDS_DIR)"
+	@cp "$(PROJECT)/seeds/seed_events_v1.csv" "$(LOCAL_SEEDS_DIR)/seed_events.csv"
+	env $(BASE_ENV) FFT_SEEDS_DIR="$(LOCAL_SEEDS_DIR)" $(UV) run fft seed "$(PROJECT)" --env $(PROFILE_ENV)
 
-# Full refresh (first run)
+seed_v2:
+	@mkdir -p "$(LOCAL_SEEDS_DIR)"
+	@cp "$(PROJECT)/seeds/seed_events_v2.csv" "$(LOCAL_SEEDS_DIR)/seed_events.csv"
+	env $(BASE_ENV) FFT_SEEDS_DIR="$(LOCAL_SEEDS_DIR)" $(UV) run fft seed "$(PROJECT)" --env $(PROFILE_ENV)
+
 run_full:
-	env $(RUN_ENV) $(UV) run fft run "$(PROJECT)" --env $(PROFILE_ENV) $(SELECT_FLAGS) --cache rw
+	env $(RUN_ENV) $(UV) run fft run "$(PROJECT)" --env $(PROFILE_ENV) $(SELECT_FLAGS) --cache=rw
 
-# second/subsequent run: shows incremental/delta behaviour
 run_incr:
-	env $(RUN_ENV) $(UV) run fft run "$(PROJECT)" --env $(PROFILE_ENV) $(SELECT_FLAGS) --cache rw
+	env $(RUN_ENV) $(UV) run fft run "$(PROJECT)" --env $(PROFILE_ENV) $(SELECT_FLAGS) --cache=rw
 
 dag:
 	env $(RUN_ENV) $(UV) run fft dag "$(PROJECT)" --env $(PROFILE_ENV) $(SELECT_FLAGS) --html
@@ -122,13 +128,20 @@ demo-open:
 
 demo: clean
 	@echo "== 🚀 Incremental Demo ($(ENGINE)) =="
-	@echo "Profile=$(PROFILE_ENV)  DB=$(DB)  PROJECT=$(PROJECT)  DBR_TABLE_FORMAT=$(DBR_TABLE_FORMAT)"
-	+$(MAKE) seed
+	@echo "== 1) First run (seed v1 → initial build) =="
+	+$(MAKE) seed_v1
 	+$(MAKE) run_full
 	@echo
-	@echo "== 🔁 Second run (Incremental/Delta) =="
+	@echo "== 2) No-op run (same seed v1; should be mostly skipped) =="
 	+$(MAKE) run_incr
+	@echo
+	@echo "== 3) Change seed data (seed v2 snapshot: update + new row) =="
+	+$(MAKE) seed_v2
+	+$(MAKE) run_incr
+	@echo
+	@echo "== 4) DAG & artifacts =="
 	+$(MAKE) dag
 	+$(MAKE) test
 	+$(MAKE) artifacts
-	@echo "✅ Demo done. Open DAG here: $(PROJECT)/site/dag/index.html"
+	@echo
+	@echo "✅ Demo done. Open DAG at: $(PROJECT)/site/dag/index.html"

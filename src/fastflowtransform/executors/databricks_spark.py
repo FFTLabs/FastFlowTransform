@@ -13,6 +13,7 @@ import pandas as pd
 from jinja2 import Environment
 
 from fastflowtransform import storage
+from fastflowtransform.contracts.runtime.databricks_spark import DatabricksSparkRuntimeContracts
 from fastflowtransform.core import REGISTRY, Node, relation_for
 from fastflowtransform.errors import ModelExecutionError
 from fastflowtransform.executors._budget_runner import run_sql_with_budget
@@ -21,6 +22,7 @@ from fastflowtransform.executors._spark_imports import (
     get_spark_functions,
     get_spark_window,
 )
+from fastflowtransform.executors._test_utils import make_fetchable, rows_to_tuples
 from fastflowtransform.executors.base import BaseExecutor
 from fastflowtransform.executors.budget import BudgetGuard
 from fastflowtransform.logging import echo, echo_debug
@@ -184,7 +186,8 @@ def _log_delta_capabilities(
 class DatabricksSparkExecutor(BaseExecutor[SDF]):
     """Spark/Databricks executor without pandas: Python models operate on Spark DataFrames."""
 
-    ENGINE_NAME = "databricks_spark"
+    ENGINE_NAME: str = "databricks_spark"
+    runtime_contracts: DatabricksSparkRuntimeContracts
     _BUDGET_GUARD = BudgetGuard(
         env_var="FF_SPK_MAX_BYTES",
         estimator_attr="_estimate_query_bytes",
@@ -269,8 +272,6 @@ class DatabricksSparkExecutor(BaseExecutor[SDF]):
                 builder = builder.config(catalog_key, _DELTA_CATALOG)
 
         self.spark = self._user_spark or builder.getOrCreate()
-        # Lightweight testing shim so tests can call executor.con.execute("SQL")
-        self.con = _SparkConnShim(self.spark)
         self._registered_path_sources: dict[str, dict[str, Any]] = {}
         self.warehouse_dir = warehouse_path
         self.catalog = catalog
@@ -313,6 +314,7 @@ class DatabricksSparkExecutor(BaseExecutor[SDF]):
         )
 
         self._spark_default_size = self._detect_default_size()
+        self.runtime_contracts = DatabricksSparkRuntimeContracts(self)
 
     # ---------- Cost estimation & central execution ----------
 
@@ -426,6 +428,33 @@ class DatabricksSparkExecutor(BaseExecutor[SDF]):
         the guard is effectively disabled.
         """
         return self._spark_plan_bytes(sql)
+
+    def execute_test_sql(self, stmt: Any) -> Any:
+        """
+        Execute lightweight SQL for DQ tests via Spark and return fetchable rows.
+        """
+
+        def _run_one(s: Any) -> Any:
+            if isinstance(s, str):
+                return rows_to_tuples(self.spark.sql(s).collect())
+            if isinstance(s, Iterable) and not isinstance(s, (bytes, bytearray, str)):
+                res = None
+                for item in s:
+                    res = _run_one(item)
+                return res
+            return rows_to_tuples(self.spark.sql(str(s)).collect())
+
+        return make_fetchable(_run_one(stmt))
+
+    def compute_freshness_delay_minutes(self, table: str, ts_col: str) -> tuple[float | None, str]:
+        sql = (
+            f"select (unix_timestamp(current_timestamp()) - unix_timestamp(max({ts_col}))) / 60.0 "
+            f"as delay_min from {table}"
+        )
+        res = self.execute_test_sql(sql)
+        row = getattr(res, "fetchone", lambda: None)()
+        val = row[0] if row else None
+        return (float(val) if val is not None else None, sql)
 
     def _execute_sql(self, sql: str) -> SDF:
         """
@@ -1243,6 +1272,47 @@ class DatabricksSparkExecutor(BaseExecutor[SDF]):
             # Reuse your existing single-statement executor
             self._execute_sql(stmt)
 
+    def load_seed(
+        self, table: str, df: pd.DataFrame, schema: str | None = None
+    ) -> tuple[bool, str, bool]:
+        cleaned_table = self._strip_quotes(table)
+        parts = self._identifier_parts(cleaned_table)
+
+        created_schema = False
+        if schema and len(parts) == 1:
+            schema_part = self._strip_quotes(schema)
+            if schema_part:
+                # Ensure database exists when a separate schema is provided.
+                self._execute_sql(f"CREATE DATABASE IF NOT EXISTS {self._q_ident(schema_part)}")
+                created_schema = True
+                parts = [schema_part, parts[0]]
+
+        if not parts:
+            raise ValueError(f"Invalid Spark table identifier: {table}")
+
+        target_identifier = ".".join(parts)
+        target_sql = self._sql_identifier(target_identifier)
+        format_handler = getattr(self, "_format_handler", None)
+
+        storage_meta = storage.get_seed_storage(target_identifier)
+
+        sdf = self.spark.createDataFrame(df)
+
+        allows_unmanaged = bool(getattr(format_handler, "allows_unmanaged_paths", lambda: True)())
+
+        if storage_meta.get("path") and allows_unmanaged:
+            try:
+                self._write_to_storage_path(target_identifier, sdf, storage_meta)
+            except Exception as exc:  # pragma: no cover
+                raise RuntimeError(f"Spark seed load failed for {target_sql}: {exc}") from exc
+        else:
+            try:
+                self._save_df_as_table(target_identifier, sdf, storage={"path": None})
+            except Exception as exc:  # pragma: no cover
+                raise RuntimeError(f"Spark seed load failed for {target_sql}: {exc}") from exc
+
+        return True, target_identifier, created_schema
+
         # ---- Unit-test helpers -------------------------------------------------
 
     def utest_load_relation_from_rows(self, relation: str, rows: list[dict]) -> None:
@@ -1293,45 +1363,52 @@ class DatabricksSparkExecutor(BaseExecutor[SDF]):
         with suppress(Exception):
             self._execute_sql(f"DROP TABLE IF EXISTS {ident}")
 
+    def _introspect_columns_metadata(
+        self,
+        table: str,
+        column: str | None = None,
+    ) -> list[tuple[str, str]]:
+        """
+        Internal helper: return [(column_name, spark_sql_type), ...] for a Spark table.
 
-# ────────────────────────── local helpers / shim ──────────────────────────
-class _SparkResult:
-    """Tiny result shim to mimic duckdb/psycopg fetch API in tests."""
+        - Uses Spark's DataFrame schema (no information_schema dependency).
+        - Works with db.table identifiers via _physical_identifier().
+        - Optionally restricts to a single column (case-insensitive).
+        """
+        physical = self._physical_identifier(table)
+        df = self.spark.table(physical)
 
-    def __init__(self, rows: list[tuple]):
-        self._rows = rows
+        want = column.lower() if column is not None else None
 
-    def fetchall(self) -> list[tuple]:
-        return self._rows
+        out: list[tuple[str, str]] = []
+        for field in df.schema.fields:
+            name = field.name
+            if want is not None and name.lower() != want:
+                continue
 
-    def fetchone(self) -> tuple | None:
-        return self._rows[0] if self._rows else None
+            dt = field.dataType
+            try:
+                # e.g. "bigint", "string", "timestamp", "decimal(10,2)", "array<string>", ...
+                typ = dt.simpleString()
+            except Exception:
+                typ = str(dt)
 
+            # Keep consistent with your existing introspect_column_physical_type()
+            out.append((str(name), str(typ).upper()))
 
-class _SparkConnShim:  # pragma: no cover
-    """Provide .execute(sql) with fetch* for test utilities."""
+        return out
 
-    def __init__(self, spark: SparkSession):
-        self._spark = spark
+    def introspect_column_physical_type(self, table: str, column: str) -> str | None:
+        """
+        Spark: return Spark SQL type (simpleString) for one column, uppercased.
+        """
+        rows = self._introspect_columns_metadata(table, column=column)
+        return rows[0][1] if rows else None
 
-    def execute(self, sql: str, params: Any | None = None) -> _SparkResult:
-        if params:
-            # Minimal positional param interpolation for tests is intentionally not implemented.
-            # All internal calls use plain SQL strings for Spark.
-            raise NotImplementedError("SparkConnShim does not support parametrized SQL")
-        df = self._spark.sql(sql)
-        rows = [tuple(r) for r in df.collect()]
-        return _SparkResult(rows)
-
-
-def _split_db_table(qualified: str) -> tuple[str | None, str]:
-    """
-    Split "db.table" → (db, table); backticks allowed.
-    Returns (None, name) if unqualified.
-    """
-    s = qualified.strip("`")
-    parts = s.split(".")
-    part_len = 2
-    if len(parts) >= part_len:
-        return parts[-2], parts[-1]
-    return None, s
+    def introspect_table_physical_schema(self, table: str) -> dict[str, str]:
+        """
+        Spark: return {lower(column_name): spark_sql_type} for all columns of `table`.
+        """
+        rows = self._introspect_columns_metadata(table, column=None)
+        # Lower keys to match runtime verifier behavior (case-insensitive compare)
+        return {name.lower(): typ for (name, typ) in rows}

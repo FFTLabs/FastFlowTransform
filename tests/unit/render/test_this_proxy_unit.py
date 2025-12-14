@@ -16,4 +16,4 @@ def test_this_string_and_name(tmp_path: Path):
     env = Environment()
     ex = DuckExecutor()
     sql = ex.render_sql(node, env).strip().lower()
-    assert sql == "select 'm' as a, 'm' as b"
+    assert sql == "select '\"m\"' as a, '\"m\"' as b"

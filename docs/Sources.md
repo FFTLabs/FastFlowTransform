@@ -11,14 +11,14 @@ project/
 ├── models/
 ├── sources.yml
 └── seeds/
-````
+```
 
 ## YAML Schema (Version 2)
 
 FastFlowTransform expects a dbt-style structure:
 
 ```yaml
-version: 2
+version: 1
 sources:
   - name: raw
     schema: staging                # default schema for this source group
@@ -82,7 +82,7 @@ Engine-specific overrides follow this merge order:
 A typical analytics project mixes **seeded reference data**, **database tables**, and **lakehouse paths**. A single `sources.yml` might look like this:
 
 ```yaml
-version: 2
+version: 1
 sources:
   # Seeded reference data (CSV → tables)
   - name: ref

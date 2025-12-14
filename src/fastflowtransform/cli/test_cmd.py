@@ -1,7 +1,6 @@
 # fastflowtransform/cli/test_cmd.py
 from __future__ import annotations
 
-import os
 import re
 import time
 from collections.abc import Callable, Iterable, Mapping
@@ -11,7 +10,7 @@ from typing import Any
 
 import typer
 
-from fastflowtransform.cli.bootstrap import _get_test_con, _prepare_context
+from fastflowtransform.cli.bootstrap import _prepare_context, configure_executor_contracts
 from fastflowtransform.cli.options import (
     EngineOpt,
     EnvOpt,
@@ -25,9 +24,11 @@ from fastflowtransform.config.project import (
     BaseProjectTestConfig,
     parse_project_yaml_config,
 )
+from fastflowtransform.contracts.core import load_contract_tests
 from fastflowtransform.core import REGISTRY
 from fastflowtransform.dag import topo_sort
 from fastflowtransform.errors import ModelExecutionError
+from fastflowtransform.executors.base import BaseExecutor
 from fastflowtransform.logging import echo
 from fastflowtransform.schema_loader import Severity, TestSpec, load_schema_tests
 from fastflowtransform.testing.discovery import (
@@ -109,11 +110,6 @@ def _execute_models(
                     raise typer.Exit(1) from exc
                 raise Exception from exc
             on_error(name, node, exc)
-
-
-def _maybe_print_marker(con: Any) -> None:
-    if os.getenv("FFT_SQL_DEBUG") == "1":
-        echo(getattr(con, "marker", "NO_SHIM"))
 
 
 def _run_models(
@@ -342,7 +338,7 @@ def _prepare_test(
     return _prepare_test_from_mapping(raw_test, executor)
 
 
-def _run_dq_tests(con: Any, tests: Iterable[Any], executor: Any) -> list[DQResult]:
+def _run_dq_tests(executor: BaseExecutor, tests: Iterable[Any]) -> list[DQResult]:
     results: list[DQResult] = []
 
     for raw_test in tests:
@@ -381,7 +377,7 @@ def _run_dq_tests(con: Any, tests: Iterable[Any], executor: Any) -> list[DQResul
             )
             continue
 
-        ok, msg, example = runner(con, table_for_exec, col, params)
+        ok, msg, example = runner(executor, table_for_exec, col, params)
         ms = int((time.perf_counter() - t0) * 1000)
         param_str = _format_params_for_summary(kind, params)
 
@@ -468,16 +464,14 @@ def test(
     engine: EngineOpt = None,
     vars: VarsOpt = None,
     select: SelectOpt = None,
-    skip_build: SkipBuildOpt = False,
+    skip_build: SkipBuildOpt = True,
 ) -> None:
     ctx = _prepare_context(project, env_name, engine, vars)
     tokens, pred = _compile_selector(select)
     has_model_matches = any(pred(node) for node in REGISTRY.nodes.values())
     legacy_tag_only = _is_legacy_test_token(tokens) and not has_model_matches
     execu, run_sql, run_py = ctx.make_executor()
-
-    con = _get_test_con(execu)
-    _maybe_print_marker(con)
+    configure_executor_contracts(ctx.project, execu)
 
     model_pred = (lambda _n: True) if legacy_tag_only else pred
     # Run models; if a model fails, show friendly error then exit(1).
@@ -492,13 +486,15 @@ def test(
     tests: list[Any] = _load_tests(ctx.project)
     # 2) schema YAML tests
     tests.extend(load_schema_tests(ctx.project))
+    # 2b) contracts tests (contracts/*.contracts.yml)
+    tests.extend(load_contract_tests(ctx.project))
     # 3) optional legacy tagfilter (e.g., "batch")
     tests = _apply_legacy_tag_filter(tests, tokens, legacy_token=legacy_tag_only)
     if not tests:
         typer.secho("No tests configured.", fg="bright_black")
         raise typer.Exit(code=0)
 
-    results = _run_dq_tests(con, tests, execu)
+    results = _run_dq_tests(execu, tests)
     _print_summary(results)
 
     # Exit code: count only ERROR fails

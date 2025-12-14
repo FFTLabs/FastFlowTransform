@@ -27,7 +27,11 @@ from fastflowtransform.ci.changed_since import (
     compute_affected_models,
     get_changed_models,
 )
-from fastflowtransform.cli.bootstrap import CLIContext, _prepare_context
+from fastflowtransform.cli.bootstrap import (
+    CLIContext,
+    _prepare_context,
+    configure_executor_contracts,
+)
 from fastflowtransform.cli.options import (
     CacheMode,
     CacheOpt,
@@ -1809,6 +1813,17 @@ def run(
     # Run metadata for hooks
     engine_.invocation_id = uuid4().hex
     engine_.run_started_at = datetime.now(UTC).isoformat(timespec="seconds")
+
+    # ---------- Runtime contracts: load + configure executor ----------
+    project_dir = Path(ctx.project)
+
+    # engine_.shared is (executor, run_sql_fn, run_py_fn)
+    try:
+        executor, _, _ = engine_.shared
+    except Exception:
+        executor = None
+
+    configure_executor_contracts(project_dir, executor)
 
     bind_context(
         engine=ctx.profile.engine,

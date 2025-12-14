@@ -9,7 +9,7 @@ from fastflowtransform.core import REGISTRY
 def test_sql_model_config_materialized_view(tmp_path: Path):
     (tmp_path / "models").mkdir()
     (tmp_path / "sources.yml").write_text(
-        "version: 2\nsources: []\n",
+        "version: 1\nsources: []\n",
         encoding="utf-8",
     )
     (tmp_path / "models" / "users.ff.sql").write_text(

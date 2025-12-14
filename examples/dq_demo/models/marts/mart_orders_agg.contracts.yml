@@ -1,0 +1,36 @@
+version: 1
+table: mart_orders_agg
+
+columns:
+  customer_id:
+    type: integer
+    nullable: false
+
+  customer_name:
+    type: string
+    nullable: false
+
+  status:
+    type: string
+    nullable: false
+    enum:
+      - active
+      - inactive        # keep in sync with customers.status
+
+  order_count:
+    type: integer
+    nullable: false
+    min: 0
+
+  total_amount:
+    type: double
+    nullable: false
+    min: 0
+
+  first_order_ts:
+    type: timestamp
+    nullable: false
+
+  last_order_ts:
+    type: timestamp
+    nullable: false

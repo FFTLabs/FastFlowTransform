@@ -13,11 +13,13 @@ import duckdb
 import pandas as pd
 from duckdb import CatalogException
 
+from fastflowtransform.contracts.runtime.duckdb import DuckRuntimeContracts
 from fastflowtransform.core import Node
 from fastflowtransform.executors._budget_runner import run_sql_with_budget
 from fastflowtransform.executors._snapshot_sql_mixin import SnapshotSqlMixin
 from fastflowtransform.executors._sql_identifier import SqlIdentifierMixin
-from fastflowtransform.executors.base import BaseExecutor
+from fastflowtransform.executors._test_utils import make_fetchable
+from fastflowtransform.executors.base import BaseExecutor, _scalar
 from fastflowtransform.executors.budget import BudgetGuard
 from fastflowtransform.meta import ensure_meta_table, upsert_meta
 
@@ -27,7 +29,8 @@ def _q(ident: str) -> str:
 
 
 class DuckExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[pd.DataFrame]):
-    ENGINE_NAME = "duckdb"
+    ENGINE_NAME: str = "duckdb"
+    runtime_contracts: DuckRuntimeContracts
 
     _FIXED_TYPE_SIZES: ClassVar[dict[str, int]] = {
         "boolean": 1,
@@ -85,6 +88,42 @@ class DuckExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[pd.DataFra
             safe_schema = _q(self.schema)
             self._execute_sql(f"create schema if not exists {safe_schema}")
             self._execute_sql(f"set schema '{self.schema}'")
+
+        self.runtime_contracts = DuckRuntimeContracts(self)
+
+    def execute_test_sql(self, stmt: Any) -> Any:
+        """
+        Execute lightweight SQL for DQ tests using the underlying DuckDB connection.
+        """
+
+        def _run_one(s: Any) -> Any:
+            statement_len = 2
+            if (
+                isinstance(s, tuple)
+                and len(s) == statement_len
+                and isinstance(s[0], str)
+                and isinstance(s[1], dict)
+            ):
+                return self.con.execute(s[0], s[1])
+            if isinstance(s, str):
+                return self.con.execute(s)
+            if isinstance(s, Iterable) and not isinstance(s, (bytes, bytearray, str)):
+                res = None
+                for item in s:
+                    res = _run_one(item)
+                return res
+            return self.con.execute(str(s))
+
+        return make_fetchable(_run_one(stmt))
+
+    def compute_freshness_delay_minutes(self, table: str, ts_col: str) -> tuple[float | None, str]:
+        now_expr = "cast(now() as timestamp)"
+        sql = (
+            f"select date_part('epoch', {now_expr} - max({ts_col})) "
+            f"/ 60.0 as delay_min from {table}"
+        )
+        delay = _scalar(self, sql)
+        return (float(delay) if delay is not None else None, sql)
 
     def _execute_sql(self, sql: str, *args: Any, **kwargs: Any) -> duckdb.DuckDBPyConnection:
         """
@@ -406,9 +445,19 @@ class DuckExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[pd.DataFra
 
     def clone(self) -> DuckExecutor:
         """
-        Generates a new Executor instance with own connection for Thread-Worker.
+        Generates a new Executor instance with its own connection for Thread-Worker.
+        Copies runtime-contract configuration from the parent.
         """
-        return DuckExecutor(self.db_path, schema=self.schema, catalog=self.catalog)
+        cloned = DuckExecutor(self.db_path, schema=self.schema, catalog=self.catalog)
+
+        # Propagate contracts + project contracts to the clone
+        contracts = getattr(self, "_ff_contracts", None)
+        project_contracts = getattr(self, "_ff_project_contracts", None)
+        if contracts is not None or project_contracts is not None:
+            # configure_contracts lives on BaseExecutor
+            cloned.configure_contracts(contracts or {}, project_contracts)
+
+        return cloned
 
     def _exec_many(self, sql: str) -> None:
         """
@@ -453,7 +502,7 @@ class DuckExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[pd.DataFra
         Return (catalog.)schema.relation if schema is set; otherwise just relation.
         When quoted=False, emit bare identifiers for APIs like con.table().
         """
-        return self._qualify_identifier(relation, quote=quoted)
+        return self._format_identifier(relation, purpose="physical", quote=quoted)
 
     def _read_relation(self, relation: str, node: Node, deps: Iterable[str]) -> pd.DataFrame:
         try:
@@ -666,3 +715,86 @@ class DuckExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[pd.DataFra
             self._execute_sql(f"drop view if exists {target}")
         with suppress(Exception):
             self._execute_sql(f"drop table if exists {target}")
+
+    def _introspect_columns_metadata(
+        self,
+        table: str,
+        column: str | None = None,
+    ) -> list[tuple[str, str]]:
+        """
+        Internal helper: return [(column_name, data_type), ...] for a DuckDB table.
+
+        - Uses _normalize_table_identifier / _normalize_column_identifier
+        - Works with or without schema qualification
+        - Optionally restricts to a single column
+        """
+        schema, table_name = self._normalize_table_identifier(table)
+
+        table_lower = table_name.lower()
+        params: list[str] = [table_lower]
+
+        where_clauses: list[str] = ["lower(table_name) = lower(?)"]
+
+        if schema:
+            where_clauses.append("lower(table_schema) = lower(?)")
+            params.append(schema.lower())
+
+        if column is not None:
+            column_lower = self._normalize_column_identifier(column).lower()
+            where_clauses.append("lower(column_name) = lower(?)")
+            params.append(column_lower)
+
+        where_sql = " AND ".join(where_clauses)
+
+        sql = (
+            "select column_name, data_type "
+            "from information_schema.columns "
+            f"where {where_sql} "
+            "order by table_schema, ordinal_position"
+        )
+
+        rows = self._execute_sql(sql, params).fetchall()
+
+        # Normalize to plain strings
+        return [(str(name), str(dtype)) for (name, dtype) in rows]
+
+    def introspect_column_physical_type(self, table: str, column: str) -> str | None:
+        """
+        DuckDB: read `data_type` from information_schema.columns for a single column.
+        """
+        rows = self._introspect_columns_metadata(table, column=column)
+        # rows: [(column_name, data_type), ...]
+        return rows[0][1] if rows else None
+
+    def introspect_table_physical_schema(self, table: str) -> dict[str, str]:
+        """
+        DuckDB: return {column_name: data_type} for all columns of `table`.
+        """
+        rows = self._introspect_columns_metadata(table, column=None)
+        return {name: dtype for (name, dtype) in rows}
+
+    def load_seed(
+        self, table: str, df: pd.DataFrame, schema: str | None = None
+    ) -> tuple[bool, str, bool]:
+        target_schema = schema or self.schema
+        created_schema = False
+
+        # Qualify identifier with optional schema/catalog
+        qualified = self._qualify_identifier(table, schema=target_schema, catalog=self.catalog)
+
+        if target_schema and "." not in table:
+            safe_schema = _q(target_schema)
+            self._execute_sql(f"create schema if not exists {safe_schema}")
+            created_schema = True
+
+        tmp = f"_ff_seed_{uuid.uuid4().hex[:8]}"
+        self.con.register(tmp, df)
+        try:
+            self._execute_sql(f'create or replace table {qualified} as select * from "{tmp}"')
+        finally:
+            with suppress(Exception):
+                self.con.unregister(tmp)
+            with suppress(Exception):
+                self._execute_sql(f'drop view if exists "{tmp}"')
+
+        return True, qualified, created_schema

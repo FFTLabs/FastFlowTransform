@@ -143,7 +143,7 @@ def _build_sources_yaml() -> str:
     return "\n".join(
         [
             "# Source declarations describe external tables. See docs/Sources.md for details.",
-            "version: 2",
+            "version: 1",
             "# sources:",
             "  # Example:",
             "  # - name: raw",

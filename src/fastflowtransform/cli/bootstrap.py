@@ -4,6 +4,7 @@ from __future__ import annotations
 import importlib
 import os
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NoReturn, cast
@@ -14,11 +15,11 @@ from dotenv import dotenv_values
 from jinja2 import Environment
 
 from fastflowtransform.config.budgets import BudgetsConfig, load_budgets_config
+from fastflowtransform.contracts.core import _load_project_contracts, load_contracts
 from fastflowtransform.core import REGISTRY
 from fastflowtransform.errors import DependencyNotFoundError
-from fastflowtransform.executors._shims import BigQueryConnShim, SAConnShim
 from fastflowtransform.executors.base import BaseExecutor
-from fastflowtransform.logging import echo
+from fastflowtransform.logging import echo, warn
 from fastflowtransform.settings import (
     EngineType,
     EnvSettings,
@@ -36,7 +37,7 @@ class CLIContext:
     profile: Profile
     budgets_cfg: BudgetsConfig | None = None
 
-    def make_executor(self) -> tuple[Any, Callable, Callable]:
+    def make_executor(self) -> tuple[BaseExecutor, Callable, Callable]:
         executor, run_sql, run_py = _make_executor(self.profile, self.jinja_env)
         self._configure_budget_limit(executor)
         return executor, run_sql, run_py
@@ -149,6 +150,29 @@ def _load_dotenv_layered(project_dir: Path, env_name: str) -> None:
     for key, value in merged.items():
         if key not in original_env and value is not None:
             os.environ.setdefault(key, value)
+
+
+def configure_executor_contracts(project_dir: Path, executor: BaseExecutor | None) -> None:
+    """
+    Load contracts from project_dir and attach them to the executor (if supported).
+
+    Mirrors the behaviour in `fft run`: parse per-table contracts and the
+    project-level contracts.yml; on parse errors, log a warning and continue
+    without contracts.
+    """
+    if executor is None or not hasattr(executor, "configure_contracts"):
+        return
+
+    try:
+        contracts_by_table = load_contracts(project_dir)
+        project_contracts = _load_project_contracts(project_dir)
+    except Exception as exc:
+        warn(f"[contracts] Failed to load contracts from {project_dir}: {exc}")
+        contracts_by_table = {}
+        project_contracts = None
+
+    with suppress(Exception):
+        executor.configure_contracts(contracts_by_table, project_contracts)
 
 
 def _resolve_profile(
@@ -316,30 +340,7 @@ def _parse_cli_vars(pairs: list[str]) -> dict[str, object]:
     return out
 
 
-def _get_test_con(executor: Any) -> Any:
-    """
-    Return a connection with .execute(...) that understands sequences and (sql, params).
-    Reuse shims on the executor or build an appropriate one when needed.
-    """
-    if hasattr(executor, "engine"):
-        try:
-            return SAConnShim(executor.engine, schema=getattr(executor, "schema", None))
-        except Exception:
-            pass
-    if hasattr(executor, "client") and hasattr(executor, "dataset"):
-        try:
-            return BigQueryConnShim(executor.client, executor.dataset, executor.location)
-        except Exception:
-            try:
-                return BigQueryConnShim(executor.client, getattr(executor, "location", None))
-            except Exception:
-                pass
-    if hasattr(executor, "con") and hasattr(executor.con, "execute"):
-        return executor.con
-    return executor
-
-
-def _make_executor(prof: Profile, jenv: Environment) -> tuple[Any, Callable, Callable]:
+def _make_executor(prof: Profile, jenv: Environment) -> tuple[BaseExecutor, Callable, Callable]:
     ex: BaseExecutor
     if prof.engine == "duckdb":
         DuckExecutor = _import_optional(
@@ -365,6 +366,16 @@ def _make_executor(prof: Profile, jenv: Environment) -> tuple[Any, Callable, Cal
     if prof.engine == "bigquery":
         if prof.bigquery.dataset is None:
             raise RuntimeError("BigQuery dataset must be set")
+
+        # Validate env-provided frame selector early (used by examples/Makefiles)
+        frame_env = os.getenv("FF_ENGINE_VARIANT") or os.getenv("BQ_FRAME")
+        if frame_env:
+            frame_normalized = frame_env.lower()
+            if frame_normalized not in {"pandas", "bigframes"}:
+                raise RuntimeError(
+                    f"Unsupported BigQuery frame '{frame_env}'. "
+                    "Set FF_ENGINE_VARIANT/BQ_FRAME to 'pandas' or 'bigframes'."
+                )
 
         if prof.bigquery.use_bigframes:
             BigQueryBFExecutor = _import_optional(

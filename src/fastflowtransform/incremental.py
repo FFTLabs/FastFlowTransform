@@ -4,8 +4,6 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from typing import Any
 
-from sqlalchemy import text as _sa_text
-
 from fastflowtransform.core import relation_for
 from fastflowtransform.errors import ModelExecutionError
 
@@ -71,28 +69,53 @@ def _is_merge_not_supported_error(exc: Exception) -> bool:
 # ---------- Helper ----------
 
 
-def _exec_sql(exe: Any, sql: str) -> None:
-    """Best-effort SQL execution across engines (DuckDB/PG/Snowflake/BQ shims)."""
-    # Prefer an engine-provided '_execute_sql' hook if available.
-    hook = getattr(exe, "_execute_sql", None)
-    if callable(hook):
-        hook(sql)
+def _apply_runtime_contracts_after_incremental(executor: Any, node: Any, relation: str) -> None:
+    """
+    After an incremental model has been materialized (via create_table_as /
+    incremental_insert / incremental_merge), run runtime contracts in
+    verify/cast mode if the executor supports them.
+
+    This is intentionally generic and works for any executor that exposes:
+      - runtime_contracts
+      - _ff_contracts
+      - _ff_project_contracts
+      - _format_relation_for_ref(name: str) -> str
+    """
+    runtime = getattr(executor, "runtime_contracts", None)
+    if runtime is None:
         return
 
-    if hasattr(exe, "con") and hasattr(exe.con, "execute"):  # DuckDB / BQ shim etc.
-        exe.con.execute(sql)
+    contracts = getattr(executor, "_ff_contracts", {}) or {}
+    project_contracts = getattr(executor, "_ff_project_contracts", None)
+
+    # How you key contracts may vary slightly; common patterns:
+    #   - contracts["customers"]
+    #   - contracts[relation_for(node.name)]
+    logical = relation_for(node.name)
+    contract = contracts.get(logical) or contracts.get(node.name)
+
+    # If there is no per-table contract and no project-level enforcement,
+    # there's nothing to do.
+    if contract is None and project_contracts is None:
         return
-    if hasattr(exe, "engine"):  # SQLAlchemy Engine
-        with exe.engine.begin() as conn:
-            conn.execute(_sa_text(sql))
-        return
-    if hasattr(exe, "execute"):  # BigQuery-like shim
-        exe.execute(sql)
-        return
-    if hasattr(exe, "run_sql_raw"):
-        exe.run_sql_raw(sql)
-        return
-    raise RuntimeError("No suitable raw-SQL execution path on executor")
+
+    try:
+        physical = executor._format_relation_for_ref(node.name)
+    except AttributeError:
+        # Fallback: use the logical relation if the executor does not
+        # implement the more specific formatting hook.
+        physical = relation
+
+    ctx = runtime.build_context(
+        node=node,
+        relation=logical,
+        physical_table=physical,
+        contract=contract,
+        project_contracts=project_contracts,
+        is_incremental=True,
+    )
+
+    runtime.verify_after_materialization(ctx=ctx)
 
 
 def _safe_exists(executor: Any, relation: Any) -> bool:
@@ -181,7 +204,7 @@ def _full_refresh_table(executor: Any, relation: Any, rendered_sql: str) -> None
     try:
         executor.create_table_as(relation, rendered_sql)
     except Exception:
-        _exec_sql(executor, f"create or replace table {target} as {rendered_sql}")
+        executor._execute_sql(f"create or replace table {target} as {rendered_sql}")
 
 
 UniqueKey = str | Sequence[str] | None
@@ -297,6 +320,8 @@ def run_or_dispatch(executor: Any, node: Any, jenv: Any) -> None:
     if not exists:
         try:
             _create_table_as_or_replace(executor, relation, fallback_sql)
+            # Contracts: first incremental run creates the table → verify schema
+            _apply_runtime_contracts_after_incremental(executor, node, relation)
         except Exception as e:
             wrap_full_refresh(e)
         return
@@ -311,7 +336,10 @@ def run_or_dispatch(executor: Any, node: Any, jenv: Any) -> None:
             fallback_sql=fallback_sql,
             on_full_refresh_error=wrap_full_refresh,
         )
+        # Contracts: after merge/insert/full-refresh fallback, verify schema
+        _apply_runtime_contracts_after_incremental(executor, node, relation)
     except ModelExecutionError:
+        # already wrapped; propagate
         raise
     except Exception as e:
         wrap_incremental(e)

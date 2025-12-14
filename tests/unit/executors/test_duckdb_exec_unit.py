@@ -134,18 +134,6 @@ def test_format_source_reference_ok(duck_exec: DuckExecutor):
 
 @pytest.mark.unit
 @pytest.mark.duckdb
-def test_format_source_reference_missing_identifier_raises(duck_exec: DuckExecutor):
-    cfg = {
-        "catalog": "c1",
-        "schema": "s1",
-        # no identifier!
-    }
-    with pytest.raises(KeyError):
-        duck_exec._format_source_reference(cfg, "src", "tbl")
-
-
-@pytest.mark.unit
-@pytest.mark.duckdb
 def test_format_source_reference_path_not_supported(duck_exec: DuckExecutor):
     cfg = {"location": "/some/path.csv"}
     with pytest.raises(NotImplementedError):

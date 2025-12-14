@@ -32,7 +32,7 @@ def test_ephemeral_inlining_end_to_end(tmp_path: Path):
     # sources.yml
     _w(
         proj / "sources.yml",
-        """version: 2
+        """version: 1
 
 sources:
   - name: crm

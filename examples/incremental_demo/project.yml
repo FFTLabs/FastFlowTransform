@@ -9,9 +9,6 @@ models:
       unique_key: "event_id"
 
     fct_events_sql_yaml.ff:
-      unique_key: "event_id"
-
-    fct_events_sql_yaml.ff:
       unique_key: "event_id"               # top-level shortcut
       incremental:
         enabled: true
@@ -19,6 +16,12 @@ models:
 
     fct_events_sql_inline_delta.ff:
       unique_key: "event_id"
+
+    fct_events_py_incremental:
+      unique_key: "event_id"
+      incremental:
+        enabled: true
+        updated_at_column: "updated_at"
 
 seeds: {}
 

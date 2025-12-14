@@ -24,6 +24,7 @@ nav:
   - Technical Overview: Technical_Overview.md
   - API & Models: Api_Models.md
   - Configuration & Macros: Config_and_Macros.md
+  - Contracts: Contracts.md
   - Cache & Parallelism: Cache_and_Parallelism.md
   - Incremental Processing: Incremental.md
   - Profiles & Environments: Profiles.md
@@ -66,7 +67,7 @@ markdown_extensions:
       permalink: true
   - pymdownx.superfences
   - pymdownx.details
-  - pymdownx.highlight          # <— ersetzt codehilite
+  - pymdownx.highlight
   - pymdownx.inlinehilite
   - pymdownx.snippets:
       base_path:

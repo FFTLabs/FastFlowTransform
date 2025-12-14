@@ -305,7 +305,7 @@ class SourcesFileConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    version: Literal[2]
+    version: Literal[1]
     sources: list[SourceGroupConfig] = Field(default_factory=list)
 
 

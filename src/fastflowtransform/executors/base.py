@@ -16,6 +16,7 @@ from pandas import DataFrame as _PDDataFrame
 
 from fastflowtransform import incremental as _ff_incremental
 from fastflowtransform.api import context as _http_ctx
+from fastflowtransform.config.contracts import ContractsFileModel, ProjectContractsModel
 from fastflowtransform.config.sources import resolve_source_entry
 from fastflowtransform.core import REGISTRY, Node, relation_for
 from fastflowtransform.errors import ModelExecutionError
@@ -84,6 +85,12 @@ def _load_callable(path: str) -> Callable[..., Any]:
     return fn
 
 
+def _scalar(executor: BaseExecutor, sql: Any) -> Any:
+    """Execute SQL and return the first column of the first row (or None)."""
+    row = executor.execute_test_sql(sql).fetchone()
+    return None if row is None else row[0]
+
+
 # Frame type (pandas.DataFrame, pyspark.sql.DataFrame, snowflake.snowpark.DataFrame, ...)
 TFrame = TypeVar("TFrame")
 
@@ -127,6 +134,21 @@ class BaseExecutor[TFrame](ABC):
     SNAPSHOT_IS_CURRENT_COL = "_ff_is_current"
     SNAPSHOT_HASH_COL = "_ff_snapshot_hash"
     SNAPSHOT_UPDATED_AT_COL = "_ff_updated_at"
+
+    _ff_contracts: Mapping[str, ContractsFileModel] | None = None
+    _ff_project_contracts: ProjectContractsModel | None = None
+
+    def configure_contracts(
+        self,
+        contracts: Mapping[str, ContractsFileModel] | None,
+        project_contracts: ProjectContractsModel | None,
+    ) -> None:
+        """
+        Inject parsed contracts into this executor instance.
+        The run engine should call this once at startup.
+        """
+        self._ff_contracts = contracts or {}
+        self._ff_project_contracts = project_contracts
 
     # ---------- SQL ----------
     def render_sql(
@@ -302,7 +324,30 @@ class BaseExecutor[TFrame](ABC):
         echo_debug(preview)
 
         try:
-            self._apply_sql_materialization(node, target_sql, body, materialization)
+            runtime = getattr(self, "runtime_contracts", None)
+            # contracts only for TABLE materialization for now
+            if runtime is not None and materialization == "table":
+                contracts = getattr(self, "_ff_contracts", {}) or {}
+                project_contracts = getattr(self, "_ff_project_contracts", None)
+
+                # keying: prefer the logical table name (contracts.table),
+                # but node.name or relation_for(node.name) is usually what you want.
+                logical_name = relation_for(node.name)
+                contract = contracts.get(logical_name) or contracts.get(node.name)
+
+                ctx = runtime.build_context(
+                    node=node,
+                    relation=logical_name,
+                    physical_table=target_sql,
+                    contract=contract,
+                    project_contracts=project_contracts,
+                    is_incremental=self._meta_is_incremental(meta),
+                )
+                # Engine-specific enforcement (verify/cast/off)
+                runtime.apply_sql_contracts(ctx=ctx, select_body=body)
+            else:
+                # Old behavior
+                self._apply_sql_materialization(node, target_sql, body, materialization)
         except Exception as e:
             preview = f"-- materialized={materialization}\n-- target={target_sql}\n{body}"
             raise ModelExecutionError(
@@ -430,6 +475,28 @@ class BaseExecutor[TFrame](ABC):
         """
         Engine-specific SQL execution hook used by shared helpers (snapshots, pruning, etc.).
         Concrete executors override this with their own signatures and semantics.
+        """
+        raise NotImplementedError
+
+    def execute_test_sql(self, stmt: Any) -> Any:  # pragma: no cover - abstract
+        """
+        Execute a lightweight SQL statement for DQ tests.
+
+        Implementations should accept:
+          - str
+          - (str, params dict)
+          - ClauseElement (optional, where supported)
+          - Sequence of the above (executed sequentially; return last result)
+        and return an object supporting .fetchone() / .fetchall().
+        """
+        raise NotImplementedError
+
+    def compute_freshness_delay_minutes(self, table: str, ts_col: str) -> tuple[float | None, str]:
+        """
+        Compute delay in minutes between now and max(ts_col) for a relation.
+
+        Returns (delay_minutes, sql_used).
+        Default implementation is not provided; executors implement engine-specific logic.
         """
         raise NotImplementedError
 
@@ -602,11 +669,8 @@ class BaseExecutor[TFrame](ABC):
 
         self._reset_http_ctx(node)
 
-        # arg = self._build_python_args(node, deps)
         args, argmap = self._build_python_inputs(node, deps)
         requires = REGISTRY.py_requires.get(node.name, {})
-        # if deps:
-        #     self._validate_required(node.name, arg, requires)
         if deps:
             # Required-columns check works against the mapping
             self._validate_required(node.name, argmap, requires)
@@ -618,12 +682,48 @@ class BaseExecutor[TFrame](ABC):
         meta = getattr(node, "meta", {}) or {}
         mat = self._resolve_materialization_strategy(meta)
 
-        if mat == "incremental":
-            self._materialize_incremental(target, out, node, meta)
-        elif mat == "view":
-            self._materialize_view(target, out, node)
-        else:
-            self._materialize_relation(target, out, node)
+        # ---------- Runtime contracts for Python models ----------
+        runtime = getattr(self, "runtime_contracts", None)
+        ctx = None
+        took_over = False
+
+        if runtime is not None:
+            contracts = getattr(self, "_ff_contracts", {}) or {}
+            project_contracts = getattr(self, "_ff_project_contracts", None)
+
+            logical = target  # usually relation_for(node.name)
+            contract = contracts.get(logical) or contracts.get(node.name)
+
+            if contract is not None or project_contracts is not None:
+                physical_table = self._format_relation_for_ref(node.name)
+                ctx = runtime.build_context(
+                    node=node,
+                    relation=logical,
+                    physical_table=physical_table,
+                    contract=contract,
+                    project_contracts=project_contracts,
+                    is_incremental=(mat == "incremental"),
+                )
+
+                # Optional pre-coercion (default is no-op).
+                if hasattr(runtime, "coerce_frame_schema"):
+                    out = runtime.coerce_frame_schema(out, ctx)
+
+                # Allow engine-specific runtime to take over Python materialization
+                if mat == "table" and hasattr(runtime, "materialize_python"):
+                    took_over = bool(runtime.materialize_python(ctx=ctx, df=out))
+
+        # ---------- Materialization ----------
+        if not took_over:
+            if mat == "incremental":
+                self._materialize_incremental(target, out, node, meta)
+            elif mat == "view":
+                self._materialize_view(target, out, node)
+            else:
+                self._materialize_relation(target, out, node)
+
+        if ctx is not None and runtime is not None:
+            runtime.verify_after_materialization(ctx=ctx)
 
         self._snapshot_http_ctx(node)
 
@@ -1089,6 +1189,42 @@ class BaseExecutor[TFrame](ABC):
         Default: no-op.
         """
         return
+
+    # ── Column schema introspection hook ────────────────────────────────
+    def introspect_column_physical_type(self, table: str, column: str) -> str | None:
+        """
+        Return the engine's physical data type for `table.column`, or None
+        if it cannot be determined.
+
+        Subclasses should override this. Default implementation raises so
+        callers can surface a clear "engine not supported" message.
+        """
+        raise NotImplementedError(
+            f"Column physical type introspection is not implemented for "
+            f"engine '{self.engine_name}'."
+        )
+
+    def normalize_physical_type(self, t: str | None) -> str:
+        """
+        Canonicalize a physical type string for comparisons (DQ + contracts).
+
+        Default: just strip + lower.
+        Engines may override to account for dialect quirks in information_schema
+        (e.g. Postgres timestamp variants, Snowflake VARCHAR(…) / NUMBER(…)).
+        """
+        return (t or "").strip().lower()
+
+    # ── Seed loading hook ───────────────────────────────────────────────
+    def load_seed(
+        self, table: str, df: Any, schema: str | None = None
+    ) -> tuple[bool, str, bool]:  # pragma: no cover - interface
+        """
+        Materialize a seed DataFrame into the target engine. Executors that
+        support seeds should override and return True when handled.
+        """
+        raise NotImplementedError(
+            f"Seeding is not implemented for executor engine '{self.engine_name}'."
+        )
 
     ENGINE_NAME: str = "generic"
 

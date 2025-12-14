@@ -131,7 +131,10 @@ class FakeClient:
 
     # ---- Test helper ----
     def add_dataset(self, ds_id: str) -> None:
-        self._datasets.setdefault(ds_id, FakeDataset(ds_id))
+        key = ds_id
+        if "." not in key:
+            key = f"{self.project}.{key}"
+        self._datasets.setdefault(key, FakeDataset(key))
 
     def add_table(self, dataset_id: str, table_id: str) -> None:
         self._tables.setdefault(dataset_id, []).append(SimpleNamespace(table_id=table_id))
@@ -221,13 +224,22 @@ class FakeClient:
         raise FakeNotFound(f"table {table_ref} not found")
 
     def get_dataset(self, ds_id: str):
-        ds = self._datasets.get(ds_id)
+        key = ds_id
+        if "." not in key:
+            key = f"{self.project}.{key}"
+        ds = self._datasets.get(key)
         if ds is None:
             raise FakeNotFound(f"dataset {ds_id} not found")
         return ds
 
     def create_dataset(self, ds_obj: Any, exists_ok: bool | None = None):
-        ds_id = getattr(ds_obj, "dataset_id", ds_obj)
+        ds_id_raw = getattr(ds_obj, "dataset_id", ds_obj)
+        ds_id = ds_id_raw
+        if isinstance(ds_id_raw, FakeDatasetReference):
+            ds_id = f"{ds_id_raw.project}.{ds_id_raw.dataset_id}"
+        if isinstance(ds_id, str) and "." not in ds_id:
+            ds_id = f"{self.project}.{ds_id}"
+
         ds = self._datasets.get(ds_id)
         if ds is None or not exists_ok:
             ds = FakeDataset(ds_id)

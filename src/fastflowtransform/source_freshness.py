@@ -59,7 +59,6 @@ def _relation_for_source(
 def run_source_freshness(
     executor: Any,
     *,
-    con: Any | None = None,
     engine: str | None = None,
 ) -> list[SourceFreshnessResult]:
     """
@@ -70,7 +69,6 @@ def run_source_freshness(
     """
     engine_label = engine or getattr(executor, "engine_name", None) or ""
     engine_norm = engine_label.lower()
-    connection = con or getattr(executor, "con", executor)
     results: list[SourceFreshnessResult] = []
 
     sources = getattr(REGISTRY, "sources", {}) or {}
@@ -102,7 +100,7 @@ def run_source_freshness(
                 if threshold is None:
                     # should not happen given the guard above
                     continue
-                _freshness_test(connection, relation, loaded_at, max_delay_minutes=int(threshold))
+                _freshness_test(executor, relation, loaded_at, max_delay_minutes=int(threshold))
                 # If we reach here, delay <= threshold; we can recompute the actual delay
                 # by re-running with a large threshold and inferring from error message
                 # OR we can simply omit it. Keep it simple and omit for now.

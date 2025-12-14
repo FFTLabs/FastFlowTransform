@@ -12,7 +12,7 @@ def test_manifest_minimal(tmp_path: Path):
     (tmp_path / "models").mkdir(parents=True)
     (tmp_path / "models" / "m.ff.sql").write_text("select 1 as x", encoding="utf-8")
     (tmp_path / "sources.yml").write_text(
-        "version: 2\nsources: []\n",
+        "version: 1\nsources: []\n",
         encoding="utf-8",
     )
 

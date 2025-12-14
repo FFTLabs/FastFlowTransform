@@ -10,7 +10,7 @@ def test_parse_schema_yaml_column_tests(tmp_path: Path):
     (tmp_path / "models").mkdir(parents=True)
     (tmp_path / "models" / "users_enriched.yml").write_text(
         """
-version: 2
+version: 1
 models:
   - name: users_enriched
     tags: [batch]

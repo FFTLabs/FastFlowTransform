@@ -39,7 +39,7 @@ class TestSpec:
 
 def load_schema_tests(project_dir: Path) -> list[TestSpec]:
     """
-    Loads schema yamls (version: 2) in models/**.yml (& schema.yml),
+    Loads schema yamls (version: 1) in models/**.yml (& schema.yml),
     and returns normalized TestSpec objects.
     """
     project_dir = Path(project_dir)
@@ -54,7 +54,7 @@ def load_schema_tests(project_dir: Path) -> list[TestSpec]:
     files = sorted(set(files))
 
     specs: list[TestSpec] = []
-    version = 2
+    version = 1
     for yml in files:
         try:
             data = yaml.safe_load(yml.read_text(encoding="utf-8")) or {}

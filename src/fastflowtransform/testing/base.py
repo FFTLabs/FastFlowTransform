@@ -1,93 +1,18 @@
 # src/fastflowtransform/testing/base.py
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
-from typing import Any, cast
+import re
+from collections.abc import Sequence
+from typing import Any
 
-from sqlalchemy import text
-from sqlalchemy.engine import Connection as _SAConn
 from sqlalchemy.sql.elements import ClauseElement
 
+from fastflowtransform.config.contracts import PhysicalTypeConfig
+from fastflowtransform.executors.base import BaseExecutor, _scalar
 from fastflowtransform.logging import dprint
 from fastflowtransform.utils.timefmt import format_duration_minutes
 
-# ===== Execution helpers (consistent for DuckDB / Postgres / BigQuery) ==
-
-
-def _exec(con: Any, sql: Any) -> Any:
-    """
-    Execute SQL robustly and consistently.
-    Accepts:
-      - str
-      - (str, params: dict)
-      - SQLAlchemy ClauseElement (if available)
-      - Sequence[ of the above types ]  -> executed sequentially (return result of the last)
-    Delegates to `con.execute(sql)` when available (e.g. DuckDB or our executor shims).
-    Fallback: use Connection.begin() + SQLAlchemy text().
-    """
-    # 1) Direct delegation to existing con.execute (e.g. DuckDB, our PG/BQ shims)
-    if hasattr(con, "execute"):
-        dprint("con.execute <-", _pretty_sql(sql))
-        try:
-            if isinstance(con, _SAConn) or "sqlalchemy" in type(con).__module__:
-                sql_tuple_len = 2
-                if isinstance(sql, str):
-                    return con.execute(text(sql))
-                if (
-                    isinstance(sql, tuple)
-                    and len(sql) == sql_tuple_len
-                    and isinstance(sql[0], str)
-                    and isinstance(sql[1], dict)
-                ):
-                    return con.execute(text(sql[0]), sql[1])
-            return cast(Any, con).execute(sql)
-        except Exception:
-            # The check name is unknown at this point → the caller adds that context
-            raise
-
-    # 2) Fallback: generic SQLAlchemy handling
-
-    statement_tuple_len = 2
-
-    def _exec_one(c: Any, stmt: Any) -> Any:
-        if (
-            isinstance(stmt, tuple)
-            and len(stmt) == statement_tuple_len
-            and isinstance(stmt[0], str)
-            and isinstance(stmt[1], dict)
-        ):
-            dprint("run (sql, params):", stmt[0], stmt[1])
-            return c.execute(text(stmt[0]), stmt[1])
-        if isinstance(stmt, ClauseElement):
-            dprint("run ClauseElement")
-            return c.execute(stmt)
-        if isinstance(stmt, str):
-            dprint("run sql:", stmt)
-            return c.execute(text(stmt))
-        # Sequences (recursive)
-        if isinstance(stmt, Iterable) and not isinstance(stmt, (bytes, bytearray, str)):
-            res = None
-            for s in stmt:
-                res = _exec_one(c, s)
-            return res
-        raise TypeError(f"Unsupported statement type: {type(stmt)} → {stmt!r}")
-
-    if hasattr(con, "begin"):
-        with con.begin() as c:
-            return _exec_one(c, sql)
-    # Last resort: best effort
-    return _exec_one(con, sql)
-
-
-def _scalar(con: Any, sql: Any) -> Any:
-    """Execute SQL and return the first column of the first row (or None)."""
-    try:
-        res = _exec(con, sql)
-    except Exception as e:
-        # Caller adds the check name in _fail()
-        raise e
-    row = getattr(res, "fetchone", lambda: None)()
-    return None if row is None else row[0]
+# ===== Execution helpers ==================
 
 
 def _fail(check: str, table: str, column: str | None, sql: str, detail: str) -> None:
@@ -129,7 +54,7 @@ def sql_list(values: list[Any] | None) -> str:
 
 
 def accepted_values(
-    con: Any, table: str, column: str, *, values: list[Any], where: str | None = None
+    executor: BaseExecutor, table: str, column: str, *, values: list[Any], where: str | None = None
 ) -> None:
     """
     Fail if any non-NULL value of table.column is outside the set 'values'.
@@ -143,7 +68,7 @@ def accepted_values(
 
     sql = f"select count(*) from {table} where {column} is not null and {column} not in ({in_list})"
 
-    n = _scalar(con, sql)
+    n = _scalar(executor, sql)
     if int(n or 0) > 0:
         sample_sql = f"select distinct {column} from {table} where {column} is not null"
         if in_list:
@@ -152,7 +77,7 @@ def accepted_values(
             sql += f" and ({where})"
             sample_sql += f" and ({where})"
         sample_sql += " limit 5"
-        rows = [r[0] for r in _exec(con, sample_sql).fetchall()]
+        rows = [r[0] for r in executor.execute_test_sql(sample_sql).fetchall()]
         raise TestFailure(f"{table}.{column} has {n} value(s) outside accepted set; e.g. {rows}")
 
 
@@ -182,13 +107,13 @@ def _wrap_db_error(
     return TestFailure("\n".join(msg))
 
 
-def not_null(con: Any, table: str, column: str, where: str | None = None) -> None:
+def not_null(executor: BaseExecutor, table: str, column: str, where: str | None = None) -> None:
     """Fails if any non-filtered row has NULL in `column`."""
     sql = f"select count(*) from {table} where {column} is null"
     if where:
         sql += f" and ({where})"
     try:
-        c = _scalar(con, sql)
+        c = _scalar(executor, sql)
     except Exception as e:
         raise _wrap_db_error("not_null", table, column, sql, e) from e
     dprint("not_null:", sql, "=>", c)
@@ -196,7 +121,7 @@ def not_null(con: Any, table: str, column: str, where: str | None = None) -> Non
         _fail("not_null", table, column, sql, f"has {c} NULL-values")
 
 
-def unique(con: Any, table: str, column: str, where: str | None = None) -> None:
+def unique(executor: BaseExecutor, table: str, column: str, where: str | None = None) -> None:
     """Fails if any duplicate appears in `column` within the (optionally) filtered set."""
     sql = (
         "select count(*) from (select {col} as v, "
@@ -205,7 +130,7 @@ def unique(con: Any, table: str, column: str, where: str | None = None) -> None:
     w = f" where ({where})" if where else ""
     sql = sql.format(col=column, tbl=table, w=w)
     try:
-        c = _scalar(con, sql)
+        c = _scalar(executor, sql)
     except Exception as e:
         raise _wrap_db_error("unique", table, column, sql, e) from e
     dprint("unique:", sql, "=>", c)
@@ -213,25 +138,111 @@ def unique(con: Any, table: str, column: str, where: str | None = None) -> None:
         _fail("unique", table, column, sql, f"contains {c} duplicates")
 
 
-def greater_equal(con: Any, table: str, column: str, threshold: float = 0.0) -> None:
+def greater_equal(executor: BaseExecutor, table: str, column: str, threshold: float = 0.0) -> None:
     sql = f"select count(*) from {table} where {column} < {threshold}"
-    c = _scalar(con, sql)
+    c = _scalar(executor, sql)
     dprint("greater_equal:", sql, "=>", c)
     if c and c != 0:
         raise TestFailure(f"{table}.{column} has {c} values < {threshold}")
 
 
-def non_negative_sum(con: Any, table: str, column: str) -> None:
+def between(
+    executor: BaseExecutor,
+    table: str,
+    column: str,
+    *,
+    min_value: float | int | None = None,
+    max_value: float | int | None = None,
+) -> None:
+    """
+    Fail if any non-NULL value of table.column is outside the inclusive
+    range [min_value, max_value]. If one bound is None, only the other
+    is enforced.
+    """
+    if min_value is None and max_value is None:
+        return
+
+    conds: list[str] = []
+    if min_value is not None:
+        conds.append(f"{column} < {min_value}")
+    if max_value is not None:
+        conds.append(f"{column} > {max_value}")
+
+    where_expr = " or ".join(conds)
+    sql = f"select count(*) from {table} where {column} is not null and ({where_expr})"
+    c = _scalar(executor, sql)
+    dprint("between:", sql, "=>", c)
+
+    if c and c != 0:
+        if min_value is not None and max_value is not None:
+            raise TestFailure(
+                f"{table}.{column} has {c} value(s) outside inclusive range "
+                f"[{min_value}, {max_value}]"
+            )
+        elif min_value is not None:
+            raise TestFailure(f"{table}.{column} has {c} value(s) < {min_value}")
+        else:
+            raise TestFailure(f"{table}.{column} has {c} value(s) > {max_value}")
+
+
+def regex_match(
+    executor: BaseExecutor,
+    table: str,
+    column: str,
+    pattern: str,
+    where: str | None = None,
+) -> None:
+    """
+    Fail if any non-NULL value in table.column does not match the given
+    Python regex pattern. This is implemented client-side for engine
+    independence:
+
+        SELECT column FROM table [WHERE ...]
+        -> evaluate in Python -> fail on first few mismatches.
+    """
+    try:
+        regex = re.compile(pattern)
+    except re.error as exc:
+        raise TestFailure(f"Invalid regex pattern {pattern!r} for {table}.{column}: {exc}") from exc
+
+    sql = f"select {column} from {table}"
+    if where:
+        sql += f" where ({where})"
+
+    res = executor.execute_test_sql(sql)
+    rows: list = getattr(res, "fetchall", lambda: [])()
+
+    bad_values: list[Any] = []
+    for row in rows:
+        val = row[0]
+        if val is None:
+            continue
+        if not regex.match(str(val)):
+            bad_values.append(val)
+            if len(bad_values) >= 5:
+                break
+
+    dprint("regex_match:", sql, "=> bad_values:", bad_values)
+
+    if bad_values:
+        raise TestFailure(
+            f"{table}.{column} has values not matching regex {pattern!r}; examples: {bad_values}"
+        )
+
+
+def non_negative_sum(executor: BaseExecutor, table: str, column: str) -> None:
     sql = f"select coalesce(sum({column}),0) from {table}"
-    s = _scalar(con, sql)
+    s = _scalar(executor, sql)
     dprint("non_negative_sum:", sql, "=>", s)
     if s is not None and s < 0:
         raise TestFailure(f"sum({table}.{column}) is negative: {s}")
 
 
-def row_count_between(con: Any, table: str, min_rows: int = 1, max_rows: int | None = None) -> None:
+def row_count_between(
+    executor: BaseExecutor, table: str, min_rows: int = 1, max_rows: int | None = None
+) -> None:
     sql = f"select count(*) from {table}"
-    c = _scalar(con, sql)
+    c = _scalar(executor, sql)
     dprint("row_count_between:", sql, "=>", c)
     if c is None or c < min_rows:
         raise TestFailure(f"{table} has too few rows: {c} < {min_rows}")
@@ -239,142 +250,77 @@ def row_count_between(con: Any, table: str, min_rows: int = 1, max_rows: int | N
         raise TestFailure(f"{table} has too many rows: {c} > {max_rows}")
 
 
-def _freshness_probe(con: Any, table: str, ts_col: str) -> Any:
+def _freshness_probe(executor: BaseExecutor, table: str, ts_col: str) -> Any:
     """Read max(ts_col) and wrap engine errors with context."""
     probe_sql = f"select max({ts_col}) from {table}"
     try:
-        return _scalar(con, probe_sql)
+        return _scalar(executor, probe_sql)
     except Exception as e:
         # Column missing or other metadata-related DB error
         raise _wrap_db_error("freshness", table, ts_col, probe_sql, e) from e
 
 
-def _detect_engine(con: Any) -> tuple[bool, bool, bool, bool]:
+def _resolve_expected_physical(
+    physical_cfg: PhysicalTypeConfig | None,
+    engine_key: str,
+) -> str | None:
     """
-    Detect engine flavour from the connection object.
+    Given the PhysicalTypeConfig and an engine key, return the expected
+    physical type string for that engine, or None if nothing is declared.
 
-    Returns:
-        (is_spark_like, is_bigquery, is_snowflake, is_duckdb)
+    Precedence:
+      1) physical.<engine_key>
+      2) physical.default
     """
-    con_type = type(con)
-    mod = getattr(con_type, "__module__", "") or ""
-    name = getattr(con_type, "__name__", "") or ""
-    mod_l = mod.lower()
-    name_l = name.lower()
+    if physical_cfg is None:
+        return None
 
-    is_spark_like = any(token in mod_l or token in name_l for token in ("spark", "databricks"))
-    is_bigquery = (
-        "bigquery" in mod_l
-        or "bigquery" in name_l
-        or str(getattr(con, "marker", "")).upper() == "BQ_SHIM"
-    )
-    is_snowflake = (
-        "snowflake" in mod_l
-        or "snowpark" in mod_l
-        or "snowflake" in name_l
-        or "snowpark" in name_l
-        or hasattr(con, "_session")
-    )
-    is_duckdb = "duckdb" in mod_l or "duckdb" in name_l
+    # Engine-specific override
+    eng_val = getattr(physical_cfg, engine_key, None)
+    if isinstance(eng_val, str) and eng_val.strip():
+        return eng_val.strip()
 
-    return is_spark_like, is_bigquery, is_snowflake, is_duckdb
+    # Fallback to default
+    if isinstance(physical_cfg.default, str) and physical_cfg.default.strip():
+        return physical_cfg.default.strip()
+
+    return None
 
 
-def _compute_delay_minutes(
-    con: Any,
+def column_physical_type(
+    executor: BaseExecutor,
     table: str,
-    ts_col: str,
-    is_spark_like: bool,
-    is_bigquery: bool,
-    is_snowflake: bool,
-    is_duckdb: bool,
-) -> tuple[float | None, str]:
+    column: str,
+    physical_cfg: PhysicalTypeConfig | None,
+) -> None:
     """
-    Compute delay in minutes for max(ts_col) depending on engine type.
-
-    Returns:
-        (delay_minutes, sql_used)
+    Assert that the physical DB type of table.column matches the contract's
+    PhysicalTypeConfig for the current engine.
     """
-    # Primary SQL (Postgres / DuckDB style)
-    now_expr = "now()"
-    if is_duckdb:
-        now_expr = "cast(now() as timestamp)"
+    engine_key = executor.engine_name
+    expected = _resolve_expected_physical(physical_cfg, engine_key)
+    if not expected:
+        # No expectation configured for this engine → nothing to enforce.
+        return
 
-    sql_primary = (
-        f"select date_part('epoch', {now_expr} - max({ts_col})) / 60.0 as delay_min from {table}"
-    )
+    actual = executor.introspect_column_physical_type(table, column)
+    if actual is None:
+        raise TestFailure(
+            f"[column_physical_type] Could not determine physical type for {table}.{column} "
+            f"(engine={engine_key}). Ensure the table exists and the column name is correct."
+        )
 
-    # Spark / Databricks: unix_timestamp over timestamps
-    sql_spark = (
-        f"select (unix_timestamp(current_timestamp()) - unix_timestamp(max({ts_col}))) / 60.0 "
-        f"as delay_min from {table}"
-    )
+    exp_norm = executor.normalize_physical_type(expected)
+    act_norm = executor.normalize_physical_type(actual)
 
-    # BigQuery: TIMESTAMP_DIFF returns integer minutes; keep float compatibility
-    sql_bigquery = (
-        f"select cast(TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), max({ts_col}), MINUTE) as float64) "
-        f"as delay_min from {table}"
-    )
-
-    # Snowflake: DATEDIFF on minutes; cast to float to align with other engines
-    sql_snowflake = (
-        f"select DATEDIFF('minute', max({ts_col}), "
-        f"CURRENT_TIMESTAMP())::float as delay_min from {table}"
-    )
-
-    delay: float | None = None
-    sql_used: str
-
-    if is_spark_like:
-        # For Spark-like engines we never send the date_part('epoch', ...) SQL,
-        # to avoid INVALID_EXTRACT_FIELD noise in the logs.
-        sql_used = sql_spark
-        try:
-            delay = _scalar(con, sql_spark)
-        except Exception as e:
-            raise _wrap_db_error("freshness", table, ts_col, sql_spark, e) from e
-
-    elif is_bigquery:
-        sql_used = sql_bigquery
-        try:
-            delay = _scalar(con, sql_bigquery)
-        except Exception as e:
-            # BigQuery error messages don't mention EXTRACT/EPOCH; surface directly.
-            raise _wrap_db_error("freshness", table, ts_col, sql_bigquery, e) from e
-
-    elif is_snowflake:
-        sql_used = sql_snowflake
-        try:
-            delay = _scalar(con, sql_snowflake)
-        except Exception as e:
-            raise _wrap_db_error("freshness", table, ts_col, sql_snowflake, e) from e
-
-    else:
-        # Non-Spark engines: try the Postgres/DuckDB expression first.
-        sql_used = sql_primary
-        try:
-            delay = _scalar(con, sql_primary)
-        except Exception as e:
-            txt = str(e).lower()
-            # If the engine complains about invalid extract fields / epoch,
-            # attempt the Spark-style expression as a fallback.
-            if (
-                "invalid_extract_field" in txt
-                or "cannot extract" in txt
-                or ("epoch" in txt and "extract" in txt)
-            ):
-                sql_used = sql_spark
-                try:
-                    delay = _scalar(con, sql_spark)
-                except Exception as e2:
-                    raise _wrap_db_error("freshness", table, ts_col, sql_spark, e2) from e2
-            else:
-                raise _wrap_db_error("freshness", table, ts_col, sql_primary, e) from e
-
-    return delay, sql_used
+    if exp_norm != act_norm:
+        raise TestFailure(
+            f"{table}.{column} has physical type {actual!r}, expected {expected!r} "
+            f"for engine {engine_key}"
+        )
 
 
-def freshness(con: Any, table: str, ts_col: str, max_delay_minutes: int) -> None:
+def freshness(executor: BaseExecutor, table: str, ts_col: str, max_delay_minutes: int) -> None:
     """
     Fail if the latest timestamp in `ts_col` is older than `max_delay_minutes`.
 
@@ -391,7 +337,7 @@ def freshness(con: Any, table: str, ts_col: str, max_delay_minutes: int) -> None
     we do not trigger noisy INVALID_EXTRACT_FIELD logs from the planner.
     """
     # 1) Probe type: read max(ts_col) and inspect the Python value that comes back.
-    probe = _freshness_probe(con, table, ts_col)
+    probe = _freshness_probe(executor, table, ts_col)
 
     # If max(...) comes back as a string, this is almost certainly a typed-as-VARCHAR
     # timestamp column. Fail with a clear hint instead of letting the engine throw.
@@ -404,17 +350,8 @@ def freshness(con: Any, table: str, ts_col: str, max_delay_minutes: int) -> None
             "and then reference that column in the freshness test."
         )
 
-    # 2) Compute delay based on connection type.
-    is_spark_like, is_bigquery, is_snowflake, is_duckdb = _detect_engine(con)
-    delay, sql_used = _compute_delay_minutes(
-        con=con,
-        table=table,
-        ts_col=ts_col,
-        is_spark_like=is_spark_like,
-        is_bigquery=is_bigquery,
-        is_snowflake=is_snowflake,
-        is_duckdb=is_duckdb,
-    )
+    # 2) Compute delay based on executor (engine-specific hook).
+    delay, sql_used = executor.compute_freshness_delay_minutes(table, ts_col)
 
     dprint("freshness:", sql_used, "=>", delay)
 
@@ -429,15 +366,15 @@ def freshness(con: Any, table: str, ts_col: str, max_delay_minutes: int) -> None
 # ===== Cross-table reconciliations (FF-310) ======================================
 
 
-def _scalar_where(con: Any, table: str, expr: str, where: str | None = None) -> Any:
+def _scalar_where(executor: BaseExecutor, table: str, expr: str, where: str | None = None) -> Any:
     """Return the first scalar from `SELECT {expr} FROM {table} [WHERE ...]`."""
     sql = f"select {expr} from {table}" + (f" where {where}" if where else "")
     dprint("reconcile:", sql)
-    return _scalar(con, sql)
+    return _scalar(executor, sql)
 
 
 def reconcile_equal(
-    con: Any,
+    executor: BaseExecutor,
     left: dict,
     right: dict,
     abs_tolerance: float | None = None,
@@ -448,8 +385,8 @@ def reconcile_equal(
     Both sides are dictionaries: {"table": str, "expr": str, "where": Optional[str]}.
     If both tolerances are omitted, exact equality is enforced.
     """
-    L = _scalar_where(con, left["table"], left["expr"], left.get("where"))
-    R = _scalar_where(con, right["table"], right["expr"], right.get("where"))
+    L = _scalar_where(executor, left["table"], left["expr"], left.get("where"))
+    R = _scalar_where(executor, right["table"], right["expr"], right.get("where"))
     if L is None or R is None:
         raise TestFailure(f"One side is NULL (left={L}, right={R})")
     diff = abs(float(L) - float(R))
@@ -475,11 +412,11 @@ def reconcile_equal(
 
 
 def reconcile_ratio_within(
-    con: Any, left: dict, right: dict, min_ratio: float, max_ratio: float
+    executor: BaseExecutor, left: dict, right: dict, min_ratio: float, max_ratio: float
 ) -> None:
     """Assert min_ratio <= (left/right) <= max_ratio."""
-    L = _scalar_where(con, left["table"], left["expr"], left.get("where"))
-    R = _scalar_where(con, right["table"], right["expr"], right.get("where"))
+    L = _scalar_where(executor, left["table"], left["expr"], left.get("where"))
+    R = _scalar_where(executor, right["table"], right["expr"], right.get("where"))
     if L is None or R is None:
         raise TestFailure(f"One side is NULL (left={L}, right={R})")
     eps = 1e-12
@@ -491,10 +428,12 @@ def reconcile_ratio_within(
         )
 
 
-def reconcile_diff_within(con: Any, left: dict, right: dict, max_abs_diff: float) -> None:
+def reconcile_diff_within(
+    executor: BaseExecutor, left: dict, right: dict, max_abs_diff: float
+) -> None:
     """Assert |left - right| <= max_abs_diff."""
-    L = _scalar_where(con, left["table"], left["expr"], left.get("where"))
-    R = _scalar_where(con, right["table"], right["expr"], right.get("where"))
+    L = _scalar_where(executor, left["table"], left["expr"], left.get("where"))
+    R = _scalar_where(executor, right["table"], right["expr"], right.get("where"))
     if L is None or R is None:
         raise TestFailure(f"One side is NULL (left={L}, right={R})")
     diff = abs(float(L) - float(R))
@@ -503,7 +442,7 @@ def reconcile_diff_within(con: Any, left: dict, right: dict, max_abs_diff: float
 
 
 def reconcile_coverage(
-    con: Any,
+    executor: BaseExecutor,
     source: dict,
     target: dict,
     source_where: str | None = None,
@@ -521,14 +460,14 @@ def reconcile_coverage(
       left join tgt t on s.k = t.k
       where t.k is null
     """
-    missing = _scalar(con, sql)
+    missing = _scalar(executor, sql)
     dprint("reconcile_coverage:", sql, "=>", missing)
     if missing and missing != 0:
         raise TestFailure(f"Coverage failed: {missing} source keys missing in target")
 
 
 def relationships(
-    con: Any,
+    executor: BaseExecutor,
     table: str,
     field: str,
     to_table: str,
@@ -551,7 +490,7 @@ def relationships(
       where p.k is null
     """
     try:
-        missing = _scalar(con, sql)
+        missing = _scalar(executor, sql)
     except Exception as e:
         raise _wrap_db_error("relationships", table, field, sql, e) from e
     dprint("relationships:", sql, "=>", missing)

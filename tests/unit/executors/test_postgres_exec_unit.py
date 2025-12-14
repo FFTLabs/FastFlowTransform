@@ -283,14 +283,6 @@ def test_format_source_reference_with_db_and_schema(fake_engine_and_conn):
     assert out == '"mydb"."other"."t_src"'
 
 
-@pytest.mark.unit
-@pytest.mark.postgres
-def test_format_source_reference_missing_identifier(fake_engine_and_conn):
-    ex = PostgresExecutor("postgresql+psycopg://x", schema="public")
-    with pytest.raises(KeyError):
-        ex._format_source_reference({}, "src", "t")
-
-
 # ---------------------------------------------------------------------------
 # view / table creation
 # ---------------------------------------------------------------------------

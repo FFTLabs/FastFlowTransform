@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import typer
 
-from fastflowtransform.cli.bootstrap import _get_test_con, _prepare_context
+from fastflowtransform.cli.bootstrap import _prepare_context
 from fastflowtransform.cli.options import EngineOpt, EnvOpt, ProjectArg, VarsOpt
 from fastflowtransform.logging import bind_context, clear_context, echo
 from fastflowtransform.source_freshness import SourceFreshnessResult, run_source_freshness
@@ -31,12 +31,10 @@ def freshness(
 
     # Get a live connection / executor from the context
     execu, _run_sql, _run_py = ctx.make_executor()
-    con = _get_test_con(execu)
 
     # Run freshness checks over all sources with a configured freshness block
     results: list[SourceFreshnessResult] = run_source_freshness(
         execu,
-        con=con,
         engine=ctx.profile.engine,
     )
 

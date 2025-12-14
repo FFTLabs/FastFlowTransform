@@ -172,7 +172,7 @@ The BigQuery client in `fastflowtransform` will pick this up automatically **as 
   make ENGINE=bigquery test
   ```
 
-  `fft test` uses the BigQuery shim to run checks like `not_null`, `unique`,
+  `fft test` uses the BigQuery to run checks like `not_null`, `unique`,
   `row_count_between`, `greater_equal`, etc. against
   `${FF_BQ_PROJECT}.${FF_BQ_DATASET}.<table>`.
 

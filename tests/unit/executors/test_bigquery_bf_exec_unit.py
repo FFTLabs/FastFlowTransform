@@ -17,7 +17,6 @@ from tests.common.mock.bigquery import (
     install_fake_bigquery,
 )
 
-import fastflowtransform.executors.bigquery._bigquery_mixin as bq_mix_mod
 import fastflowtransform.executors.bigquery.base as bq_base_mod
 import fastflowtransform.executors.bigquery.bigframes as bq_exec_mod
 from fastflowtransform.core import Node
@@ -47,7 +46,7 @@ class _FakeBFSession:
 
 @pytest.fixture
 def bq_exec(monkeypatch):
-    _ = install_fake_bigquery(monkeypatch, [bq_exec_mod, bq_mix_mod, bq_base_mod])
+    _ = install_fake_bigquery(monkeypatch, [bq_exec_mod, bq_base_mod])
 
     # Test-only shim: ensure the fake bigquery module has DatasetReference,
     # which BigQueryBaseExecutor._execute_sql now relies on.
@@ -141,7 +140,7 @@ def test_materialize_relation_prefers_to_gbq(bq_exec):
 @pytest.mark.unit
 @pytest.mark.bigquery
 def test_ensure_dataset_respects_flag(monkeypatch):
-    _ = install_fake_bigquery(monkeypatch, [bq_exec_mod, bq_mix_mod, bq_base_mod])
+    _ = install_fake_bigquery(monkeypatch, [bq_exec_mod, bq_base_mod])
 
     fake_bigframes = types.ModuleType("bigframes")
     fake_conf = types.ModuleType("bigframes._config")
@@ -170,7 +169,7 @@ def test_ensure_dataset_respects_flag(monkeypatch):
 @pytest.mark.unit
 @pytest.mark.bigquery
 def test_ensure_dataset_creates_when_allowed(monkeypatch):
-    _ = install_fake_bigquery(monkeypatch, [bq_exec_mod, bq_mix_mod, bq_base_mod])
+    _ = install_fake_bigquery(monkeypatch, [bq_exec_mod, bq_base_mod])
 
     fake_bigframes = types.ModuleType("bigframes")
     fake_conf = types.ModuleType("bigframes._config")

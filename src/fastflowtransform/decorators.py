@@ -195,14 +195,14 @@ def dq_test(
         from fastflowtransform import dq_test
 
         @dq_test("email_domain_allowed")
-        def email_domain_allowed(con, table, column, params):
+        def email_domain_allowed(executor, table, column, params):
             ...
             return True, None, "select ..."
 
     If `name` is omitted, the function name is used:
 
         @dq_test()
-        def email_sanity(con, table, column, params):
+        def email_sanity(executor, table, column, params):
             ...
 
         # In project.yml / schema.yml: type: email_sanity
@@ -213,7 +213,7 @@ def dq_test(
             allowed_domains: list[str]
 
         @dq_test("email_domain_allowed", params_model=EmailTestParams)
-        def email_domain_allowed(con, table, column, params: EmailTestParams):
+        def email_domain_allowed(executor, table, column, params: EmailTestParams):
             ...
 
     Args:

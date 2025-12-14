@@ -1,159 +1,296 @@
 # Data Quality Demo Project
 
-The **Data Quality Demo** shows how to use **all built-in FFT data quality tests** plus **custom DQ tests (Python & SQL)** on a small, understandable model:
+The **Data Quality Demo** shows how to combine:
 
-* Column checks:
+- **Built-in FFT data quality tests**
+- **Tests generated from data contracts (`*.contracts.yml` + `contracts.yml`)**
+- **Custom DQ tests (Python & SQL)**
+- **Multiple engines** (DuckDB, Postgres, Databricks Spark, BigQuery, Snowflake Snowpark)
 
-  * `not_null`
-  * `unique`
-  * `accepted_values`
-  * `greater_equal`
-  * `non_negative_sum`
-  * `row_count_between`
-  * `freshness`
-* Cross-table reconciliations:
+on a small, understandable model:
 
-  * `reconcile_equal`
-  * `reconcile_ratio_within`
-  * `reconcile_diff_within`
-  * `reconcile_coverage`
+- **Column checks (from contracts + project.yml):**
+  - `column_physical_type`
+  - `not_null`
+  - `unique`
+  - `accepted_values`
+  - `between`
+  - `regex_match`
+  - `greater_equal`
+  - `non_negative_sum`
+  - `row_count_between`
+  - `freshness`
+  - `relationships`
 
-* Custom tests (demo):
+- **Cross-table reconciliations:**
+  - `reconcile_equal`
+  - `reconcile_ratio_within`
+  - `reconcile_diff_within`
+  - `reconcile_coverage`
 
-  * `min_positive_share` (Python-based)
-  * `no_future_orders` (SQL-based)
+- **Custom tests (demo):**
+  - `min_positive_share` (Python-based)
+  - `no_future_orders` (SQL-based)
 
-It uses a simple **customers / orders / mart** setup so you can see exactly what each test does and how it fails when something goes wrong.
+It uses a simple **customers / orders / mart** setup so you can see exactly what
+each test does and how it fails when something goes wrong.
 
 ---
 
 ## What this example demonstrates
 
-1. **Basic column checks** on staging tables
-   Ensure IDs are present and unique, amounts are non-negative, and status values are valid.
+1. **Basic column checks** on staging tables  
+   - Enforced via **contracts** (`*.contracts.yml` + `contracts.yml`) and
+     project tests:
+   - IDs are present / non-null, status values are constrained, numeric ranges
+     are respected, physical types match the warehouse.
 
-2. **Freshness** on a timestamp column
-   Check that the most recent order in your mart is not “too old”, using `last_order_ts`.
+2. **Freshness** on a timestamp column  
+   - Table-level `freshness` test on `orders.order_ts`.
+   - Source-level freshness via `sources.yml` for `crm.customers` / `crm.orders`.
 
-3. **Row count sanity checks**
-   Guard against empty tables and unexpectedly large row counts.
+3. **Row count sanity checks**  
+   - Guard against empty tables and unexpectedly large row counts.
 
-4. **Cross-table reconciliations** between staging and mart
-   Verify that sums and counts match between `orders` and the aggregated `mart_orders_agg`, and that every customer has a corresponding mart row.
+4. **Cross-table reconciliations** between staging and mart  
+   - Verify that sums and counts match between `orders` and the aggregated
+     `mart_orders_agg`, and that every order has a matching customer.
 
-5. **Tagged tests and selective execution**
-   All tests are tagged (e.g. `example:dq_demo`, `reconcile`) so you can run exactly the subset you care about.
+5. **Tagged tests and selective execution**  
+   - All tests are tagged (e.g. `example:dq_demo`, `reconcile`, `fk`,
+     `contract`) so you can run exactly the subset you care about.
+
+6. **Contracts-driven tests**  
+   - Per-table contracts plus project-wide defaults generate DQ tests
+     automatically (including `column_physical_type`).
 
 ---
 
-## Project layout (example)
+## Project layout
 
 ```text
 examples/dq_demo/
-  .env
+  .env.dev_bigquery_bigframes
+  .env.dev_bigquery_pandas
+  .env.dev_databricks
   .env.dev_duckdb
   .env.dev_postgres
-  .env.dev_databricks
-  .env.dev_bigquery_pandas
-  .env.dev_bigquery_bigframes
   .env.dev_snowflake
-  Makefile                  # optional, convenience wrapper around fft commands
+  Makefile
+  README.md
+  contracts.yml
   profiles.yml
   project.yml
   sources.yml
 
-  seeds/
-    customers.csv
-    orders.csv
-
   models/
-    staging/
-      customers.ff.sql
-      orders.ff.sql
+    README.md
     marts/
+      mart_orders_agg.contracts.yml
       mart_orders_agg.ff.sql
+    staging/
+      customers.contracts.yml
+      customers.ff.sql
+      orders.contracts.yml
+      orders.ff.sql
+
+  seeds/
+    README.md
+    schema.yml
+    seed_customers.csv
+    seed_orders.csv
 
   tests/
     dq/
       min_positive_share.ff.py
       no_future_orders.ff.sql
+    unit/
+      README.md
+````
+
+High level:
+
+* **`.env.dev_*`** — engine-specific environment examples
+* **`Makefile`** — convenience wrapper for seeding, running models, DAG HTML and tests
+* **`profiles.yml`** — connection profiles for all engines
+* **`project.yml`** — central place for **tests** (including reconciliations & custom DQ tests)
+* **`contracts.yml`** — project-level **contract defaults**
+* **`models/**.contracts.yml`** — per-table contracts
+* **`sources.yml`** — source definitions + freshness on raw seeds
+* **`seeds/`** — demo CSVs and seed schema
+* **`tests/dq/`** — custom DQ tests (Python + SQL)
+
+---
+
+## Seeds
+
+### `seeds/seed_customers.csv`
+
+Simple customer dimension with a creation timestamp:
+
+```csv
+customer_id,name,status,created_at
+1,Alice,active,2025-01-01T10:00:00
+2,Bob,active,2025-01-02T11:00:00
+3,Carol,inactive,2025-01-03T12:00:00
 ```
 
-### Seeds
+Columns:
 
-* `seeds/customers.csv`
-  Simple customer dimension with a creation timestamp:
-  `customer_id`, `name`, `status`, `created_at` (ISO-8601, e.g. `2025-01-01T10:00:00`).
-  The demo ships with three rows (Alice, Bob, Carol) so it’s easy to reason about failures.
+* `customer_id` – integer
+* `name` – string
+* `status` – string (`active` / `inactive`)
+* `created_at` – ISO-8601 timestamp
 
-* `seeds/orders.csv`
-  Order fact data with per-order timestamps:
-  `order_id`, `customer_id`, `amount`, `order_ts` (ISO-8601, e.g. `2025-01-10T09:00:00`).
-  One order has `amount = 0.00` so the custom `min_positive_share` test has something to complain about.
+### `seeds/seed_orders.csv`
 
-### Models
+Order fact data with per-order timestamps:
 
-**1. Staging: `customers.ff.sql`**
+```csv
+order_id,customer_id,amount,order_ts
+100,1,50.00,2025-01-10T09:00:00
+101,1,20.00,2025-01-11T09:00:00
+102,2,30.00,2025-01-11T10:00:00
+103,3,0.00,2025-01-12T10:00:00
+```
 
-* Materialized as a table.
-* Casts IDs and other fields into proper types.
-* Used as the “clean” customer dimension for downstream checks.
+Columns:
 
-  ```sql
-  {{ config(
-      materialized='table',
-      tags=[
-          'example:dq_demo',
-          'scope:staging',
-          'engine:duckdb',
-          'engine:postgres',
-          'engine:databricks_spark',
-          'engine:bigquery',
-          'engine:snowflake_snowpark'
-      ],
-  ) }}
+* `order_id` – integer
+* `customer_id` – integer
+* `amount` – double
+* `order_ts` – ISO-8601 timestamp
 
-  select
-    cast(customer_id as int)       as customer_id,
-    name,
-    status,
-    cast(created_at as timestamp)  as created_at
-  from {{ source('crm', 'customers') }};
-  ```
+**One order has `amount = 0.00`** so the custom
+`min_positive_share` test has something to complain about.
 
-**2. Staging: `orders.ff.sql`**
+### Seed schema and sources
 
-* Materialized as a table.
-* Casts fields to proper types so DQ tests work reliably:
+`seeds/schema.yml` defines target placement and types:
 
-  ```sql
-  {{ config(
-      materialized='table',
-      tags=[
-          'example:dq_demo',
-          'scope:staging',
-          'engine:duckdb',
-          'engine:postgres',
-          'engine:databricks_spark',
-          'engine:bigquery',
-          'engine:snowflake_snowpark'
-      ],
-  ) }}
+```yaml
+targets:
+  seed_customers:
+    schema: dq_demo
+  seed_orders:
+    schema: dq_demo
 
-  select
-    cast(order_id    as int)        as order_id,
-    cast(customer_id as int)        as customer_id,
-    cast(amount      as double)     as amount,
-    cast(order_ts    as timestamp)  as order_ts
-  from {{ source('crm', 'orders') }};
-  ```
+columns:
+  seed_customers:
+    customer_id: integer
+    name: string
+    status: string
+    created_at:
+      type: timestamp
+  seed_orders:
+    order_id: integer
+    customer_id: integer
+    amount: double
+    order_ts:
+      type: timestamp
+```
 
-  This is important for:
+`sources.yml` exposes them as `crm.customers` and `crm.orders` with **source
+freshness**:
 
-  * numeric checks (`greater_equal`, `non_negative_sum`)
-  * timestamp-based `freshness` checks
+```yaml
+version: 1
 
-**3. Mart: `mart_orders_agg.ff.sql`**
+sources:
+  - name: crm
+    schema: dq_demo
+    tables:
+      - name: customers
+        identifier: seed_customers
+        description: "Seeded customers table"
+        freshness:
+          loaded_at_field: _ff_loaded_at
+          warn_after:
+            count: 60
+            period: minute
+          error_after:
+            count: 240
+            period: minute
+      - name: orders
+        identifier: seed_orders
+        description: "Seeded orders table"
+        freshness:
+          loaded_at_field: _ff_loaded_at
+          warn_after:
+            count: 60
+            period: minute
+          error_after:
+            count: 240
+            period: minute
+```
+
+---
+
+## Models
+
+### 1. Staging: `models/staging/customers.ff.sql`
+
+Materialized as a table; casts IDs and timestamps into proper types and
+prepares the customer dimension:
+
+```sql
+{{ config(
+    materialized='table',
+    tags=[
+        'example:dq_demo',
+        'scope:staging',
+        'engine:duckdb',
+        'engine:postgres',
+        'engine:databricks_spark',
+        'engine:bigquery',
+        'engine:snowflake_snowpark'
+    ],
+) }}
+
+-- Staging table for customers
+select
+  cast(customer_id as int)        as customer_id,
+  name,
+  status,
+  cast(created_at as timestamp)   as created_at
+from {{ source('crm', 'customers') }};
+```
+
+### 2. Staging: `models/staging/orders.ff.sql`
+
+Materialized as a table; ensures types are suitable for numeric and freshness
+checks:
+
+```sql
+{{ config(
+    materialized='table',
+    tags=[
+        'example:dq_demo',
+        'scope:staging',
+        'engine:duckdb',
+        'engine:postgres',
+        'engine:databricks_spark',
+        'engine:bigquery',
+        'engine:snowflake_snowpark'
+    ],
+) }}
+
+-- Staging table for orders with proper types for DQ checks
+select
+  cast(order_id    as int)        as order_id,
+  cast(customer_id as int)        as customer_id,
+  cast(amount      as numeric)    as amount,
+  cast(order_ts    as timestamp)  as order_ts
+from {{ source('crm', 'orders') }};
+```
+
+This is important for:
+
+* Numeric checks (`greater_equal`, `non_negative_sum`)
+* Timestamp-based `freshness` checks on `order_ts`
+* Relationships on `customer_id`
+
+### 3. Mart: `models/marts/mart_orders_agg.ff.sql`
 
 Aggregates orders per customer and prepares data for reconciliation + freshness:
 
@@ -171,13 +308,13 @@ Aggregates orders per customer and prepares data for reconciliation + freshness:
     ],
 ) }}
 
--- Aggregate orders per customer for DQ & reconciliation tests
+-- Aggregate orders per customer for reconciliation & freshness tests
 with base as (
   select
     o.order_id,
     o.customer_id,
     -- Ensure numeric and timestamp types for downstream DQ checks
-    cast(o.amount   as double)    as amount,
+    cast(o.amount   as numeric)    as amount,
     cast(o.order_ts as timestamp) as order_ts,
     c.name   as customer_name,
     c.status as customer_status
@@ -197,70 +334,244 @@ from base
 group by customer_id, customer_name, customer_status;
 ```
 
-The important columns for DQ tests are:
+Key columns:
 
-* `status` → used for `accepted_values`
-* `order_count` and `total_amount` → used for numeric and reconciliation tests
-* `last_order_ts` → used for `freshness`
+* `status` → used by contracts (`enum`)
+* `order_count` and `total_amount` → used by reconciliation tests
+* `first_order_ts` / `last_order_ts` → available for freshness & diagnostics
+
+---
+
+## Contracts in the demo
+
+The demo uses contracts for:
+
+* **Per-table contracts** in `models/**.contracts.yml`
+* **Project-wide defaults** in `contracts.yml`
+
+See `docs/Contracts.md` for the full specification; below is how the demo uses
+it.
+
+### Project-level defaults: `contracts.yml`
+
+```yaml
+version: 1
+
+defaults:
+  columns:
+    - match:
+        name: ".*_id$"
+      type: integer
+      nullable: false
+
+    - match:
+        name: "created_at"
+      type: timestamp
+      nullable: false
+
+    - match:
+        name: ".*_ts$"
+      type: timestamp
+      nullable: true
+      description: "Timestamp-like but allowed to be null in some pipelines"
+```
+
+These rules say:
+
+* Any column ending with `_id` is an integer and not nullable.
+* Any `created_at` is a non-null timestamp.
+* Any `*_ts` column is a (possibly nullable) timestamp with a description.
+
+Defaults are *merged into* per-table contracts, but never override explicit
+settings.
+
+### Example: `models/staging/customers.contracts.yml`
+
+```yaml
+version: 1
+table: customers
+
+columns:
+  customer_id:
+    type: integer
+    nullable: false
+    physical:
+      duckdb: integer
+      postgres: integer
+      bigquery: INT64
+      snowflake_snowpark: NUMBER
+      databricks_spark: INT
+
+  name:
+    type: string
+    nullable: false
+    physical:
+      duckdb: VARCHAR
+      postgres: text
+      bigquery: STRING
+      snowflake_snowpark: TEXT
+      databricks_spark: STRING
+
+  status:
+    type: string
+    nullable: false
+    enum:
+      - active
+      - inactive
+    physical:
+      duckdb: VARCHAR
+      postgres: text
+      bigquery: STRING
+      snowflake_snowpark: TEXT
+      databricks_spark: STRING
+
+  created_at:
+    type: timestamp
+    nullable: false
+    physical:
+      duckdb: TIMESTAMP
+      postgres: timestamp without time zone
+      bigquery: TIMESTAMP
+      snowflake_snowpark: TIMESTAMP_NTZ
+      databricks_spark: TIMESTAMP
+```
+
+At runtime, these contracts get turned into tests:
+
+* `column_physical_type` for each column with `physical`
+* `not_null` for columns with `nullable: false`
+* `accepted_values` for `status` via `enum`
+* Plus any inherited defaults from `contracts.yml`
+
+Similarly, the mart has a contract at
+`models/marts/mart_orders_agg.contracts.yml` specifying types, nullability,
+and enums.
 
 ---
 
 ## Data quality configuration (`project.yml`)
 
-All tests live under `project.yml → tests:`.
-This example uses the tag `example:dq_demo` for easy selection.
+All **explicit** tests live under `project.yml → tests:`.
+Contracts produce additional tests with the tag `contract`.
 
-### Column-level checks
+The demo uses the tag `example:dq_demo` for easy selection.
+
+### Single-table & relationships tests
 
 ```yaml
 tests:
-  # 1) IDs must be present and unique
-  - type: not_null
+  # --- Single-table checks ----------------------------------------------------
+
+  - type: row_count_between
     table: customers
-    column: customer_id
+    min_rows: 1
+    max_rows: 100
     tags: [example:dq_demo, batch]
 
-  - type: unique
-    table: customers
-    column: customer_id
-    tags: [example:dq_demo, batch]
-
-  # 2) Order amounts must be >= 0
   - type: greater_equal
     table: orders
     column: amount
     threshold: 0
     tags: [example:dq_demo, batch]
 
-  # 3) Total sum of amounts must not be negative
   - type: non_negative_sum
     table: orders
     column: amount
     tags: [example:dq_demo, batch]
 
- # 4) Customer status values must be within a known set
-  - type: accepted_values
-    table: mart_orders_agg
-    column: status
-    values: ["active", "inactive", "prospect"]
-    severity: warn         # show as warning, not hard failure
-    tags: [example:dq_demo, batch]
+  - type: relationships
+    table: orders
+    column: customer_id
+    to: "ref('customers.ff')"
+    to_field: customer_id
+    tags: [example:dq_demo, fk]
 
-  # 5) Row count sanity check on mart
-  - type: row_count_between
-    table: mart_orders_agg
-    min_rows: 1
-    max_rows: 100000
-    tags: [example:dq_demo, batch]
-
-  # 6) Freshness: last order in the mart must not be "too old"
+  # Large max_delay_minutes so the example typically passes;
+  # adjust down in real projects to enforce freshness SLAs.
   - type: freshness
-    table: mart_orders_agg
-    column: last_order_ts
+    table: orders
+    column: order_ts
     max_delay_minutes: 100000000
     tags: [example:dq_demo, batch]
+```
 
-  # 7) Custom Python test: ensure at least a given share of positive amounts
+What these do:
+
+* `row_count_between` — ensure `customers` is not empty and not unexpectedly
+  large.
+* `greater_equal` / `non_negative_sum` — protect against negative `amount` and
+  weird aggregates.
+* `relationships` — enforces referential integrity:
+  every `orders.customer_id` must exist in `customers.customer_id`.
+* `freshness` — checks that the latest `order_ts` is recent enough.
+
+### Reconciliation tests
+
+```yaml
+  # --- Reconciliation checks --------------------------------------------------
+
+  - type: reconcile_equal
+    name: orders_total_matches_mart
+    tags: [example:dq_demo, reconcile]
+    left:
+      table: orders
+      expr: "sum(amount)"
+    right:
+      table: mart_orders_agg
+      expr: "sum(total_amount)"
+    abs_tolerance: 0.0
+
+  - type: reconcile_ratio_within
+    name: order_counts_match
+    tags: [example:dq_demo, reconcile]
+    left:
+      table: mart_orders_agg
+      expr: "sum(order_count)"
+    right:
+      table: orders
+      expr: "count(*)"
+    min_ratio: 0.999
+    max_ratio: 1.001
+
+  - type: reconcile_diff_within
+    name: customers_vs_orders_volume
+    tags: [example:dq_demo, reconcile]
+    left:
+      table: orders
+      expr: "count(*)"
+    right:
+      table: customers
+      expr: "count(*)"
+    max_abs_diff: 10
+
+  - type: reconcile_coverage
+    name: all_orders_have_customers
+    tags: [example:dq_demo, reconcile]
+    source:
+      table: orders
+      key: "customer_id"
+    target:
+      table: customers
+      key: "customer_id"
+```
+
+These checks ensure:
+
+* Sums match between raw `orders.amount` and `mart_orders_agg.total_amount`.
+* The number of rows in `orders` matches the sum of `order_count` in the mart.
+* Overall orders vs customers volume stays within a reasonable bound.
+* All orders reference an existing customer (coverage).
+
+### Custom tests
+
+```yaml
+  # --- Custom tests --------------------------------------------------
+  - type: no_future_orders
+    table: orders
+    column: order_ts
+    where: "order_ts is not null"
+    tags: [example:dq_demo, batch]
+
   - type: min_positive_share
     table: orders
     column: amount
@@ -268,126 +579,80 @@ tests:
       min_share: 0.75
       where: "amount <> 0"
     tags: [example:dq_demo, batch]
-
-  # 8) Custom SQL test: no future orders allowed
-  - type: no_future_orders
-    table: orders
-    column: order_ts
-    params:
-      where: "amount <> 0"
-    tags: [example:dq_demo, batch]
 ```
 
-### Cross-table reconciliations
-
-```yaml
-  # 7) Reconcile total revenue between orders and mart
-  - type: reconcile_equal
-    name: total_amount_orders_vs_mart
-    tags: [example:dq_demo, reconcile]
-    left:
-      table: orders
-      expr: "sum(amount)"
-    right:
-      table: mart_orders_agg
-      expr: "sum(total_amount)"
-    abs_tolerance: 0.01
-
-  # 8) Ratio of sums should be ~1 (within tight bounds)
-  - type: reconcile_ratio_within
-    name: total_amount_ratio
-    tags: [example:dq_demo, reconcile]
-    left:
-      table: orders
-      expr: "sum(amount)"
-    right:
-      table: mart_orders_agg
-      expr: "sum(total_amount)"
-    min_ratio: 0.999
-    max_ratio: 1.001
-
-  # 9) Row count diff between orders and mart should be bounded
-  - type: reconcile_diff_within
-    name: order_count_diff
-    tags: [example:dq_demo, reconcile]
-    left:
-      table: orders
-      expr: "count(*)"
-    right:
-      table: mart_orders_agg
-      expr: "sum(order_count)"
-    max_abs_diff: 0
-
-  # 10) Coverage: every customer should appear in the mart
-  - type: reconcile_coverage
-    name: customers_covered_in_mart
-    tags: [example:dq_demo, reconcile]
-    source:
-      table: customers
-      key: "customer_id"
-    target:
-      table: mart_orders_agg
-      key: "customer_id"
-```
-
-This set of tests touches **all available test types** and ties directly back to the simple data model.
+* `no_future_orders` — SQL-based test that fails if any order has a timestamp
+  in the future.
+* `min_positive_share` — Python-based test that requires a minimum share of
+  positive values in `amount`.
 
 ---
 
 ## Custom DQ tests (Python & SQL)
 
-The demo also shows how to define **custom data quality tests** that integrate with:
+The demo shows how to define **custom data quality tests** that integrate with:
 
-* the `project.yml → tests:` block,
-* the `fft test` CLI,
-* and the same summary output as built-in tests.
+* `project.yml → tests:`
+* `fft test`
+* The same summary output as built-in tests.
 
 ### Python-based test: `min_positive_share`
 
 File: `examples/dq_demo/tests/dq/min_positive_share.ff.py`
 
 ```python
+# examples/dq_demo/tests/dq/min_positive_share.ff.py
 from __future__ import annotations
 
 from typing import Any
+
+from pydantic import BaseModel, ConfigDict
 
 from fastflowtransform.decorators import dq_test
 from fastflowtransform.testing import base as testing
 
 
-@dq_test("min_positive_share")
+class MinPositiveShareParams(BaseModel):
+    """
+    Params for the min_positive_share test.
+
+    - min_share: required minimum share of positive values in [0, 1]
+    - where: optional WHERE predicate to filter rows
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    min_share: float = 0.5
+    where: str | None = None
+
+
+@dq_test("min_positive_share", params_model=MinPositiveShareParams)
 def min_positive_share(
-    con: Any,
+    executor: Any,
     table: str,
     column: str | None,
     params: dict[str, Any],
 ) -> tuple[bool, str | None, str | None]:
     """
-    Custom DQ test: require that at least `min_share` of rows have column > 0.
-
-    Parameters (from project.yml → tests → params):
-      - min_share: float in [0,1], e.g. 0.75
-      - where: optional filter (string) to restrict the population
+    Require that at least `min_share` of rows have column > 0.
     """
     if column is None:
         example = f"select count(*) from {table} where <column> > 0"
         return False, "min_positive_share requires a 'column' parameter", example
 
-    # Params come from project.yml under `params:`
-    cfg: dict[str, Any] = params.get("params") or params  # project.yml wrapper
-    min_share: float = cfg["min_share"]
-    where: str | None = cfg.get("where")
+    min_share: float = params["min_share"]
+    where: str | None = params.get("where")
 
     where_clause = f" where {where}" if where else ""
 
     total_sql = f"select count(*) from {table}{where_clause}"
     if where:
-        pos_sql = f"select count(*) from {table}{where_clause} and {column} > 0"
+        pos_sql = f"{total_sql} and {column} > 0"
     else:
         pos_sql = f"select count(*) from {table} where {column} > 0"
 
-    total = testing._scalar(con, total_sql)
-    positives = testing._scalar(con, pos_sql)
+    total = testing._scalar(executor, total_sql)
+    positives = testing._scalar(executor, pos_sql)
 
     example_sql = f"{pos_sql};  -- positives\n{total_sql}; -- total"
 
@@ -399,14 +664,16 @@ def min_positive_share(
         msg = (
             f"min_positive_share failed: positive share {share:.4f} "
             f"< required {min_share:.4f} "
-            f"({positives} of {total} rows have {column} > 0)"
+            f"({positives} of {total} rows have {column} > 0"
+            + (f" where {where}" if where else "")
+            + ")"
         )
         return False, msg, example_sql
 
     return True, None, example_sql
-````
+```
 
-This test is wired up from `project.yml` like this:
+Wiring in `project.yml`:
 
 ```yaml
 - type: min_positive_share
@@ -430,10 +697,11 @@ File: `examples/dq_demo/tests/dq/no_future_orders.ff.sql`
 
 -- Custom DQ test: fail if any row has a timestamp in the future.
 --
--- Conventions:
---   - {{ table }}  : table name (e.g. "orders")
---   - {{ column }} : timestamp column (e.g. "order_ts")
---   - {{ where }}  : optional filter, passed via params["where"]
+-- Context variables injected by the runner:
+--   {{ table }}   : table name (e.g. "orders")
+--   {{ column }}  : timestamp column (e.g. "order_ts")
+--   {{ where }}   : optional filter (string), from params["where"]
+--   {{ params }}  : full params dict (validated), if you ever need it
 
 select count(*) as failures
 from {{ table }}
@@ -441,144 +709,111 @@ where {{ column }} > current_timestamp
   {%- if where %} and ({{ where }}){%- endif %}
 ```
 
-And the corresponding `project.yml` test:
+And the corresponding entry in `project.yml`:
 
 ```yaml
 - type: no_future_orders
   table: orders
   column: order_ts
-  params:
-    where: "amount <> 0"
+  where: "order_ts is not null"
   tags: [example:dq_demo, batch]
 ```
 
 At runtime:
 
-* The SQL file is discovered under `tests/**/*.ff.sql`.
-* `{{ config(...) }}` tells FFT the logical `type` and allowed `params`.
-* `fft test` validates your `params:` from `project.yml` against this schema and
-  then executes the rendered SQL as a “violation count” query (`0` = pass, `>0` = fail).
+* FFT discovers `*.ff.sql` test files under `tests/dq/`.
+* `{{ config(...) }}` declares the test `type` and valid `params`.
+* `fft test` validates and injects params, then executes the query as a
+  “violation count” (`0` = pass, `>0` = fail).
 
 ---
 
 ## Running the demo
 
-Assuming you are in the repo root and using DuckDB as a starting point:
+From `examples/dq_demo/`, you can either:
 
-### 1. Seed the data
+* Use the **Makefile** (recommended), or
+* Run `fft` commands manually.
+
+### Using the Makefile
+
+Pick an engine:
 
 ```bash
+# DuckDB
+make demo ENGINE=duckdb
+
+# Postgres
+make demo ENGINE=postgres
+
+# Databricks Spark
+make demo ENGINE=databricks_spark
+
+# BigQuery (pandas or BigFrames)
+make demo ENGINE=bigquery BQ_FRAME=pandas
+make demo ENGINE=bigquery BQ_FRAME=bigframes
+
+# Snowflake Snowpark
+make demo ENGINE=snowflake_snowpark
+```
+
+The `demo` target runs:
+
+1. `fft seed` (load seeds)
+2. `fft source freshness`
+3. `fft run` (build models)
+4. `fft dag` (generate DAG HTML)
+5. `fft test` (run DQ tests)
+6. Prints locations of artifacts (manifest, run_results, catalog, DAG HTML)
+
+### Running manually (DuckDB example)
+
+From the repo root:
+
+```bash
+# 1) Seed
 fft seed examples/dq_demo --env dev_duckdb
-```
 
-This reads `seeds/customers.csv` and `seeds/orders.csv` and materializes them as tables referenced by `sources.yml`.
-
-### 2. Run the models
-
-```bash
+# 2) Build models
 fft run examples/dq_demo --env dev_duckdb
-```
 
-This builds:
-
-* `customers` (staging)
-* `orders` (staging)
-* `mart_orders_agg` (mart)
-
-### 3. Run all DQ tests
-
-```bash
+# 3) Run all DQ tests
 fft test examples/dq_demo --env dev_duckdb --select tag:example:dq_demo
 ```
 
-You should see a summary like:
+You’ll see a summary of:
 
-```text
-Data Quality Summary
-────────────────────
-✅ not_null           customers.customer_id
-✅ unique             customers.customer_id
-✅ greater_equal      orders.amount
-✅ non_negative_sum   orders.amount
-❕ accepted_values    mart_orders_agg.status
-✅ row_count_between  mart_orders_agg
-✅ freshness          mart_orders_agg.last_order_ts
-✅ reconcile_equal    total_amount_orders_vs_mart
-✅ reconcile_ratio_within total_amount_ratio
-✅ reconcile_diff_within  order_count_diff
-✅ reconcile_coverage customers_covered_in_mart
+* Tests derived from **contracts** (tag: `contract`)
+* Explicit tests from `project.yml` (tags: `batch`, `reconcile`, `fk`, …)
 
-Totals
-──────
-✓ passed: 10
-! warnings: 1
-```
-
-(Exact output will differ, but you’ll see pass/failed/warned checks listed.)
-
-### 4. Run only reconciliation tests
+You can also run just reconciliations, just FK tests, etc.:
 
 ```bash
+# Only reconciliation tests
 fft test examples/dq_demo --env dev_duckdb --select tag:reconcile
-```
 
-This executes just the cross-table checks, which is handy when you’re iterating on a mart.
+# Only FK-style relationship tests
+fft test examples/dq_demo --env dev_duckdb --select tag:fk
+```
 
 ---
 
-## BigQuery variant (pandas or BigFrames)
-
-To run the same demo on BigQuery:
-
-1. Copy `.env.dev_bigquery_pandas` or `.env.dev_bigquery_bigframes` to `.env` and fill in:
-   ```bash
-   FF_BQ_PROJECT=<your-project-id>
-   FF_BQ_DATASET=dq_demo
-   FF_BQ_LOCATION=<region>   # e.g., EU or US
-   GOOGLE_APPLICATION_CREDENTIALS=../secrets/<service-account>.json  # or rely on gcloud / WIF
-   ```
-2. Run via the Makefile from `examples/dq_demo`:
-   ```bash
-   make demo ENGINE=bigquery BQ_FRAME=pandas      # or bigframes
-   ```
-
-Both profiles accept `allow_create_dataset` in `profiles.yml` if you want the example to create the dataset automatically.
-
-## Snowflake Snowpark variant
-
-To run on Snowflake:
-
-1. Copy `.env.dev_snowflake` to `.env` and populate:
-   ```bash
-   FF_SF_ACCOUNT=<account>
-   FF_SF_USER=<user>
-   FF_SF_PASSWORD=<password>
-   FF_SF_WAREHOUSE=COMPUTE_WH
-   FF_SF_DATABASE=DQ_DEMO
-   FF_SF_SCHEMA=DQ_DEMO
-   FF_SF_ROLE=<optional-role>
-   ```
-2. Install the Snowflake extra if needed:
-   ```bash
-   pip install "fastflowtransform[snowflake]"
-   ```
-3. Run via the Makefile:
-   ```bash
-   make demo ENGINE=snowflake_snowpark
-   ```
-
-The Snowflake profile enables `allow_create_schema`, so the schema is created automatically on first run when permitted.
-
 ## Things to experiment with
 
-To understand the tests better, intentionally break the data and re-run `fft test`:
+To understand the tests better, intentionally break the data and re-run
+`fft test`:
 
-* Set one `customers.customer_id` to `NULL` → watch `not_null` fail.
-* Duplicate a `customer_id` → watch `unique` fail.
-* Put a negative `amount` in `orders.csv` → `greater_equal` and `non_negative_sum` fail.
-* Add a new `status` value (e.g. `"paused"`) → `accepted_values` warns.
-* Drop a customer from `mart_orders_agg` manually (or filter it out in SQL) → `reconcile_coverage` fails.
+* Set one `customers.customer_id` to `NULL` → `not_null` (from contracts) fails.
+* Duplicate a `customer_id` → `unique` (from contracts) fails.
+* Put a negative `amount` in `seed_orders.csv` → `greater_equal` and
+  `non_negative_sum` fail.
+* Change `status` to a value not in the enum → `accepted_values` fails.
+* Drop a customer from `customers` or change an ID → `relationships` and
+  reconciliation tests complain.
 * Change an amount in the mart only → reconciliation tests fail.
+* Push an order timestamp into the future → `no_future_orders` fails.
+* Change a physical column type in the warehouse to disagree with the
+  contract → `column_physical_type` fails.
 
 This makes it very clear what each test guards against.
 
@@ -589,24 +824,38 @@ This makes it very clear what each test guards against.
 The Data Quality Demo is designed to be:
 
 * **Small and readable** – customers, orders, and a single mart.
-* **Complete** – exercises every built-in FFT DQ test type.
+* **Complete** – exercises:
+
+  * Built-in FFT DQ tests,
+  * Tests generated from contracts,
+  * Custom Python & SQL tests.
 * **Practical** – real-world patterns like:
 
-  * typing in staging models,
-  * testing freshness on a mart timestamp,
-  * reconciling sums and row counts across tables.
+  * Typing in staging models,
+  * Testing freshness on staging tables and sources,
+  * Reconciling sums and row counts across tables,
+  * Enforcing physical types per engine.
 
-Once you’re comfortable with this example, you can copy the patterns into your real project: start with staging-level checks, then layer in reconciliations and freshness on your most important marts.
+Once you’re comfortable with this example, you can copy the patterns into your
+real projects:
+
+1. Start with **contracts** and simple column tests on staging.
+2. Add **freshness** on key timestamps and sources.
+3. Layer in **reconciliations** across marts and fact tables.
+4. Add **custom tests** when built-ins aren’t enough.
 
 > **Tip – Source vs. table freshness**
-> 
-> The demo uses the `freshness` test type on the mart (`mart_orders_agg.last_order_ts`).
-> For *source-level freshness* (e.g. “when was `crm.orders` last loaded?”), define
-> freshness rules on your sources and run:
-> 
+>
+> The demo uses:
+>
+> * `freshness` tests on tables (`orders.order_ts`), and
+> * `freshness` in `sources.yml` (via `_ff_loaded_at`).
+>
+> Run source freshness with:
+>
 > ```bash
 > fft source freshness examples/dq_demo --env dev_duckdb
 > ```
-> 
-> This complements table-level DQ tests by checking whether your inputs are recent enough
-> *before* you even build marts.
+>
+> This complements table-level DQ tests by checking whether your inputs are
+> recent enough *before* you even build marts.

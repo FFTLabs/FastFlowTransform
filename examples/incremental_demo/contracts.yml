@@ -1,0 +1,33 @@
+# Project-level contracts for incremental_demo.
+
+defaults:
+  columns:
+    - match:
+        name: "^event_id$"
+      type: integer
+      nullable: false
+
+    - match:
+        name: "^updated_at$"
+      type: timestamp
+      nullable: false
+
+enforcement:
+  # Modes: off | verify | cast
+  default_mode: off
+  allow_extra_columns: true
+
+  tables:
+    # incremental SQL examples
+    fct_events_sql_inline:
+      mode: verify
+      allow_extra_columns: true
+
+    fct_events_sql_yaml:
+      mode: verify
+      allow_extra_columns: true
+
+    # python incremental example
+    fct_events_py_incremental:
+      mode: verify
+      allow_extra_columns: true

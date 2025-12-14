@@ -1,6 +1,6 @@
 # tests/unit/render/test_this_relation_unit.py
 import pytest
-from jinja2 import Environment, FileSystemLoader, select_autoescape
+from jinja2 import Environment, FileSystemLoader
 
 from fastflowtransform.core import Node
 from fastflowtransform.executors.duckdb import DuckExecutor
@@ -9,7 +9,7 @@ from fastflowtransform.executors.duckdb import DuckExecutor
 def _env_for_tests() -> Environment:
     return Environment(
         loader=FileSystemLoader(["."]),
-        autoescape=select_autoescape([]),
+        autoescape=False,
         trim_blocks=True,
         lstrip_blocks=True,
     )
@@ -29,4 +29,4 @@ def test_this_renders_physical_relation(tmp_path):
     rendered = ex.render_sql(node, env).strip()
 
     # Assert
-    assert rendered.lower() == "select 'm' as rel"
+    assert rendered.lower() == "select '\"m\"' as rel"
