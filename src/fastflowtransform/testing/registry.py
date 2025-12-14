@@ -233,8 +233,12 @@ def run_column_physical_type(
     """
     Runner for testing.column_physical_type (schema/DDL assertion).
 
-    Params:
-      - physical: string or mapping {engine_key: type, default: type}
+    Args:
+        executor: Backend executor for querying information_schema.
+        table: Target table name.
+        column: Target column name.
+        params: Config mapping; supports `physical` as either a string type
+            or a mapping of {engine_key: type, default: type}.
     """
     physical_cfg = params.get("physical")
 

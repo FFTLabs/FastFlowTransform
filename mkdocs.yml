@@ -67,7 +67,7 @@ markdown_extensions:
       permalink: true
   - pymdownx.superfences
   - pymdownx.details
-  - pymdownx.highlight          # <— ersetzt codehilite
+  - pymdownx.highlight
   - pymdownx.inlinehilite
   - pymdownx.snippets:
       base_path:

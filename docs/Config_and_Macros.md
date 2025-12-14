@@ -56,9 +56,8 @@ FastFlowTransform discovers models under `<project>/models/` with two primary fl
 create or replace table users as
 select id, email
 from {{ source('crm', 'users') }};
-````
+```
 
-<a id="12-python-models-ffpy"></a>
 ### 1.2 Python models (`*.ff.py`)
 
 Use the `@model` decorator from `fastflowtransform.core` to register a callable. The decorator accepts:
