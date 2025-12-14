@@ -7,6 +7,7 @@ from time import perf_counter
 
 import pandas as pd
 
+from fastflowtransform.contracts.runtime.bigquery import BigQueryRuntimeContracts
 from fastflowtransform.core import Node
 from fastflowtransform.executors.bigquery.base import BigQueryBaseExecutor
 from fastflowtransform.executors.query_stats import QueryStats
@@ -14,7 +15,8 @@ from fastflowtransform.typing import BadRequest, Client, LoadJobConfig, NotFound
 
 
 class BigQueryExecutor(BigQueryBaseExecutor[pd.DataFrame]):
-    ENGINE_NAME = "bigquery"
+    ENGINE_NAME: str = "bigquery"
+    runtime_contracts: BigQueryRuntimeContracts
     """
     BigQuery executor (pandas DataFrames).
     ENV/Profiles typically use:
@@ -38,6 +40,7 @@ class BigQueryExecutor(BigQueryBaseExecutor[pd.DataFrame]):
             client=client,
             allow_create_dataset=allow_create_dataset,
         )
+        self.runtime_contracts = BigQueryRuntimeContracts(self)
 
     # ---------- Python (Frames) ----------
     def _read_relation(self, relation: str, node: Node, deps: Iterable[str]) -> pd.DataFrame:

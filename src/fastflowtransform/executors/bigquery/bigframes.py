@@ -7,6 +7,7 @@ from typing import Any
 
 import pandas as pd
 
+from fastflowtransform.contracts.runtime.bigquery import BigQueryRuntimeContracts
 from fastflowtransform.core import Node
 from fastflowtransform.executors.bigquery.base import BigQueryBaseExecutor
 from fastflowtransform.typing import (
@@ -22,7 +23,8 @@ from fastflowtransform.typing import (
 
 
 class BigQueryBFExecutor(BigQueryBaseExecutor[BFDataFrame]):
-    ENGINE_NAME = "bigquery"
+    ENGINE_NAME: str = "bigquery"
+    runtime_contracts: BigQueryRuntimeContracts
 
     def __init__(
         self,
@@ -44,6 +46,7 @@ class BigQueryBFExecutor(BigQueryBaseExecutor[BFDataFrame]):
             location=location,
             allow_create_dataset=allow_create_dataset,
         )
+        self.runtime_contracts = BigQueryRuntimeContracts(self)
 
         try:
             ctx = BigQueryOptions(

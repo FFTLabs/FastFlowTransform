@@ -9,6 +9,7 @@ from typing import Any, cast
 
 import pandas as pd
 
+from fastflowtransform.contracts.runtime.snowflake_snowpark import SnowflakeSnowparkRuntimeContracts
 from fastflowtransform.core import Node, relation_for
 from fastflowtransform.executors._budget_runner import run_sql_with_budget
 from fastflowtransform.executors._snapshot_sql_mixin import SnapshotSqlMixin
@@ -22,7 +23,8 @@ from fastflowtransform.typing import SNDF, SnowparkSession as Session
 
 
 class SnowflakeSnowparkExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[SNDF]):
-    ENGINE_NAME = "snowflake_snowpark"
+    ENGINE_NAME: str = "snowflake_snowpark"
+    runtime_contracts: SnowflakeSnowparkRuntimeContracts
     """Snowflake executor operating on Snowpark DataFrames (no pandas)."""
     _BUDGET_GUARD = BudgetGuard(
         env_var="FF_SF_MAX_BYTES",
@@ -39,6 +41,7 @@ class SnowflakeSnowparkExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecut
 
         self.allow_create_schema: bool = bool(cfg["allow_create_schema"])
         self._ensure_schema()
+        self.runtime_contracts = SnowflakeSnowparkRuntimeContracts(self)
 
     def execute_test_sql(self, stmt: Any) -> Any:
         """
@@ -366,6 +369,53 @@ class SnowflakeSnowparkExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecut
     def _frame_name(self) -> str:
         return "Snowpark"
 
+    def load_seed(
+        self, table: str, df: pd.DataFrame, schema: str | None = None
+    ) -> tuple[bool, str, bool]:
+        """
+        Materialize a pandas seed into Snowflake via Snowpark.
+
+        - Qualifies with database + schema (defaults to configured schema).
+        - Best-effort schema creation when allow_create_schema is enabled.
+        - Normalizes columns to uppercase before writing.
+        """
+        db_part, schema_part, table_part = self._normalize_table_parts_for_introspection(table)
+
+        if schema:
+            schema_part = schema.strip().strip('`"') or schema_part
+
+        target_db = db_part or self.database
+        target_schema = schema_part or self.schema
+
+        created_schema = False
+        if target_db and target_schema and getattr(self, "allow_create_schema", False):
+            db_ident = self._q(target_db)
+            schema_ident = self._q(target_schema)
+            try:
+                self.session.sql(f"CREATE SCHEMA IF NOT EXISTS {db_ident}.{schema_ident}").collect()
+                created_schema = True
+            except Exception:
+                # Best-effort; let the write fail later if schema truly missing.
+                pass
+
+        qualified = self._format_identifier(
+            table_part,
+            purpose="seed",
+            schema=target_schema,
+            catalog=target_db,
+            quote=False,
+        )
+
+        snow_df = self.session.create_dataframe(df.reset_index(drop=True))
+        cols = list(snow_df.schema.names)
+        upper_cols = [c.upper() for c in cols]
+        if cols != upper_cols:
+            snow_df = snow_df.toDF(*upper_cols)
+
+        snow_df.write.save_as_table(qualified, mode="overwrite")
+
+        return True, qualified, created_schema
+
     # ---- SQL hooks ----
     def _this_identifier(self, node: Node) -> str:
         """
@@ -654,18 +704,127 @@ class SnowflakeSnowparkExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecut
         with suppress(Exception):
             self.session.sql(f"DROP TABLE IF EXISTS {qualified}").collect()
 
-    def introspect_column_physical_type(self, table: str, column: str) -> str | None:
+    def _normalize_table_parts_for_introspection(self, table: str) -> tuple[str, str, str]:
         """
-        Snowflake: read DATA_TYPE from database.information_schema.columns.
+        Return (database, schema, table_name) for a possibly qualified identifier.
+
+        Accepts:
+          - TABLE
+          - SCHEMA.TABLE
+          - DATABASE.SCHEMA.TABLE
+
+        Quotes/backticks are stripped best-effort; names are returned as raw strings.
         """
-        db_ident = self._q(self.database)
-        schema_lit = self.schema.replace("'", "''").upper()
-        table_name = table.split(".")[-1]
-        table_lit = table_name.replace("'", "''").upper()
-        col_lit = column.replace("'", "''").upper()
+        raw = (table or "").strip()
+        raw = raw.replace('"', "").replace("`", "")
+        parts = [p for p in raw.split(".") if p]
+
+        if len(parts) >= 3:
+            db, sch, tbl = parts[-3], parts[-2], parts[-1]
+            return db, sch, tbl
+        if len(parts) == 2:
+            sch, tbl = parts[0], parts[1]
+            return self.database, sch, tbl
+        return self.database, self.schema, parts[0] if parts else raw
+
+    def _compose_snowflake_type(
+        self,
+        data_type: Any,
+        char_max: Any,
+        num_precision: Any,
+        num_scale: Any,
+    ) -> str:
+        dt = str(data_type).strip().upper()
+
+        def _to_int(v: Any) -> int | None:
+            try:
+                if v is None:
+                    return None
+                return int(v)
+            except Exception:
+                return None
+
+        SF_VARCHAR_MAX = 16777216
+
+        if dt in {"NUMBER", "DECIMAL", "NUMERIC"}:
+            p = _to_int(num_precision)
+            s = _to_int(num_scale)
+            if s is None:
+                s = 0
+
+            # Treat integer NUMBERs as base NUMBER so contracts can just say "NUMBER"
+            if s == 0:
+                return "NUMBER"
+
+            # Only surface precision/scale for non-integer decimals
+            if p is None:
+                return "NUMBER"
+            return f"NUMBER({p},{s})"
+
+        if dt in {"VARCHAR", "CHAR", "CHARACTER", "STRING", "TEXT"}:
+            n = _to_int(char_max)
+            if n is None or n <= 0 or n >= SF_VARCHAR_MAX:
+                return "VARCHAR"
+            return f"VARCHAR({n})"
+
+        return dt
+
+    def introspect_table_physical_schema(self, table: str) -> dict[str, str]:
+        """
+        Snowflake: return {lower(column_name): type_string} for all columns.
+
+        Uses <db>.information_schema.columns and composes NUMBER(p,s) / VARCHAR(n)
+        when metadata is present.
+        """
+        db, sch, tbl = self._normalize_table_parts_for_introspection(table)
+
+        db_ident = self._q(db)
+        schema_lit = sch.replace("'", "''").upper()
+        table_lit = tbl.replace("'", "''").upper()
 
         sql = f"""
-        select data_type
+        select
+            column_name,
+            data_type,
+            character_maximum_length,
+            numeric_precision,
+            numeric_scale
+        from {db_ident}.information_schema.columns
+        where upper(table_schema) = '{schema_lit}'
+          and upper(table_name)   = '{table_lit}'
+        order by ordinal_position
+        """
+
+        rows = self._execute_sql(sql).collect()
+        out: dict[str, str] = {}
+
+        for r in rows or []:
+            col_name = str(r[0]) if r and r[0] is not None else None
+            if not col_name:
+                continue
+            typ = self._compose_snowflake_type(r[1], r[2], r[3], r[4])
+            out[col_name.lower()] = typ
+
+        return out
+
+    def introspect_column_physical_type(self, table: str, column: str) -> str | None:
+        """
+        Snowflake: read column type from information_schema.columns and return a composed
+        type string (e.g. NUMBER(38,0), VARCHAR(16777216), TIMESTAMP_NTZ).
+        """
+        db, sch, tbl = self._normalize_table_parts_for_introspection(table)
+
+        db_ident = self._q(db)
+        schema_lit = sch.replace("'", "''").upper()
+        table_lit = tbl.replace("'", "''").upper()
+        col_lit = (column or "").replace("'", "''").upper()
+
+        sql = f"""
+        select
+            data_type,
+            character_maximum_length,
+            numeric_precision,
+            numeric_scale
         from {db_ident}.information_schema.columns
         where upper(table_schema) = '{schema_lit}'
           and upper(table_name)   = '{table_lit}'
@@ -676,36 +835,5 @@ class SnowflakeSnowparkExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecut
         rows = self._execute_sql(sql).collect()
         if not rows:
             return None
-        # first column of first row
-        return str(rows[0][0]) if rows[0] and rows[0][0] is not None else None
-
-    def load_seed(
-        self, table: str, df: pd.DataFrame, schema: str | None = None
-    ) -> tuple[bool, str, bool]:
-        target_db = self.database
-        target_schema = schema or self.schema
-
-        if not target_db or not target_schema:
-            raise RuntimeError("Snowflake seeding requires database and schema.")
-
-        created_schema = False
-        if self.allow_create_schema:
-            self.session.sql(
-                f'CREATE SCHEMA IF NOT EXISTS "{target_db}"."{target_schema}"'
-            ).collect()
-            created_schema = True
-
-        self.session.write_pandas(
-            df,
-            table_name=table,
-            database=target_db,
-            schema=target_schema,
-            auto_create_table=True,
-            quote_identifiers=False,
-            overwrite=True,
-            use_logical_type=True,
-        )
-
-        full_name = f'"{target_db}"."{target_schema}"."{table}"'
-
-        return True, full_name, created_schema
+        r = rows[0]
+        return self._compose_snowflake_type(r[0], r[1], r[2], r[3])

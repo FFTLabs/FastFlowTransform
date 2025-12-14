@@ -1,6 +1,7 @@
 # fastflowtransform/contracts/runtime/base.by
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any, Protocol, TypeVar
 
@@ -72,6 +73,34 @@ def _resolve_physical_type_for_engine(
     return None
 
 
+def _canonicalize_physical_type(engine_name: str, typ: str | None) -> str | None:
+    """
+    Apply minimal, engine-specific normalization so expected vs. actual types
+    compare predictably. Keep this small and focused on real metadata quirks.
+    """
+    if typ is None:
+        return None
+    engine = (engine_name or "").lower()
+    t = typ.strip()
+    if not t:
+        return None
+
+    # Snowflake: information_schema reports all string-family types as TEXT with a
+    # length column; normalize common aliases to VARCHAR and drop the huge default.
+    if engine.startswith("snowflake"):
+        upper = t.upper()
+        if upper in {"TEXT", "STRING", "CHAR", "CHARACTER"}:
+            return "VARCHAR"
+        if re.fullmatch(r"VARCHAR\s*\(\s*16777216\s*\)", upper):
+            return "VARCHAR"
+        if upper in {"DECIMAL", "NUMERIC"}:
+            return "NUMBER"
+        return upper
+
+    # Default: case-insensitive comparison only.
+    return t.upper()
+
+
 def expected_physical_schema(
     *,
     executor: ContractExecutor,
@@ -91,7 +120,9 @@ def expected_physical_schema(
         phys = col_model.physical
         typ = _resolve_physical_type_for_engine(phys, engine)
         if typ:
-            result[col_name] = typ
+            canon = _canonicalize_physical_type(engine, typ)
+            if canon:
+                result[col_name] = canon
 
     return result
 

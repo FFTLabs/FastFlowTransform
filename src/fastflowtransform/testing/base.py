@@ -310,8 +310,8 @@ def column_physical_type(
             f"(engine={engine_key}). Ensure the table exists and the column name is correct."
         )
 
-    exp_norm = str(expected).strip().lower()
-    act_norm = str(actual).strip().lower()
+    exp_norm = executor.normalize_physical_type(expected)
+    act_norm = executor.normalize_physical_type(actual)
 
     if exp_norm != act_norm:
         raise TestFailure(

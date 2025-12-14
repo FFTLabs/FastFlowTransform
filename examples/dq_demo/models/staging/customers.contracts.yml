@@ -19,7 +19,7 @@ columns:
       duckdb: VARCHAR
       postgres: text
       bigquery: STRING
-      snowflake_snowpark: TEXT
+      snowflake_snowpark: VARCHAR
       databricks_spark: STRING
 
   status:
@@ -32,7 +32,7 @@ columns:
       duckdb: VARCHAR
       postgres: text
       bigquery: STRING
-      snowflake_snowpark: TEXT
+      snowflake_snowpark: VARCHAR
       databricks_spark: STRING
 
   created_at:

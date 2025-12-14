@@ -456,9 +456,19 @@ class BigQueryBaseExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[TF
         """
         self._execute_sql(sql).result()
 
-    def introspect_column_physical_type(self, table: str, column: str) -> str | None:
+    def _introspect_columns_metadata(
+        self,
+        table: str,
+        *,
+        column: str | None = None,
+    ) -> list[tuple[str, str]]:
         """
-        BigQuery: read DATA_TYPE from INFORMATION_SCHEMA.COLUMNS, handling qualified names.
+        Internal helper: return [(column_name_lower, data_type_upper), ...]
+        for a BigQuery table using INFORMATION_SCHEMA.COLUMNS.
+
+        Accepts:
+          - `table` as "table" or "dataset.table" or "project.dataset.table"
+          - optional `column` to restrict to a single column
         """
         project = self.project
         dataset = self.dataset
@@ -475,37 +485,41 @@ class BigQueryBaseExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[TF
         project = project.strip("`") if project else project
 
         if not table_name:
-            return None
+            return []
 
-        sql = """
-        select data_type
-        from `{catalog}.{schema}.INFORMATION_SCHEMA.COLUMNS`
-        where lower(table_name) = lower(@t)
-          and lower(column_name) = lower(@c)
-        limit 1
+        where = ["lower(table_name) = lower(@t)"]
+        params = [bigquery.ScalarQueryParameter("t", "STRING", table_name)]
+
+        if column is not None:
+            where.append("lower(column_name) = lower(@c)")
+            params.append(bigquery.ScalarQueryParameter("c", "STRING", column))
+
+        sql = f"""
+        select lower(column_name) as column_name, upper(data_type) as data_type
+        from `{project}.{dataset}.INFORMATION_SCHEMA.COLUMNS`
+        where {" and ".join(where)}
+        order by ordinal_position
         """
-        sql = sql.format(
-            catalog=project or self.project,
-            schema=dataset or self.dataset,
-        )
 
         job = self.client.query(
             sql,
             job_config=bigquery.QueryJobConfig(
-                query_parameters=[
-                    bigquery.ScalarQueryParameter("t", "STRING", table_name),
-                    bigquery.ScalarQueryParameter("c", "STRING", column),
-                ],
-                default_dataset=bigquery.DatasetReference(
-                    project or self.project, dataset or self.dataset
-                ),
+                query_parameters=params,
+                default_dataset=bigquery.DatasetReference(project, dataset),
             ),
             location=self.location,
         )
         rows = list(job.result())
-        if not rows:
-            return None
-        return rows[0][0]
+        return [(str(r[0]), str(r[1])) for r in rows]
+
+    def introspect_column_physical_type(self, table: str, column: str) -> str | None:
+        rows = self._introspect_columns_metadata(table, column=column)
+        return rows[0][1] if rows else None
+
+    def introspect_table_physical_schema(self, table: str) -> dict[str, str]:
+        rows = self._introspect_columns_metadata(table, column=None)
+        # keys are lowercased to match the DuckRuntimeContracts verify logic
+        return {name: dtype for (name, dtype) in rows}
 
     def load_seed(self, table: str, df: Any, schema: str | None = None) -> tuple[bool, str, bool]:
         dataset_id = schema or self.dataset

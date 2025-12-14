@@ -1204,6 +1204,16 @@ class BaseExecutor[TFrame](ABC):
             f"engine '{self.engine_name}'."
         )
 
+    def normalize_physical_type(self, t: str | None) -> str:
+        """
+        Canonicalize a physical type string for comparisons (DQ + contracts).
+
+        Default: just strip + lower.
+        Engines may override to account for dialect quirks in information_schema
+        (e.g. Postgres timestamp variants, Snowflake VARCHAR(…) / NUMBER(…)).
+        """
+        return (t or "").strip().lower()
+
     # ── Seed loading hook ───────────────────────────────────────────────
     def load_seed(
         self, table: str, df: Any, schema: str | None = None

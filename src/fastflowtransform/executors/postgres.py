@@ -1,5 +1,6 @@
 # fastflowtransform/executors/postgres.py
 import json
+import re
 from collections.abc import Callable, Iterable
 from time import perf_counter
 from typing import Any, cast
@@ -11,6 +12,7 @@ from sqlalchemy.exc import ProgrammingError, SQLAlchemyError
 from sqlalchemy.sql import Executable
 from sqlalchemy.sql.elements import ClauseElement
 
+from fastflowtransform.contracts.runtime.postgres import PostgresRuntimeContracts
 from fastflowtransform.core import Node
 from fastflowtransform.errors import ModelExecutionError, ProfileConfigError
 from fastflowtransform.executors._budget_runner import run_sql_with_budget
@@ -23,8 +25,16 @@ from fastflowtransform.executors.query_stats import QueryStats
 from fastflowtransform.meta import ensure_meta_table, upsert_meta
 
 
+def _base_type(t: str) -> str:
+    # Strip modifiers so DQ compares are stable (varchar(10) -> varchar, numeric(18,0) -> numeric)
+    s = re.sub(r"\s+", " ", (t or "").strip().lower())
+    s = re.sub(r"\s*\(.*\)\s*$", "", s)
+    return s
+
+
 class PostgresExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[pd.DataFrame]):
-    ENGINE_NAME = "postgres"
+    ENGINE_NAME: str = "postgres"
+    runtime_contracts: PostgresRuntimeContracts
     _DEFAULT_PG_ROW_WIDTH = 128
     _BUDGET_GUARD = BudgetGuard(
         env_var="FF_PG_MAX_BYTES",
@@ -55,6 +65,9 @@ class PostgresExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[pd.Dat
                 raise ProfileConfigError(
                     f"Failed to ensure schema '{self.schema}' exists: {exc}"
                 ) from exc
+
+        # Enable runtime contracts (cast/verify) for SQL and pandas models.
+        self.runtime_contracts = PostgresRuntimeContracts(self)
 
     def execute_test_sql(self, stmt: Any) -> Any:
         """
@@ -694,34 +707,90 @@ class PostgresExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[pd.Dat
                 else:  # table
                     conn.execute(text(f"DROP TABLE IF EXISTS {qualified} CASCADE"))
 
-    def introspect_column_physical_type(self, table: str, column: str) -> str | None:
+    def _introspect_columns_metadata(
+        self,
+        table: str,
+        column: str | None = None,
+    ) -> list[tuple[str, str]]:
         """
-        Postgres: read `data_type` from information_schema.columns for the
-        current schema (or an explicit schema if table is qualified).
+        Return [(column_name, canonical_type), ...] for a Postgres table.
+
+        Uses pg_catalog + format_type() so aliases/modifiers are represented consistently.
         """
         schema, table_name = self._normalize_table_identifier(table)
-        column_name = self._normalize_column_identifier(column)
 
+        params: dict[str, Any] = {}
+        where: list[str] = []
+
+        # table match
+        where.append("lower(c.relname) = lower(:table)")
+        params["table"] = table_name
+
+        # schema match
         if schema:
-            sql = """
-            select data_type
-            from information_schema.columns
-            where lower(table_schema) = lower(:schema)
-              and lower(table_name)   = lower(:table)
-              and lower(column_name)  = lower(:column)
-            limit 1
-            """
-            params = {"schema": schema, "table": table_name, "column": column_name}
+            where.append("lower(n.nspname) = lower(:schema)")
+            params["schema"] = schema
         else:
-            sql = """
-            select data_type
-            from information_schema.columns
-            where table_schema = current_schema()
-              and lower(table_name)  = lower(:table)
-              and lower(column_name) = lower(:column)
-            limit 1
-            """
-            params = {"table": table_name, "column": column_name}
+            where.append("n.nspname = current_schema()")
+
+        # column match (optional)
+        if column is not None:
+            col = self._normalize_column_identifier(column)
+            where.append("lower(a.attname) = lower(:column)")
+            params["column"] = col
+
+        where_sql = " AND ".join(where)
+
+        sql = f"""
+        select
+        a.attname as column_name,
+        format_type(a.atttypid, a.atttypmod) as data_type
+        from pg_attribute a
+        join pg_class c on c.oid = a.attrelid
+        join pg_namespace n on n.oid = c.relnamespace
+        where {where_sql}
+        and a.attnum > 0
+        and not a.attisdropped
+        order by a.attnum
+        """
 
         rows = self._execute_sql(sql, params).fetchall()
-        return rows[0][0] if rows else None
+        # Return canonical type *base* by default
+        return [(str(name), _base_type(str(dtype))) for (name, dtype) in rows]
+
+    def introspect_column_physical_type(self, table: str, column: str) -> str | None:
+        """
+        Postgres: read `data_type` from information_schema.columns for a single column.
+        """
+        rows = self._introspect_columns_metadata(table, column=column)
+        return rows[0][1] if rows else None
+
+    def introspect_table_physical_schema(self, table: str) -> dict[str, str]:
+        """
+        Postgres: return {lower(column_name): data_type} for all columns of `table`.
+        """
+        rows = self._introspect_columns_metadata(table, column=None)
+        # Lower keys to match your runtime contract verifier's `.lower()` comparisons.
+        return {name.lower(): dtype for (name, dtype) in rows}
+
+    def normalize_physical_type(self, t: str | None) -> str:
+        s = (t or "").strip()
+        if not s:
+            return ""
+
+        # Ask Postgres to resolve the type name and return its canonical spelling.
+        # Works great for aliases like TIMESTAMP / TIMESTAMPTZ / INT / etc.
+        sql = """
+        SELECT lower(pg_catalog.format_type(pg_catalog.to_regtype(:t), NULL))
+        """
+        try:
+            row = self._execute_sql(sql, {"t": s}).fetchone()
+            canon = row[0] if row else None
+            if canon:
+                return str(canon).strip()
+        except Exception:
+            pass
+
+        # If Postgres can't resolve it (e.g. includes typmods like varchar(10)),
+        # just return a normalized string. (Optional: you can choose to error instead.)
+        return s.lower()

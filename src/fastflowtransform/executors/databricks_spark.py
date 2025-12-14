@@ -13,6 +13,7 @@ import pandas as pd
 from jinja2 import Environment
 
 from fastflowtransform import storage
+from fastflowtransform.contracts.runtime.databricks_spark import DatabricksSparkRuntimeContracts
 from fastflowtransform.core import REGISTRY, Node, relation_for
 from fastflowtransform.errors import ModelExecutionError
 from fastflowtransform.executors._budget_runner import run_sql_with_budget
@@ -185,7 +186,8 @@ def _log_delta_capabilities(
 class DatabricksSparkExecutor(BaseExecutor[SDF]):
     """Spark/Databricks executor without pandas: Python models operate on Spark DataFrames."""
 
-    ENGINE_NAME = "databricks_spark"
+    ENGINE_NAME: str = "databricks_spark"
+    runtime_contracts: DatabricksSparkRuntimeContracts
     _BUDGET_GUARD = BudgetGuard(
         env_var="FF_SPK_MAX_BYTES",
         estimator_attr="_estimate_query_bytes",
@@ -312,6 +314,7 @@ class DatabricksSparkExecutor(BaseExecutor[SDF]):
         )
 
         self._spark_default_size = self._detect_default_size()
+        self.runtime_contracts = DatabricksSparkRuntimeContracts(self)
 
     # ---------- Cost estimation & central execution ----------
 
@@ -1360,21 +1363,52 @@ class DatabricksSparkExecutor(BaseExecutor[SDF]):
         with suppress(Exception):
             self._execute_sql(f"DROP TABLE IF EXISTS {ident}")
 
-    def introspect_column_physical_type(self, table: str, column: str) -> str | None:
+    def _introspect_columns_metadata(
+        self,
+        table: str,
+        column: str | None = None,
+    ) -> list[tuple[str, str]]:
         """
-        Spark: use DataFrame schema for `table` and return the Spark SQL type
-        (simpleString) for the given column, uppercased.
+        Internal helper: return [(column_name, spark_sql_type), ...] for a Spark table.
+
+        - Uses Spark's DataFrame schema (no information_schema dependency).
+        - Works with db.table identifiers via _physical_identifier().
+        - Optionally restricts to a single column (case-insensitive).
         """
         physical = self._physical_identifier(table)
         df = self.spark.table(physical)
 
-        col_lower = column.lower()
+        want = column.lower() if column is not None else None
+
+        out: list[tuple[str, str]] = []
         for field in df.schema.fields:
-            if field.name.lower() == col_lower:
-                dt = field.dataType
-                try:
-                    # e.g. "bigint", "string", "timestamp"
-                    return dt.simpleString().upper()
-                except Exception:
-                    return str(dt)
-        return None
+            name = field.name
+            if want is not None and name.lower() != want:
+                continue
+
+            dt = field.dataType
+            try:
+                # e.g. "bigint", "string", "timestamp", "decimal(10,2)", "array<string>", ...
+                typ = dt.simpleString()
+            except Exception:
+                typ = str(dt)
+
+            # Keep consistent with your existing introspect_column_physical_type()
+            out.append((str(name), str(typ).upper()))
+
+        return out
+
+    def introspect_column_physical_type(self, table: str, column: str) -> str | None:
+        """
+        Spark: return Spark SQL type (simpleString) for one column, uppercased.
+        """
+        rows = self._introspect_columns_metadata(table, column=column)
+        return rows[0][1] if rows else None
+
+    def introspect_table_physical_schema(self, table: str) -> dict[str, str]:
+        """
+        Spark: return {lower(column_name): spark_sql_type} for all columns of `table`.
+        """
+        rows = self._introspect_columns_metadata(table, column=None)
+        # Lower keys to match runtime verifier behavior (case-insensitive compare)
+        return {name.lower(): typ for (name, typ) in rows}

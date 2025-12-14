@@ -158,6 +158,26 @@ If the engine does not yet support physical type introspection, the test will
 fail with a clear “engine not yet supported” message instead of silently
 passing.
 
+### Engine-canonical type names
+
+Physical type comparisons use the **canonical type strings reported by the engine**.
+
+That means:
+
+* Some engines expose aliases as canonical names in their catalogs.
+
+  * Example (Postgres):
+
+    * `timestamp` is an alias for `timestamp without time zone`
+    * `timestamptz` is an alias for `timestamp with time zone`
+* FFT compares types after **engine-specific canonicalization**, so contracts can use common names like `timestamp`/`timestamptz` while still matching what Postgres reports.
+
+If you see a mismatch like:
+
+> expected `timestamp`, got `timestamp without time zone`
+
+it means your Postgres executor/runtime is not canonicalizing types yet (or you’re using raw `information_schema.data_type`). In that case, update Postgres type introspection to use `pg_catalog.format_type(...)` so comparisons are consistent.
+
 ---
 
 ### `nullable`
@@ -276,6 +296,49 @@ defaults:
       type: timestamp
       nullable: false
 ```
+
+### `contracts.yml` enforcement configuration
+
+Example:
+
+```yaml
+version: 1
+
+defaults:
+  columns:
+    - match:
+        name: ".*_id$"
+      type: integer
+      nullable: false
+
+enforcement:
+  # Modes: off | verify | cast
+  default_mode: off
+
+  # If true, contract enforcement only cares about declared columns.
+  # Extra columns produced by the model are allowed.
+  allow_extra_columns: true
+
+  # Optional per-table overrides (by logical relation name)
+  tables:
+    mart_users_by_domain:
+      mode: verify
+      allow_extra_columns: true
+
+    mart_latest_signup:
+      mode: cast
+      allow_extra_columns: true
+```
+
+Rules:
+
+* `enforcement.default_mode` applies to all tables unless overridden.
+* `enforcement.tables.<table>.mode` overrides the default for a single table.
+* `allow_extra_columns` controls whether the model output may contain columns not listed in the contract:
+
+  * `true`: extra columns are ignored by enforcement (but still exist in the table)
+  * `false`: extra columns fail enforcement
+
 
 ### Column match rules
 
@@ -410,6 +473,111 @@ customers.status accepted_values (tags: contract)
 You don’t need to write those tests yourself; they’re derived automatically
 from the contract files.
 
+### Runtime enforcement (optional)
+
+In addition to turning contracts into `fft test` checks, FastFlowTransform can **enforce** contracts **at runtime** while building models.
+
+Runtime enforcement means:
+
+* FFT can **verify** that the materialized table matches the contract schema, and fail the run if not.
+* FFT can **cast** the model output into the declared physical types before creating the table.
+
+This is configured in **project-level `contracts.yml`** under `enforcement`.
+
+#### Enforcement modes
+
+Contracts enforcement supports three modes:
+
+* `off`
+  Do not enforce at build time. (Contracts may still generate tests.)
+
+* `verify`
+  Build the table normally, then verify the physical schema matches the contract.
+
+* `cast`
+  Build the table by selecting from your model and **casting** contract columns into their declared physical types, then verify.
+
+> `cast` is useful when your warehouse would infer “close but not exact” types (e.g. `COUNT(*)` becoming a sized numeric type) and you want stable physical types across engines.
+
+### Failure messages
+
+If enforcement fails, FFT raises an error like:
+
+* Missing/extra columns
+* Type mismatch (expected vs actual physical type)
+* Non-null/unique contract failures (if those are enforced at runtime in your setup)
+
+The error includes the table name and a list of mismatches.
+
+### Enforcement with incremental models
+
+When a model is materialized as `incremental`, FFT applies enforcement to the **incremental write path**, not only full refresh.
+
+Typical behavior:
+
+* On the first run, the model creates the target relation (full refresh behavior) and enforcement is applied.
+* On subsequent runs, FFT computes a delta dataset and writes it using the engine’s incremental strategy (insert/merge/delete+insert, etc.).
+* Enforcement is applied so the target table remains compatible with the contract.
+
+Practical recommendations:
+
+* If the incremental model relies on `unique_key`, make sure your source change simulation does not introduce duplicated keys in the delta.
+* For “update simulation” in demos, prefer a **second full seed file** that represents the entire source after the update (not just appended rows), then rerun incremental. This produces a realistic “source changed” scenario without creating duplicates.
+
+### Tests vs runtime enforcement
+
+Contracts can be used in two independent ways:
+
+1. **Tests** (`fft test`)
+   Contracts generate test specs like `not_null`, `unique`, `accepted_values`, `regex_match`, and `column_physical_type`.
+
+2. **Runtime enforcement** (`fft run`)
+   Enforcement runs during model materialization and can fail the run early.
+
+You can use either one alone, or both together.
+
+### Enforcement for SQL models
+
+When enforcing contracts for a SQL model:
+
+* `verify` mode:
+
+  1. FFT creates the table/view normally from the model SQL
+  2. FFT introspects the created object and compares the physical schema to the contract
+
+* `cast` mode:
+
+  1. FFT wraps the model SQL in a projection that casts the declared columns:
+
+     ```sql
+     select
+       cast(col_a as <physical-type>) as col_a,
+       cast(col_b as <physical-type>) as col_b,
+       ...
+       -- optionally include extra columns if allow_extra_columns=true
+     from (<model select>) as src
+     ```
+  2. FFT creates the table from that casted SELECT
+  3. FFT verifies the resulting physical schema
+
+Notes:
+
+* Enforcement is best-effort: if a contract has no physical types for the current engine, `cast` mode cannot enforce and will fail with a clear error.
+* `allow_extra_columns=true` means non-contracted columns are carried through unchanged.
+
+### Enforcement for Python models
+
+For Python models (pandas / Spark / Snowpark / BigFrames):
+
+* FFT first materializes the DataFrame result according to the executor.
+* If enforcement is enabled, the runtime contracts layer may:
+
+  * Stage the DataFrame into a temporary table (engine-specific)
+  * Re-create the target table using casts (`cast` mode)
+  * Or only verify the schema (`verify` mode)
+
+This allows a consistent enforcement mechanism even when the model result is not expressed as SQL.
+
 ---
 
 ## Using contracts with `fft test`
@@ -446,14 +614,8 @@ A few things contracts **do not** do yet:
   * Other engines may reject such tests with a clear “engine not supported”
     message.
 
-The intended next step (not implemented yet) is an **“enforce schema”** mode
-which uses contracts to drive actual table DDL (or casts) instead of only
-post-hoc assertions.
+### Current limitations
 
-For now, contracts give you **schema-as-YAML** + **tests-from-contracts** in a
-single, consistent place.
-
-Additional validation:
-
-* Duplicate YAML keys in contract files are rejected (the loader raises before
-  parsing). Fix or remove duplicates to proceed.
+* Enforcement behavior can differ by engine depending on what the executor can introspect and how it stages/casts data.
+* `cast` mode requires explicit `physical` types for the current engine.
+* Some warehouses expose “decorated” physical types (e.g. `VARCHAR(16777216)`, `NUMBER(18,0)`) rather than a short base type name. Contracts should match the canonical/normalized representation used by the engine implementation.

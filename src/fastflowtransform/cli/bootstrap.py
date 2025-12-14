@@ -367,6 +367,16 @@ def _make_executor(prof: Profile, jenv: Environment) -> tuple[BaseExecutor, Call
         if prof.bigquery.dataset is None:
             raise RuntimeError("BigQuery dataset must be set")
 
+        # Validate env-provided frame selector early (used by examples/Makefiles)
+        frame_env = os.getenv("FF_ENGINE_VARIANT") or os.getenv("BQ_FRAME")
+        if frame_env:
+            frame_normalized = frame_env.lower()
+            if frame_normalized not in {"pandas", "bigframes"}:
+                raise RuntimeError(
+                    f"Unsupported BigQuery frame '{frame_env}'. "
+                    "Set FF_ENGINE_VARIANT/BQ_FRAME to 'pandas' or 'bigframes'."
+                )
+
         if prof.bigquery.use_bigframes:
             BigQueryBFExecutor = _import_optional(
                 "fastflowtransform.executors.bigquery.bigframes",

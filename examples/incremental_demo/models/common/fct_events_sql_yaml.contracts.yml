@@ -1,0 +1,36 @@
+table: fct_events_sql_yaml
+
+columns:
+  event_id:
+    type: integer
+    nullable: false
+    unique: true
+    physical:
+      duckdb: BIGINT
+      postgres: bigint
+      bigquery: INT64
+      databricks_spark: BIGINT
+      snowflake_snowpark: NUMBER
+      default: BIGINT
+
+  updated_at:
+    type: timestamp
+    nullable: false
+    physical:
+      duckdb: TIMESTAMP
+      postgres: timestamp
+      bigquery: TIMESTAMP
+      databricks_spark: TIMESTAMP
+      snowflake_snowpark: TIMESTAMP_NTZ
+      default: TIMESTAMP
+
+  value:
+    type: integer
+    nullable: false
+    physical:
+      duckdb: BIGINT
+      postgres: bigint
+      bigquery: INT64
+      databricks_spark: BIGINT
+      snowflake_snowpark: NUMBER
+      default: BIGINT

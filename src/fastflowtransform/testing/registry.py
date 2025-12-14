@@ -679,6 +679,10 @@ def register_sql_test(
 
         # 2) Render the SQL template with a stable context
         env = REGISTRY.get_env()
+        if "config" not in env.globals:
+            # DQ SQL templates include a leading {{ config(...) }} metadata block; it
+            # should be a no-op at render time, so provide a stub when absent.
+            env.globals["config"] = lambda **kwargs: ""
         raw = path.read_text(encoding="utf-8")
         tmpl = env.from_string(raw)
 
