@@ -6,19 +6,19 @@ from typing import Any, TypeVar
 
 from fastflowtransform.core import Node, relation_for
 from fastflowtransform.executors._budget_runner import run_sql_with_budget
-from fastflowtransform.executors._snapshot_sql_mixin import SnapshotSqlMixin
 from fastflowtransform.executors._sql_identifier import SqlIdentifierMixin
 from fastflowtransform.executors._test_utils import make_fetchable
 from fastflowtransform.executors.base import BaseExecutor
 from fastflowtransform.executors.budget import BudgetGuard
 from fastflowtransform.executors.query_stats import _TrackedQueryJob
 from fastflowtransform.meta import ensure_meta_table, upsert_meta
+from fastflowtransform.snapshots.runtime.bigquery import BigQuerySnapshotRuntime
 from fastflowtransform.typing import BadRequest, Client, NotFound, bigquery
 
 TFrame = TypeVar("TFrame")
 
 
-class BigQueryBaseExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[TFrame]):
+class BigQueryBaseExecutor(SqlIdentifierMixin, BaseExecutor[TFrame]):
     """
     Shared BigQuery executor logic (SQL, incremental, meta, DQ helpers).
 
@@ -55,6 +55,7 @@ class BigQueryBaseExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[TF
             project=self.project,
             location=self.location,
         )
+        self.snapshot_runtime = BigQuerySnapshotRuntime(self)
 
     # ---- Identifier helpers ----
     def _bq_quote(self, value: str) -> str:
@@ -290,29 +291,6 @@ class BigQueryBaseExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[TF
         self._ensure_dataset()
         self._execute_sql(f"CREATE OR REPLACE VIEW {view_id} AS SELECT * FROM {back_id}").result()
 
-    # ---- Snapshot mixin hooks ----
-    def _snapshot_prepare_target(self) -> None:
-        self._ensure_dataset()
-
-    def _snapshot_target_identifier(self, rel_name: str) -> str:
-        return self._qualified_identifier(rel_name)
-
-    def _snapshot_current_timestamp(self) -> str:
-        return "CURRENT_TIMESTAMP()"
-
-    def _snapshot_null_timestamp(self) -> str:
-        return "CAST(NULL AS TIMESTAMP)"
-
-    def _snapshot_null_hash(self) -> str:
-        return "CAST(NULL AS STRING)"
-
-    def _snapshot_hash_expr(self, check_cols: list[str], src_alias: str) -> str:
-        concat_expr = self._snapshot_concat_expr(check_cols, src_alias)
-        return f"TO_HEX(MD5({concat_expr}))"
-
-    def _snapshot_cast_as_string(self, expr: str) -> str:
-        return f"CAST({expr} AS STRING)"
-
     # ---- Meta hook ----
     def on_node_built(self, node: Node, relation: str, fingerprint: str) -> None:
         """
@@ -455,6 +433,25 @@ class BigQueryBaseExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[TF
         Execute one SQL statement for pre/post/on_run hooks.
         """
         self._execute_sql(sql).result()
+
+    # ---- Snapshot runtime delegation (shared for pandas + BigFrames) ----
+    def run_snapshot_sql(self, node: Node, env: Any) -> None:
+        self.snapshot_runtime.run_snapshot_sql(node, env)
+
+    def snapshot_prune(
+        self,
+        relation: str,
+        unique_key: list[str],
+        keep_last: int,
+        *,
+        dry_run: bool = False,
+    ) -> None:
+        self.snapshot_runtime.snapshot_prune(
+            relation,
+            unique_key,
+            keep_last,
+            dry_run=dry_run,
+        )
 
     def _introspect_columns_metadata(
         self,

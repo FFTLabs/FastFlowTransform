@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import re
 import uuid
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from contextlib import suppress
 from pathlib import Path
 from typing import Any, ClassVar
@@ -12,25 +12,24 @@ from typing import Any, ClassVar
 import duckdb
 import pandas as pd
 from duckdb import CatalogException
+from jinja2 import Environment
 
 from fastflowtransform.contracts.runtime.duckdb import DuckRuntimeContracts
 from fastflowtransform.core import Node
 from fastflowtransform.executors._budget_runner import run_sql_with_budget
-from fastflowtransform.executors._snapshot_sql_mixin import SnapshotSqlMixin
 from fastflowtransform.executors._sql_identifier import SqlIdentifierMixin
 from fastflowtransform.executors._test_utils import make_fetchable
 from fastflowtransform.executors.base import BaseExecutor, _scalar
 from fastflowtransform.executors.budget import BudgetGuard
+from fastflowtransform.executors.common import _q_ident
 from fastflowtransform.meta import ensure_meta_table, upsert_meta
+from fastflowtransform.snapshots.runtime.duckdb import DuckSnapshotRuntime
 
 
-def _q(ident: str) -> str:
-    return '"' + ident.replace('"', '""') + '"'
-
-
-class DuckExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[pd.DataFrame]):
+class DuckExecutor(SqlIdentifierMixin, BaseExecutor[pd.DataFrame]):
     ENGINE_NAME: str = "duckdb"
     runtime_contracts: DuckRuntimeContracts
+    snapshot_runtime: DuckSnapshotRuntime
 
     _FIXED_TYPE_SIZES: ClassVar[dict[str, int]] = {
         "boolean": 1,
@@ -85,11 +84,12 @@ class DuckExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[pd.DataFra
             else:
                 self.catalog = self._detect_catalog()
         if self.schema:
-            safe_schema = _q(self.schema)
+            safe_schema = _q_ident(self.schema)
             self._execute_sql(f"create schema if not exists {safe_schema}")
             self._execute_sql(f"set schema '{self.schema}'")
 
         self.runtime_contracts = DuckRuntimeContracts(self)
+        self.snapshot_runtime = DuckSnapshotRuntime(self)
 
     def execute_test_sql(self, stmt: Any) -> Any:
         """
@@ -436,8 +436,10 @@ class DuckExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[pd.DataFra
             if self.db_path != ":memory:":
                 resolved = str(Path(self.db_path).resolve())
                 with suppress(Exception):
-                    self._execute_sql(f"detach database {_q(alias)}")
-                self._execute_sql(f"attach database '{resolved}' as {_q(alias)} (READ_ONLY FALSE)")
+                    self._execute_sql(f"detach database {_q_ident(alias)}")
+                self._execute_sql(
+                    f"attach database '{resolved}' as {_q_ident(alias)} (READ_ONLY FALSE)"
+                )
             self._execute_sql(f"set catalog '{alias}'")
             return True
         except Exception:
@@ -471,7 +473,7 @@ class DuckExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[pd.DataFra
 
     # ---- Frame hooks ----
     def _quote_identifier(self, ident: str) -> str:
-        return _q(ident)
+        return _q_ident(ident)
 
     def _should_include_catalog(
         self, catalog: str | None, schema: str | None, *, explicit: bool
@@ -630,7 +632,7 @@ class DuckExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[pd.DataFra
         }
         add = [c for c in cols if c not in existing]
         for c in add:
-            col = _q(c)
+            col = _q_ident(c)
             target = self._qualified(relation)
             try:
                 self._execute_sql(f"alter table {target} add column {col} varchar")
@@ -645,37 +647,27 @@ class DuckExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[pd.DataFra
         """
         self._exec_many(sql)
 
-    # ---- Snapshot mixin hooks ----
-    def _snapshot_target_identifier(self, rel_name: str) -> str:
-        return self._qualified(rel_name)
+    # ---- Snapshot runtime delegation ----
+    def run_snapshot_sql(self, node: Node, env: Environment) -> None:
+        """
+        Delegate snapshot materialization to the DuckDB snapshot runtime.
+        """
+        self.snapshot_runtime.run_snapshot_sql(node, env)
 
-    def _snapshot_current_timestamp(self) -> str:
-        return "current_timestamp"
-
-    def _snapshot_null_timestamp(self) -> str:
-        return "cast(null as timestamp)"
-
-    def _snapshot_null_hash(self) -> str:
-        return "cast(null as varchar)"
-
-    def _snapshot_hash_expr(self, check_cols: list[str], src_alias: str) -> str:
-        concat_expr = self._snapshot_concat_expr(check_cols, src_alias)
-        return f"cast(md5({concat_expr}) as varchar)"
-
-    def _snapshot_cast_as_string(self, expr: str) -> str:
-        return f"cast({expr} as varchar)"
-
-    def _snapshot_source_ref(
-        self, rel_name: str, select_body: str
-    ) -> tuple[str, Callable[[], None]]:
-        src_view_name = f"__ff_snapshot_src_{rel_name}".replace(".", "_")
-        src_quoted = _q(src_view_name)
-        self._execute_sql(f"create or replace temp view {src_quoted} as {select_body}")
-
-        def _cleanup() -> None:
-            self._execute_sql(f"drop view if exists {src_quoted}")
-
-        return src_quoted, _cleanup
+    def snapshot_prune(
+        self,
+        relation: str,
+        unique_key: list[str],
+        keep_last: int,
+        *,
+        dry_run: bool = False,
+    ) -> None:
+        self.snapshot_runtime.snapshot_prune(
+            relation,
+            unique_key,
+            keep_last,
+            dry_run=dry_run,
+        )
 
         # ---- Unit-test helpers -------------------------------------------------
 
@@ -783,7 +775,7 @@ class DuckExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[pd.DataFra
         qualified = self._qualify_identifier(table, schema=target_schema, catalog=self.catalog)
 
         if target_schema and "." not in table:
-            safe_schema = _q(target_schema)
+            safe_schema = _q_ident(target_schema)
             self._execute_sql(f"create schema if not exists {safe_schema}")
             created_schema = True
 

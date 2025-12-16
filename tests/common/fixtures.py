@@ -46,8 +46,12 @@ except ModuleNotFoundError:  # pragma: no cover - import guard
 # Snowflake
 try:
     from fastflowtransform.executors.snowflake_snowpark import SnowflakeSnowparkExecutor
+    from fastflowtransform.snapshots.runtime.snowflake_snowpark import (
+        SnowflakeSnowparkSnapshotRuntime,
+    )
 except ModuleNotFoundError:  # pragma: no cover
     SnowflakeSnowparkExecutor = None  # type: ignore[assignment]
+    SnowflakeSnowparkSnapshotRuntime = None  # type: ignore[assignment]
 
 
 # ---- Jinja env ----------------------------------------------------------------
@@ -446,6 +450,9 @@ def snowflake_executor_fake() -> Any:
     # Fake Snowflake session and cursor shim.
     session = FakeSnowflakeSession()
     ex.session = session
+
+    # Wire snapshot runtime to mirror real executor setup.
+    ex.snapshot_runtime = SnowflakeSnowparkSnapshotRuntime(ex)
 
     return ex
 

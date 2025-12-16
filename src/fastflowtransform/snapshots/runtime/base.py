@@ -2,29 +2,71 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 from contextlib import suppress
-from typing import TYPE_CHECKING, Any, cast
+from typing import Any, Protocol, TypeVar
 
 from jinja2 import Environment
 
 from fastflowtransform.core import Node, relation_for
 from fastflowtransform.logging import echo
-from fastflowtransform.snapshots import resolve_snapshot_config
-
-if TYPE_CHECKING:
-    # Adjust this import to your actual path
-    from fastflowtransform.executors.base import BaseExecutor
+from fastflowtransform.snapshots.core import resolve_snapshot_config
 
 
-class SnapshotSqlMixin:
+class SnapshotExecutor(Protocol):
     """
-    Shared SQL snapshot materialization (timestamp + check strategies).
+    Minimal surface required by the snapshot runtime.
+    """
+
+    def render_sql(
+        self,
+        node: Node,
+        env: Environment,
+        ref_resolver: Callable[[str], str] | None = None,
+        source_resolver: Callable[[str, str], str] | None = None,
+    ) -> str: ...
+
+    def _resolve_ref(self, name: str, env: Environment) -> str: ...
+
+    def _resolve_source(self, source_name: str, table_name: str) -> str: ...
+
+    def _strip_leading_config(self, sql: str) -> str: ...
+
+    def _selectable_body(self, sql: str) -> str: ...
+
+    def exists_relation(self, relation: str) -> bool: ...
+
+    def _execute_sql(self, sql: str, *args: Any, **kwargs: Any) -> Any: ...
+
+    def _meta_is_snapshot(self, meta: dict[str, Any] | None) -> bool: ...
+
+    def _quote_identifier(self, ident: str) -> str: ...
+
+
+E = TypeVar("E", bound=SnapshotExecutor)
+
+
+class BaseSnapshotRuntime[E: SnapshotExecutor]:
+    """
+    Base snapshot runtime mirroring the contracts runtime pattern.
 
     Engines provide small hooks for identifier qualification, expressions,
-    staging, and execution. All column names come from BaseExecutor constants.
+    staging, and execution. All column names come from the executor constants.
     """
 
+    # Standard snapshot metadata column names (single source of truth for runtimes).
+    SNAPSHOT_VALID_FROM_COL = "_ff_valid_from"
+    SNAPSHOT_VALID_TO_COL = "_ff_valid_to"
+    SNAPSHOT_IS_CURRENT_COL = "_ff_is_current"
+    SNAPSHOT_HASH_COL = "_ff_snapshot_hash"
+    SNAPSHOT_UPDATED_AT_COL = "_ff_updated_at"
+
+    executor: E
+
+    def __init__(self, executor: E):
+        self.executor = executor
+
+    # ---- Public entrypoints -------------------------------------------------
     def run_snapshot_sql(self, node: Node, env: Environment) -> None:
-        ex = cast("BaseExecutor[Any]", self)
+        ex = self.executor
 
         meta = self._snapshot_validate_node(node)
         cfg = resolve_snapshot_config(node, meta)
@@ -35,11 +77,11 @@ class SnapshotSqlMixin:
         if not cfg.unique_key:
             raise ValueError(f"{node.path}: snapshot models require a non-empty unique_key list.")
 
-        vf = self.SNAPSHOT_VALID_FROM_COL  # type: ignore[attr-defined]
-        vt = self.SNAPSHOT_VALID_TO_COL  # type: ignore[attr-defined]
-        is_cur = self.SNAPSHOT_IS_CURRENT_COL  # type: ignore[attr-defined]
-        hash_col = self.SNAPSHOT_HASH_COL  # type: ignore[attr-defined]
-        upd_meta = self.SNAPSHOT_UPDATED_AT_COL  # type: ignore[attr-defined]
+        vf = self.SNAPSHOT_VALID_FROM_COL
+        vt = self.SNAPSHOT_VALID_TO_COL
+        is_cur = self.SNAPSHOT_IS_CURRENT_COL
+        hash_col = self.SNAPSHOT_HASH_COL
+        upd_meta = self.SNAPSHOT_UPDATED_AT_COL
 
         self._snapshot_prepare_target()
 
@@ -115,6 +157,74 @@ class SnapshotSqlMixin:
         finally:
             with suppress(Exception):
                 cleanup()
+
+    def snapshot_prune(
+        self,
+        relation: str,
+        unique_key: list[str],
+        keep_last: int,
+        *,
+        dry_run: bool = False,
+    ) -> None:
+        """
+        Delete older snapshot versions while keeping the most recent `keep_last`
+        rows per business key (including the current row).
+        """
+        ex = self.executor
+
+        if keep_last <= 0:
+            return
+
+        keys = [k for k in unique_key if k]
+        if not keys:
+            return
+
+        target = self._snapshot_target_identifier(relation)
+        vf = self.SNAPSHOT_VALID_FROM_COL
+
+        key_select = ", ".join(keys)
+        part_by = ", ".join(keys)
+
+        ranked_sql = f"""
+SELECT
+  {key_select},
+  {vf},
+  ROW_NUMBER() OVER (
+    PARTITION BY {part_by}
+    ORDER BY {vf} DESC
+  ) AS rn
+FROM {target}
+"""
+
+        if dry_run:
+            sql = f"""
+WITH ranked AS (
+  {ranked_sql}
+)
+SELECT COUNT(*) AS rows_to_delete
+FROM ranked
+WHERE rn > {int(keep_last)}
+"""
+            res = ex._execute_sql(sql)
+            count = self._snapshot_fetch_count(res)
+            echo(
+                f"[DRY-RUN] snapshot_prune({relation}): would delete {count} row(s) "
+                f"(keep_last={keep_last})"
+            )
+            return
+
+        join_pred = " AND ".join([f"t.{k} = r.{k}" for k in keys])
+        delete_sql = f"""
+DELETE FROM {target} t
+USING (
+  {ranked_sql}
+) r
+WHERE
+  r.rn > {int(keep_last)}
+  AND {join_pred}
+  AND t.{vf} = r.{vf}
+"""
+        ex._execute_sql(delete_sql)
 
     # ---- Core SQL builders -------------------------------------------------
     def _snapshot_first_run_sql(
@@ -228,78 +338,9 @@ WHERE
   OR {change_condition}
 """
 
-    # ---- Pruning -----------------------------------------------------------
-    def snapshot_prune(
-        self,
-        relation: str,
-        unique_key: list[str],
-        keep_last: int,
-        *,
-        dry_run: bool = False,
-    ) -> None:
-        """
-        Delete older snapshot versions while keeping the most recent `keep_last`
-        rows per business key (including the current row).
-        """
-        ex = cast("BaseExecutor[Any]", self)
-
-        if keep_last <= 0:
-            return
-
-        keys = [k for k in unique_key if k]
-        if not keys:
-            return
-
-        target = self._snapshot_target_identifier(relation)
-        vf = self.SNAPSHOT_VALID_FROM_COL  # type: ignore[attr-defined]
-
-        key_select = ", ".join(keys)
-        part_by = ", ".join(keys)
-
-        ranked_sql = f"""
-SELECT
-  {key_select},
-  {vf},
-  ROW_NUMBER() OVER (
-    PARTITION BY {part_by}
-    ORDER BY {vf} DESC
-  ) AS rn
-FROM {target}
-"""
-
-        if dry_run:
-            sql = f"""
-WITH ranked AS (
-  {ranked_sql}
-)
-SELECT COUNT(*) AS rows_to_delete
-FROM ranked
-WHERE rn > {int(keep_last)}
-"""
-            res = ex._execute_sql(sql)
-            count = self._snapshot_fetch_count(res)
-            echo(
-                f"[DRY-RUN] snapshot_prune({relation}): would delete {count} row(s) "
-                f"(keep_last={keep_last})"
-            )
-            return
-
-        join_pred = " AND ".join([f"t.{k} = r.{k}" for k in keys])
-        delete_sql = f"""
-DELETE FROM {target} t
-USING (
-  {ranked_sql}
-) r
-WHERE
-  r.rn > {int(keep_last)}
-  AND {join_pred}
-  AND t.{vf} = r.{vf}
-"""
-        ex._execute_sql(delete_sql)
-
     # ---- Rendering helpers -------------------------------------------------
     def _snapshot_render_body(self, node: Node, env: Environment) -> str:
-        ex = cast("BaseExecutor[Any]", self)
+        ex = self.executor
 
         sql_rendered = ex.render_sql(
             node,
@@ -311,6 +352,8 @@ WHERE
         return ex._selectable_body(sql_clean).rstrip(" ;\n\t")
 
     def _snapshot_validate_node(self, node: Node) -> dict[str, Any]:
+        ex = self.executor
+
         if node.kind != "sql":
             raise TypeError(
                 f"Snapshot materialization is only supported for SQL models, "
@@ -318,7 +361,7 @@ WHERE
             )
 
         meta = getattr(node, "meta", {}) or {}
-        if not self._meta_is_snapshot(meta):  # type: ignore[attr-defined]
+        if not ex._meta_is_snapshot(meta):
             raise ValueError(f"Node {node.name} is not configured with materialized='snapshot'.")
         return meta
 
@@ -348,6 +391,10 @@ WHERE
     def _snapshot_hash_expr(self, check_cols: list[str], src_alias: str) -> str:  # pragma: no cover
         raise NotImplementedError
 
+    # ---- Optional overrides -----------------------------------------------
+    def _snapshot_cast_as_string(self, expr: str) -> str:
+        return f"CAST({expr} AS STRING)"
+
     def _snapshot_updated_at_expr(self, updated_at: str, src_alias: str) -> str:
         return f"{src_alias}.{updated_at}"
 
@@ -359,7 +406,7 @@ WHERE
         """
         Execute SQL and, if necessary, wait for completion (jobs, lazy DataFrames).
         """
-        res = self._execute_sql(sql)  # type: ignore[attr-defined]
+        res = self.executor._execute_sql(sql)
         if res is None:
             return
         for attr in ("result", "collect"):
@@ -376,9 +423,6 @@ WHERE
             for col in columns
         ]
         return " || '||' || ".join(parts) if parts else "''"
-
-    def _snapshot_cast_as_string(self, expr: str) -> str:
-        return f"CAST({expr} AS STRING)"
 
     def _snapshot_coalesce(self, expr: str, default: str) -> str:
         return f"COALESCE({expr}, {default})"

@@ -142,7 +142,6 @@ def test_init_schema_creation_failure(monkeypatch):
 @pytest.mark.postgres
 def test_q_ident_and_qualified(monkeypatch, fake_engine_and_conn):
     ex = PostgresExecutor("postgresql+psycopg://x", schema="public")
-    assert ex._q_ident('t"b') == '"t""b"'
     assert ex._qualified("tbl") == '"public"."tbl"'
     assert ex._qualified("tbl", schema="x") == '"x"."tbl"'
     # with no schema

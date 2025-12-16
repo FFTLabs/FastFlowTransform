@@ -187,7 +187,6 @@ def test_init_sets_db_schema_and_con(sf_exec):
 @pytest.mark.unit
 @pytest.mark.snowflake_snowpark
 def test_q_and_qualified(sf_exec):
-    assert sf_exec._q("x") == '"x"'
     assert sf_exec._qualified("TBL") == "DB1.SC1.TBL"
 
 

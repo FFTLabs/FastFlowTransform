@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from contextlib import suppress
 from time import perf_counter
 from typing import Any, cast
@@ -12,19 +12,23 @@ import pandas as pd
 from fastflowtransform.contracts.runtime.snowflake_snowpark import SnowflakeSnowparkRuntimeContracts
 from fastflowtransform.core import Node, relation_for
 from fastflowtransform.executors._budget_runner import run_sql_with_budget
-from fastflowtransform.executors._snapshot_sql_mixin import SnapshotSqlMixin
 from fastflowtransform.executors._sql_identifier import SqlIdentifierMixin
 from fastflowtransform.executors._test_utils import make_fetchable, rows_to_tuples
 from fastflowtransform.executors.base import BaseExecutor
 from fastflowtransform.executors.budget import BudgetGuard
+from fastflowtransform.executors.common import _q_ident
 from fastflowtransform.executors.query_stats import QueryStats
 from fastflowtransform.meta import ensure_meta_table, upsert_meta
+from fastflowtransform.snapshots.runtime.snowflake_snowpark import (
+    SnowflakeSnowparkSnapshotRuntime,
+)
 from fastflowtransform.typing import SNDF, SnowparkSession as Session
 
 
-class SnowflakeSnowparkExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[SNDF]):
+class SnowflakeSnowparkExecutor(SqlIdentifierMixin, BaseExecutor[SNDF]):
     ENGINE_NAME: str = "snowflake_snowpark"
     runtime_contracts: SnowflakeSnowparkRuntimeContracts
+    snapshot_runtime: SnowflakeSnowparkSnapshotRuntime
     """Snowflake executor operating on Snowpark DataFrames (no pandas)."""
     _BUDGET_GUARD = BudgetGuard(
         env_var="FF_SF_MAX_BYTES",
@@ -42,6 +46,7 @@ class SnowflakeSnowparkExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecut
         self.allow_create_schema: bool = bool(cfg["allow_create_schema"])
         self._ensure_schema()
         self.runtime_contracts = SnowflakeSnowparkRuntimeContracts(self)
+        self.snapshot_runtime = SnowflakeSnowparkSnapshotRuntime(self)
 
     def execute_test_sql(self, stmt: Any) -> Any:
         """
@@ -174,9 +179,6 @@ class SnowflakeSnowparkExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecut
             self._execute_sql(stmt).collect()
 
     # ---------- Helpers ----------
-    def _q(self, s: str) -> str:
-        return '"' + s.replace('"', '""') + '"'
-
     def _quote_identifier(self, ident: str) -> str:
         # Keep identifiers unquoted to match legacy Snowflake behaviour.
         return ident
@@ -193,9 +195,9 @@ class SnowflakeSnowparkExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecut
         # Always include database when present; Snowflake expects DB.SCHEMA.TABLE.
         return bool(catalog)
 
-    def _qualified(self, rel: str) -> str:
+    def _qualified(self, relation: str, *, quoted: bool = False) -> str:
         # DATABASE.SCHEMA.TABLE  (no quotes)
-        return self._format_identifier(rel, purpose="physical", quote=False)
+        return self._format_identifier(relation, purpose="physical", quote=quoted)
 
     def _ensure_schema(self) -> None:
         """
@@ -211,8 +213,8 @@ class SnowflakeSnowparkExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecut
             # Misconfigured; let downstream errors surface naturally.
             return
 
-        db = self._q(self.database)
-        sch = self._q(self.schema)
+        db = _q_ident(self.database)
+        sch = _q_ident(self.schema)
         with suppress(Exception):
             # Fully qualified CREATE SCHEMA is allowed in Snowflake.
             self.session.sql(f"CREATE SCHEMA IF NOT EXISTS {db}.{sch}").collect()
@@ -389,8 +391,8 @@ class SnowflakeSnowparkExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecut
 
         created_schema = False
         if target_db and target_schema and getattr(self, "allow_create_schema", False):
-            db_ident = self._q(target_db)
-            schema_ident = self._q(target_schema)
+            db_ident = _q_ident(target_db)
+            schema_ident = _q_ident(target_schema)
             try:
                 self.session.sql(f"CREATE SCHEMA IF NOT EXISTS {db_ident}.{schema_ident}").collect()
                 created_schema = True
@@ -481,7 +483,7 @@ class SnowflakeSnowparkExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecut
     # ── Incremental API (parity with DuckDB/PG) ──────────────────────────
     def exists_relation(self, relation: str) -> bool:
         """Check existence via information_schema.tables."""
-        db = self._q(self.database)
+        db = _q_ident(self.database)
         schema_lit = f"'{self.schema.upper()}'"
         rel_lit = f"'{relation.upper()}'"
         q = f"""
@@ -546,7 +548,7 @@ class SnowflakeSnowparkExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecut
         qrel = self._qualified(relation)
 
         # Use identifiers in FROM, but *string literals* in WHERE
-        db_ident = self._q(self.database)
+        db_ident = _q_ident(self.database)
         schema_lit = self.schema.replace("'", "''")
         rel_lit = relation.replace("'", "''")
 
@@ -575,45 +577,27 @@ class SnowflakeSnowparkExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecut
             return
 
         # Column names are identifiers → _q is correct here
-        cols_sql = ", ".join(f"{self._q(c)} STRING" for c in to_add)
+        cols_sql = ", ".join(f"{_q_ident(c)} STRING" for c in to_add)
         self._execute_sql(f"ALTER TABLE {qrel} ADD COLUMN {cols_sql}").collect()
 
-    # ---- Snapshot API (mixin hooks) --------------------------------------
-    def _snapshot_target_identifier(self, rel_name: str) -> str:
-        return self._qualified(rel_name)
+    # ---- Snapshot runtime delegation --------------------------------------
+    def run_snapshot_sql(self, node: Node, env: Any) -> None:
+        self.snapshot_runtime.run_snapshot_sql(node, env)
 
-    def _snapshot_current_timestamp(self) -> str:
-        return "CURRENT_TIMESTAMP()"
-
-    def _snapshot_create_keyword(self) -> str:
-        return "CREATE OR REPLACE TABLE"
-
-    def _snapshot_null_timestamp(self) -> str:
-        return "CAST(NULL AS TIMESTAMP)"
-
-    def _snapshot_null_hash(self) -> str:
-        return "CAST(NULL AS VARCHAR)"
-
-    def _snapshot_hash_expr(self, check_cols: list[str], src_alias: str) -> str:
-        concat_expr = self._snapshot_concat_expr(check_cols, src_alias)
-        return f"CAST(MD5({concat_expr}) AS VARCHAR)"
-
-    def _snapshot_cast_as_string(self, expr: str) -> str:
-        return f"CAST({expr} AS VARCHAR)"
-
-    def _snapshot_source_ref(
-        self, rel_name: str, select_body: str
-    ) -> tuple[str, Callable[[], None]]:
-        src_name = f"__ff_snapshot_src_{rel_name}".replace(".", "_")
-        src_quoted = self._q(src_name)
-        self._execute_sql(
-            f"CREATE OR REPLACE TEMPORARY VIEW {src_quoted} AS {select_body}"
-        ).collect()
-
-        def _cleanup() -> None:
-            self._execute_sql(f"DROP VIEW IF EXISTS {src_quoted}").collect()
-
-        return src_quoted, _cleanup
+    def snapshot_prune(
+        self,
+        relation: str,
+        unique_key: list[str],
+        keep_last: int,
+        *,
+        dry_run: bool = False,
+    ) -> None:
+        self.snapshot_runtime.snapshot_prune(
+            relation,
+            unique_key,
+            keep_last,
+            dry_run=dry_run,
+        )
 
     def execute_hook_sql(self, sql: str) -> None:
         """
@@ -778,7 +762,7 @@ class SnowflakeSnowparkExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecut
         """
         db, sch, tbl = self._normalize_table_parts_for_introspection(table)
 
-        db_ident = self._q(db)
+        db_ident = _q_ident(db)
         schema_lit = sch.replace("'", "''").upper()
         table_lit = tbl.replace("'", "''").upper()
 
@@ -814,7 +798,7 @@ class SnowflakeSnowparkExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecut
         """
         db, sch, tbl = self._normalize_table_parts_for_introspection(table)
 
-        db_ident = self._q(db)
+        db_ident = _q_ident(db)
         schema_lit = sch.replace("'", "''").upper()
         table_lit = tbl.replace("'", "''").upper()
         col_lit = (column or "").replace("'", "''").upper()

@@ -1,11 +1,12 @@
 # fastflowtransform/executors/postgres.py
 import json
 import re
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from time import perf_counter
 from typing import Any, cast
 
 import pandas as pd
+from jinja2 import Environment
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import ProgrammingError, SQLAlchemyError
@@ -16,13 +17,14 @@ from fastflowtransform.contracts.runtime.postgres import PostgresRuntimeContract
 from fastflowtransform.core import Node
 from fastflowtransform.errors import ModelExecutionError, ProfileConfigError
 from fastflowtransform.executors._budget_runner import run_sql_with_budget
-from fastflowtransform.executors._snapshot_sql_mixin import SnapshotSqlMixin
 from fastflowtransform.executors._sql_identifier import SqlIdentifierMixin
 from fastflowtransform.executors._test_utils import make_fetchable
 from fastflowtransform.executors.base import BaseExecutor, _scalar
 from fastflowtransform.executors.budget import BudgetGuard
+from fastflowtransform.executors.common import _q_ident
 from fastflowtransform.executors.query_stats import QueryStats
 from fastflowtransform.meta import ensure_meta_table, upsert_meta
+from fastflowtransform.snapshots.runtime.postgres import PostgresSnapshotRuntime
 
 
 def _base_type(t: str) -> str:
@@ -32,9 +34,10 @@ def _base_type(t: str) -> str:
     return s
 
 
-class PostgresExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[pd.DataFrame]):
+class PostgresExecutor(SqlIdentifierMixin, BaseExecutor[pd.DataFrame]):
     ENGINE_NAME: str = "postgres"
     runtime_contracts: PostgresRuntimeContracts
+    snapshot_runtime: PostgresSnapshotRuntime
     _DEFAULT_PG_ROW_WIDTH = 128
     _BUDGET_GUARD = BudgetGuard(
         env_var="FF_PG_MAX_BYTES",
@@ -60,7 +63,7 @@ class PostgresExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[pd.Dat
         if self.schema:
             try:
                 with self.engine.begin() as conn:
-                    conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {self._q_ident(self.schema)}"))
+                    conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {_q_ident(self.schema)}"))
             except SQLAlchemyError as exc:
                 raise ProfileConfigError(
                     f"Failed to ensure schema '{self.schema}' exists: {exc}"
@@ -68,6 +71,7 @@ class PostgresExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[pd.Dat
 
         # Enable runtime contracts (cast/verify) for SQL and pandas models.
         self.runtime_contracts = PostgresRuntimeContracts(self)
+        self.snapshot_runtime = PostgresSnapshotRuntime(self)
 
     def execute_test_sql(self, stmt: Any) -> Any:
         """
@@ -310,19 +314,15 @@ class PostgresExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[pd.Dat
         return int(candidate)
 
     # --- Helpers ---------------------------------------------------------
-    def _q_ident(self, ident: str) -> str:
-        # Simple, safe quoting for identifiers
-        return '"' + ident.replace('"', '""') + '"'
-
     def _quote_identifier(self, ident: str) -> str:
-        return self._q_ident(ident)
+        return _q_ident(ident)
 
-    def _qualified(self, relname: str, schema: str | None = None) -> str:
-        return self._format_identifier(relname, purpose="physical", schema=schema)
+    def _qualified(self, relation: str, schema: str | None = None, *, quoted: bool = True) -> str:
+        return self._format_identifier(relation, purpose="physical", schema=schema, quote=quoted)
 
     def _set_search_path(self, conn: Connection) -> None:
         if self.schema:
-            conn.execute(text(f"SET LOCAL search_path = {self._q_ident(self.schema)}"))
+            conn.execute(text(f"SET LOCAL search_path = {_q_ident(self.schema)}"))
 
     def _extract_select_like(self, sql_or_body: str) -> str:
         """
@@ -546,37 +546,26 @@ class PostgresExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[pd.Dat
                 self._execute_sql(f'alter table {qrel} add column "{c}" text', conn=conn)
 
     # ── Snapshot API ──────────────────────────────────────────────────────
-    def _snapshot_target_identifier(self, rel_name: str) -> str:
-        return self._qualified(rel_name)
+    def run_snapshot_sql(self, node: Node, env: Environment) -> None:
+        """
+        Delegate snapshot materialization to the Postgres snapshot runtime.
+        """
+        self.snapshot_runtime.run_snapshot_sql(node, env)
 
-    def _snapshot_current_timestamp(self) -> str:
-        return "current_timestamp"
-
-    def _snapshot_null_timestamp(self) -> str:
-        return "cast(null as timestamp)"
-
-    def _snapshot_null_hash(self) -> str:
-        return "cast(null as text)"
-
-    def _snapshot_hash_expr(self, check_cols: list[str], src_alias: str) -> str:
-        concat_expr = self._snapshot_concat_expr(check_cols, src_alias)
-        return f"md5({concat_expr})"
-
-    def _snapshot_cast_as_string(self, expr: str) -> str:
-        return f"cast({expr} as text)"
-
-    def _snapshot_source_ref(
-        self, rel_name: str, select_body: str
-    ) -> tuple[str, Callable[[], None]]:
-        src_name = f"__ff_snapshot_src_{rel_name}".replace(".", "_")
-        src_q = self._q_ident(src_name)
-        self._execute_sql(f"drop table if exists {src_q}")
-        self._execute_sql(f"create temporary table {src_q} as {select_body}")
-
-        def _cleanup() -> None:
-            self._execute_sql(f"drop table if exists {src_q}")
-
-        return src_q, _cleanup
+    def snapshot_prune(
+        self,
+        relation: str,
+        unique_key: list[str],
+        keep_last: int,
+        *,
+        dry_run: bool = False,
+    ) -> None:
+        self.snapshot_runtime.snapshot_prune(
+            relation,
+            unique_key,
+            keep_last,
+            dry_run=dry_run,
+        )
 
     def execute_hook_sql(self, sql: str) -> None:
         """
@@ -624,8 +613,8 @@ class PostgresExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[pd.Dat
             )
 
         cols = list(first.keys())
-        col_list_sql = ", ".join(self._q_ident(c) for c in cols)
-        select_exprs = ", ".join(f":{c} AS {self._q_ident(c)}" for c in cols)
+        col_list_sql = ", ".join(_q_ident(c) for c in cols)
+        select_exprs = ", ".join(f":{c} AS {_q_ident(c)}" for c in cols)
         insert_values_sql = ", ".join(f":{c}" for c in cols)
 
         try:
