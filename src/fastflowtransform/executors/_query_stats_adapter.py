@@ -4,7 +4,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any, Protocol
 
-from fastflowtransform.executors.query_stats import QueryStats
+from fastflowtransform.executors.query_stats.core import QueryStats
 
 
 class QueryStatsAdapter(Protocol):

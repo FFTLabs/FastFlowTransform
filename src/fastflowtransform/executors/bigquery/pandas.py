@@ -10,7 +10,7 @@ import pandas as pd
 from fastflowtransform.contracts.runtime.bigquery import BigQueryRuntimeContracts
 from fastflowtransform.core import Node
 from fastflowtransform.executors.bigquery.base import BigQueryBaseExecutor
-from fastflowtransform.executors.query_stats import QueryStats
+from fastflowtransform.executors.query_stats.core import QueryStats
 from fastflowtransform.typing import BadRequest, Client, LoadJobConfig, NotFound, bigquery
 
 

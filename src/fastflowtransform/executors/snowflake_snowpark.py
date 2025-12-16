@@ -15,9 +15,9 @@ from fastflowtransform.executors._budget_runner import run_sql_with_budget
 from fastflowtransform.executors._sql_identifier import SqlIdentifierMixin
 from fastflowtransform.executors._test_utils import make_fetchable, rows_to_tuples
 from fastflowtransform.executors.base import BaseExecutor
-from fastflowtransform.executors.budget import BudgetGuard
+from fastflowtransform.executors.budget.core import BudgetGuard
 from fastflowtransform.executors.common import _q_ident
-from fastflowtransform.executors.query_stats import QueryStats
+from fastflowtransform.executors.query_stats.core import QueryStats
 from fastflowtransform.meta import ensure_meta_table, upsert_meta
 from fastflowtransform.snapshots.runtime.snowflake_snowpark import (
     SnowflakeSnowparkSnapshotRuntime,

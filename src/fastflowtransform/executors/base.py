@@ -21,8 +21,8 @@ from fastflowtransform.config.sources import resolve_source_entry
 from fastflowtransform.core import REGISTRY, Node, relation_for
 from fastflowtransform.errors import ModelExecutionError
 from fastflowtransform.executors._query_stats_adapter import JobStatsAdapter
-from fastflowtransform.executors.budget import BudgetGuard
-from fastflowtransform.executors.query_stats import QueryStats
+from fastflowtransform.executors.budget.core import BudgetGuard
+from fastflowtransform.executors.query_stats.core import QueryStats
 from fastflowtransform.incremental import _normalize_unique_key
 from fastflowtransform.logging import echo, echo_debug
 from fastflowtransform.validation import validate_required_columns

@@ -9,8 +9,8 @@ from fastflowtransform.executors._budget_runner import run_sql_with_budget
 from fastflowtransform.executors._sql_identifier import SqlIdentifierMixin
 from fastflowtransform.executors._test_utils import make_fetchable
 from fastflowtransform.executors.base import BaseExecutor
-from fastflowtransform.executors.budget import BudgetGuard
-from fastflowtransform.executors.query_stats import _TrackedQueryJob
+from fastflowtransform.executors.budget.core import BudgetGuard
+from fastflowtransform.executors.query_stats.core import _TrackedQueryJob
 from fastflowtransform.meta import ensure_meta_table, upsert_meta
 from fastflowtransform.snapshots.runtime.bigquery import BigQuerySnapshotRuntime
 from fastflowtransform.typing import BadRequest, Client, NotFound, bigquery

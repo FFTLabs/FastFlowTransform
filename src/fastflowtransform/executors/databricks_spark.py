@@ -19,7 +19,7 @@ from fastflowtransform.executors._budget_runner import run_sql_with_budget
 from fastflowtransform.executors._query_stats_adapter import SparkDataFrameStatsAdapter
 from fastflowtransform.executors._test_utils import make_fetchable, rows_to_tuples
 from fastflowtransform.executors.base import BaseExecutor
-from fastflowtransform.executors.budget import BudgetGuard
+from fastflowtransform.executors.budget.core import BudgetGuard
 from fastflowtransform.logging import echo_debug
 from fastflowtransform.meta import ensure_meta_table, upsert_meta
 from fastflowtransform.snapshots.runtime.databricks_spark import DatabricksSparkSnapshotRuntime

@@ -65,7 +65,7 @@ from fastflowtransform.config.project import HookSpec
 from fastflowtransform.core import REGISTRY, Node, relation_for
 from fastflowtransform.dag import levels as dag_levels
 from fastflowtransform.executors.base import BaseExecutor
-from fastflowtransform.executors.budget import format_bytes
+from fastflowtransform.executors.budget.core import format_bytes
 from fastflowtransform.fingerprint import (
     EnvCtx,
     build_env_ctx,

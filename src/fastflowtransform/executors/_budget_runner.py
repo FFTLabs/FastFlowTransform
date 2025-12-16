@@ -6,8 +6,8 @@ from time import perf_counter
 from typing import Any
 
 from fastflowtransform.executors._query_stats_adapter import QueryStatsAdapter, RowcountStatsAdapter
-from fastflowtransform.executors.budget import BudgetGuard
-from fastflowtransform.executors.query_stats import QueryStats
+from fastflowtransform.executors.budget.core import BudgetGuard
+from fastflowtransform.executors.query_stats.core import QueryStats
 
 
 def run_sql_with_budget(
