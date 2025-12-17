@@ -31,9 +31,9 @@ class BaseBudgetRuntime[E: BudgetExecutor]:
     executor: E
     guard: BudgetGuard | None
 
-    def __init__(self, executor: E, guard: BudgetGuard | None):
+    def __init__(self, executor: E, guard: BudgetGuard | None = None):
         self.executor = executor
-        self.guard = guard
+        self.guard = guard or getattr(type(self), "DEFAULT_GUARD", None)
 
     def apply_guard(self, sql: str) -> int | None:
         return self.executor._apply_budget_guard(self.guard, sql)
@@ -52,13 +52,14 @@ class BaseBudgetRuntime[E: BudgetExecutor]:
         stats_adapter: QueryStatsAdapter | None = None,
     ) -> Any:
         estimated_bytes = self.apply_guard(sql)
+        estimator = estimate_fn or getattr(self, "estimate_query_bytes", None)
         if (
             estimated_bytes is None
             and not self.executor._is_budget_guard_active()
-            and estimate_fn is not None
+            and callable(estimator)
         ):
             with suppress(Exception):
-                estimated_bytes = estimate_fn(sql)
+                estimated_bytes = estimator(sql)
 
         if not record_stats:
             return exec_fn()

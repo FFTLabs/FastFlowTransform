@@ -16,7 +16,14 @@ class DatabricksSparkBudgetExecutor(BudgetExecutor, Protocol):
 class DatabricksSparkBudgetRuntime(BaseBudgetRuntime[DatabricksSparkBudgetExecutor]):
     """Databricks/Spark budget runtime using logical-plan stats for estimation."""
 
-    def __init__(self, executor: DatabricksSparkBudgetExecutor, guard: BudgetGuard | None):
+    DEFAULT_GUARD = BudgetGuard(
+        env_var="FF_SPK_MAX_BYTES",
+        estimator_attr="runtime_budget_estimate_query_bytes",
+        engine_label="Databricks/Spark",
+        what="query",
+    )
+
+    def __init__(self, executor: DatabricksSparkBudgetExecutor, guard: BudgetGuard | None = None):
         super().__init__(executor, guard)
         self._default_size: int | None = self.detect_default_size()
 

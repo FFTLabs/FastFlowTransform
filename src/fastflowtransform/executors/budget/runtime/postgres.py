@@ -26,9 +26,16 @@ class PostgresBudgetExecutor(BudgetExecutor, Protocol):
 class PostgresBudgetRuntime(BaseBudgetRuntime[PostgresBudgetExecutor]):
     """Postgres-specific budget runtime with EXPLAIN-based estimation."""
 
+    DEFAULT_GUARD = BudgetGuard(
+        env_var="FF_PG_MAX_BYTES",
+        estimator_attr="_estimate_query_bytes",
+        engine_label="Postgres",
+        what="query",
+    )
+
     _DEFAULT_PG_ROW_WIDTH = 128
 
-    def __init__(self, executor: PostgresBudgetExecutor, guard: BudgetGuard | None):
+    def __init__(self, executor: PostgresBudgetExecutor, guard: BudgetGuard | None = None):
         super().__init__(executor, guard)
 
     def estimate_query_bytes(self, sql: str) -> int | None:

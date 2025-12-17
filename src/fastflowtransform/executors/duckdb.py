@@ -17,7 +17,6 @@ from fastflowtransform.core import Node
 from fastflowtransform.executors._sql_identifier import SqlIdentifierMixin
 from fastflowtransform.executors._test_utils import make_fetchable
 from fastflowtransform.executors.base import BaseExecutor, _scalar
-from fastflowtransform.executors.budget.core import BudgetGuard
 from fastflowtransform.executors.budget.runtime.duckdb import DuckBudgetRuntime
 from fastflowtransform.executors.common import _q_ident
 from fastflowtransform.executors.query_stats.runtime.duckdb import DuckQueryStatsRuntime
@@ -31,13 +30,6 @@ class DuckExecutor(SqlIdentifierMixin, BaseExecutor[pd.DataFrame]):
     runtime_query_stats: DuckQueryStatsRuntime
     runtime_budget: DuckBudgetRuntime
     snapshot_runtime: DuckSnapshotRuntime
-
-    _BUDGET_GUARD = BudgetGuard(
-        env_var="FF_DUCKDB_MAX_BYTES",
-        estimator_attr="_estimate_query_bytes",
-        engine_label="DuckDB",
-        what="query",
-    )
 
     def __init__(
         self, db_path: str = ":memory:", schema: str | None = None, catalog: str | None = None
@@ -56,7 +48,7 @@ class DuckExecutor(SqlIdentifierMixin, BaseExecutor[pd.DataFrame]):
             else:
                 self.catalog = self._detect_catalog()
         self.runtime_query_stats = DuckQueryStatsRuntime(self)
-        self.runtime_budget = DuckBudgetRuntime(self, self._BUDGET_GUARD)
+        self.runtime_budget = DuckBudgetRuntime(self)
         self.runtime_contracts = DuckRuntimeContracts(self)
         self.snapshot_runtime = DuckSnapshotRuntime(self)
 
@@ -134,13 +126,7 @@ class DuckExecutor(SqlIdentifierMixin, BaseExecutor[pd.DataFrame]):
             exec_fn=_exec,
             stats_runtime=self.runtime_query_stats,
             rowcount_extractor=_rows,
-            estimate_fn=self._estimate_query_bytes,
         )
-
-    # --- Cost estimation for the shared BudgetGuard -----------------
-
-    def _estimate_query_bytes(self, sql: str) -> int | None:
-        return self.runtime_budget.estimate_query_bytes(sql)
 
     def _detect_catalog(self) -> str | None:
         rows = self._execute_basic("PRAGMA database_list").fetchall()

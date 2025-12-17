@@ -17,7 +17,6 @@ from fastflowtransform.core import REGISTRY, Node, relation_for
 from fastflowtransform.errors import ModelExecutionError
 from fastflowtransform.executors._test_utils import make_fetchable, rows_to_tuples
 from fastflowtransform.executors.base import BaseExecutor
-from fastflowtransform.executors.budget.core import BudgetGuard
 from fastflowtransform.executors.budget.runtime.databricks_spark import (
     DatabricksSparkBudgetRuntime,
 )
@@ -190,12 +189,6 @@ class DatabricksSparkExecutor(BaseExecutor[SDF]):
     runtime_query_stats: DatabricksSparkQueryStatsRuntime
     runtime_budget: DatabricksSparkBudgetRuntime
     snapshot_runtime: DatabricksSparkSnapshotRuntime
-    _BUDGET_GUARD = BudgetGuard(
-        env_var="FF_SPK_MAX_BYTES",
-        estimator_attr="runtime_budget_estimate_query_bytes",
-        engine_label="Databricks/Spark",
-        what="query",
-    )
 
     def __init__(
         self,
@@ -275,7 +268,7 @@ class DatabricksSparkExecutor(BaseExecutor[SDF]):
         self.database = database
         self.schema = database
         self.runtime_query_stats = DatabricksSparkQueryStatsRuntime(self)
-        self.runtime_budget = DatabricksSparkBudgetRuntime(self, self._BUDGET_GUARD)
+        self.runtime_budget = DatabricksSparkBudgetRuntime(self)
 
         if database:
             self._execute_sql_basic(f"CREATE DATABASE IF NOT EXISTS `{database}`")
@@ -314,12 +307,6 @@ class DatabricksSparkExecutor(BaseExecutor[SDF]):
 
         self.runtime_contracts = DatabricksSparkRuntimeContracts(self)
         self.snapshot_runtime = DatabricksSparkSnapshotRuntime(self)
-
-    # ---------- Cost estimation & central execution ----------
-
-    def runtime_budget_estimate_query_bytes(self, sql: str) -> int | None:
-        """Expose runtime_budget estimator for BudgetGuard."""
-        return self.runtime_budget.estimate_query_bytes(sql)
 
     def execute_test_sql(self, stmt: Any) -> Any:
         """
@@ -367,7 +354,6 @@ class DatabricksSparkExecutor(BaseExecutor[SDF]):
             sql,
             exec_fn=_exec,
             stats_runtime=self.runtime_query_stats,
-            estimate_fn=self.runtime_budget_estimate_query_bytes,
             stats_adapter=self.runtime_budget.spark_stats_adapter(sql),
         )
 

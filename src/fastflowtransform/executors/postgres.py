@@ -18,7 +18,6 @@ from fastflowtransform.errors import ModelExecutionError, ProfileConfigError
 from fastflowtransform.executors._sql_identifier import SqlIdentifierMixin
 from fastflowtransform.executors._test_utils import make_fetchable
 from fastflowtransform.executors.base import BaseExecutor, _scalar
-from fastflowtransform.executors.budget.core import BudgetGuard
 from fastflowtransform.executors.budget.runtime.postgres import PostgresBudgetRuntime
 from fastflowtransform.executors.common import _q_ident
 from fastflowtransform.executors.query_stats.runtime.postgres import PostgresQueryStatsRuntime
@@ -39,12 +38,6 @@ class PostgresExecutor(SqlIdentifierMixin, BaseExecutor[pd.DataFrame]):
     runtime_query_stats: PostgresQueryStatsRuntime
     runtime_budget: PostgresBudgetRuntime
     snapshot_runtime: PostgresSnapshotRuntime
-    _BUDGET_GUARD = BudgetGuard(
-        env_var="FF_PG_MAX_BYTES",
-        estimator_attr="_estimate_query_bytes",
-        engine_label="Postgres",
-        what="query",
-    )
 
     def __init__(self, dsn: str, schema: str | None = None):
         """
@@ -72,7 +65,7 @@ class PostgresExecutor(SqlIdentifierMixin, BaseExecutor[pd.DataFrame]):
 
         # Enable runtime helpers and contracts.
         self.runtime_query_stats = PostgresQueryStatsRuntime(self)
-        self.runtime_budget = PostgresBudgetRuntime(self, self._BUDGET_GUARD)
+        self.runtime_budget = PostgresBudgetRuntime(self)
         self.runtime_contracts = PostgresRuntimeContracts(self)
         self.snapshot_runtime = PostgresSnapshotRuntime(self)
 
@@ -194,7 +187,6 @@ class PostgresExecutor(SqlIdentifierMixin, BaseExecutor[pd.DataFrame]):
             exec_fn=_exec,
             stats_runtime=self.runtime_query_stats,
             rowcount_extractor=_rows,
-            estimate_fn=self._estimate_query_bytes,
         )
 
     def _analyze_relations(
@@ -216,11 +208,6 @@ class PostgresExecutor(SqlIdentifierMixin, BaseExecutor[pd.DataFrame]):
                 self._execute_sql_maintenance(f"ANALYZE {qrel}", conn=conn)
             except Exception:
                 pass
-
-    # --- Cost estimation for the shared BudgetGuard -----------------
-
-    def _estimate_query_bytes(self, sql: str) -> int | None:
-        return self.runtime_budget.estimate_query_bytes(sql)
 
     # --- Helpers ---------------------------------------------------------
     def _quote_identifier(self, ident: str) -> str:

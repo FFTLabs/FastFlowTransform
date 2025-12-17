@@ -19,6 +19,13 @@ class DuckBudgetExecutor(BudgetExecutor, Protocol):
 class DuckBudgetRuntime(BaseBudgetRuntime[DuckBudgetExecutor]):
     """DuckDB-specific budget runtime with plan-based estimation."""
 
+    DEFAULT_GUARD = BudgetGuard(
+        env_var="FF_DUCKDB_MAX_BYTES",
+        estimator_attr="_estimate_query_bytes",
+        engine_label="DuckDB",
+        what="query",
+    )
+
     _FIXED_TYPE_SIZES: ClassVar[dict[str, int]] = {
         "boolean": 1,
         "bool": 1,
@@ -48,7 +55,7 @@ class DuckBudgetRuntime(BaseBudgetRuntime[DuckBudgetExecutor]):
     _VARCHAR_MAX_WIDTH = 1024
     _DEFAULT_ROW_WIDTH = 128
 
-    def __init__(self, executor: DuckBudgetExecutor, guard: BudgetGuard | None):
+    def __init__(self, executor: DuckBudgetExecutor, guard: BudgetGuard | None = None):
         super().__init__(executor, guard)
         self._table_row_width_cache: dict[tuple[str | None, str], int] = {}
 
