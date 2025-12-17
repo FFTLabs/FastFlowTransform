@@ -5,7 +5,7 @@ from collections.abc import Callable, Iterable
 from contextlib import suppress
 from pathlib import Path
 from time import perf_counter
-from typing import Any, cast
+from typing import Any
 from urllib.parse import unquote, urlparse
 
 import pandas as pd
@@ -15,11 +15,15 @@ from fastflowtransform import storage
 from fastflowtransform.contracts.runtime.databricks_spark import DatabricksSparkRuntimeContracts
 from fastflowtransform.core import REGISTRY, Node, relation_for
 from fastflowtransform.errors import ModelExecutionError
-from fastflowtransform.executors._budget_runner import run_sql_with_budget
-from fastflowtransform.executors._query_stats_adapter import SparkDataFrameStatsAdapter
 from fastflowtransform.executors._test_utils import make_fetchable, rows_to_tuples
 from fastflowtransform.executors.base import BaseExecutor
 from fastflowtransform.executors.budget.core import BudgetGuard
+from fastflowtransform.executors.budget.runtime.databricks_spark import (
+    DatabricksSparkBudgetRuntime,
+)
+from fastflowtransform.executors.query_stats.runtime.databricks_spark import (
+    DatabricksSparkQueryStatsRuntime,
+)
 from fastflowtransform.logging import echo_debug
 from fastflowtransform.meta import ensure_meta_table, upsert_meta
 from fastflowtransform.snapshots.runtime.databricks_spark import DatabricksSparkSnapshotRuntime
@@ -183,10 +187,12 @@ class DatabricksSparkExecutor(BaseExecutor[SDF]):
 
     ENGINE_NAME: str = "databricks_spark"
     runtime_contracts: DatabricksSparkRuntimeContracts
+    runtime_query_stats: DatabricksSparkQueryStatsRuntime
+    runtime_budget: DatabricksSparkBudgetRuntime
     snapshot_runtime: DatabricksSparkSnapshotRuntime
     _BUDGET_GUARD = BudgetGuard(
         env_var="FF_SPK_MAX_BYTES",
-        estimator_attr="_estimate_query_bytes",
+        estimator_attr="runtime_budget_estimate_query_bytes",
         engine_label="Databricks/Spark",
         what="query",
     )
@@ -241,11 +247,6 @@ class DatabricksSparkExecutor(BaseExecutor[SDF]):
         # Apply Delta configuration last, after all Spark configs are set.
         if not wants_delta and self._user_spark is None:
             catalog_overridden = bool(catalog_value)
-            if not catalog_overridden:
-                # Leave Spark catalog untouched; downstream environments may supply
-                # their own defaults (e.g., Unity, Glue). We only force a catalog
-                # when the user explicitly opts into Delta.
-                pass
 
         # Apply Delta configuration last, after all Spark configs are set.
         if wants_delta and self._user_spark is None:
@@ -273,9 +274,11 @@ class DatabricksSparkExecutor(BaseExecutor[SDF]):
         self.catalog = catalog
         self.database = database
         self.schema = database
+        self.runtime_query_stats = DatabricksSparkQueryStatsRuntime(self)
+        self.runtime_budget = DatabricksSparkBudgetRuntime(self, self._BUDGET_GUARD)
 
         if database:
-            self._execute_sql(f"CREATE DATABASE IF NOT EXISTS `{database}`")
+            self._execute_sql_basic(f"CREATE DATABASE IF NOT EXISTS `{database}`")
             with suppress(Exception):
                 self.spark.catalog.setCurrentDatabase(database)
 
@@ -309,122 +312,14 @@ class DatabricksSparkExecutor(BaseExecutor[SDF]):
             sql_runner=self._execute_sql,
         )
 
-        self._spark_default_size = self._detect_default_size()
         self.runtime_contracts = DatabricksSparkRuntimeContracts(self)
         self.snapshot_runtime = DatabricksSparkSnapshotRuntime(self)
 
     # ---------- Cost estimation & central execution ----------
 
-    def _detect_default_size(self) -> int:
-        """
-        Detect Spark's defaultSizeInBytes sentinel.
-
-        - Prefer spark.sql.defaultSizeInBytes if available.
-        - Fall back to Long.MaxValue (2^63 - 1) otherwise.
-        """
-        try:
-            conf_val = self.spark.conf.get("spark.sql.defaultSizeInBytes")
-            if conf_val is not None:
-                return int(conf_val)
-        except Exception:
-            # config not set / older Spark / weird environment
-            pass
-
-        # Fallback: Spark uses Long.MaxValue by default
-        return 2**63 - 1  # 9223372036854775807
-
-    def _parse_spark_stats_size(self, size_val: Any) -> int | None:
-        if size_val is None:
-            return None
-        try:
-            size_int = int(str(size_val))
-        except Exception:
-            return None
-        return size_int if size_int > 0 else None
-
-    def _jplan_uses_default_size(self, jplan: Any) -> bool:
-        """
-        Recursively walk a JVM LogicalPlan and return True if any node's
-        stats.sizeInBytes equals spark.sql.defaultSizeInBytes.
-        """
-        if self._spark_default_size is None:
-            return False
-
-        try:
-            stats = jplan.stats()
-            size_val = stats.sizeInBytes()
-            size_int = int(str(size_val))
-            if size_int == self._spark_default_size:
-                return True
-        except Exception:
-            # ignore stats errors and keep walking
-            pass
-
-        # children() is a Scala Seq[LogicalPlan]; iterate via .size() / .apply(i)
-        try:
-            children = jplan.children()
-            n = children.size()
-            for idx in range(n):
-                child = children.apply(idx)
-                if self._jplan_uses_default_size(child):
-                    return True
-        except Exception:
-            # if we can't inspect children, stop here
-            pass
-
-        return False
-
-    def _spark_plan_bytes(self, sql: str) -> int | None:
-        """
-        Inspect the optimized logical plan via the JVM and return sizeInBytes
-        as an integer, or None if not available.
-
-        This does *not* execute the query; it only goes through analysis/planning.
-        """
-        try:
-            normalized = self._selectable_body(sql).rstrip(";\n\t ")
-            if not normalized:
-                normalized = sql
-        except Exception:
-            normalized = sql
-
-        stmt = normalized.lstrip().lower()
-        if not stmt.startswith(("select", "with")):
-            # DDL/DML statements (ALTER/INSERT/etc.) should not be executed twice.
-            return None
-
-        try:
-            df = self.spark.sql(normalized)
-
-            jdf = cast(Any, getattr(df, "_jdf", None))
-            if jdf is None:
-                return None
-
-            qe = jdf.queryExecution()
-            jplan = qe.optimizedPlan()
-
-            # If any node relies on defaultSizeInBytes, we don't trust the stats
-            if self._jplan_uses_default_size(jplan):
-                return None
-
-            stats = jplan.stats()
-
-            size_attr = getattr(stats, "sizeInBytes", None)
-            size_val = size_attr() if callable(size_attr) else size_attr
-
-            return self._parse_spark_stats_size(size_val)
-        except Exception:
-            return None
-
-    def _estimate_query_bytes(self, sql: str) -> int | None:
-        """
-        Best-effort logical-plan size estimate using Spark's stats.
-
-        It inspects the optimized plan's sizeInBytes via the JVM API without
-        executing the query. If unavailable or unsupported, returns None and
-        the guard is effectively disabled.
-        """
-        return self._spark_plan_bytes(sql)
+    def runtime_budget_estimate_query_bytes(self, sql: str) -> int | None:
+        """Expose runtime_budget estimator for BudgetGuard."""
+        return self.runtime_budget.estimate_query_bytes(sql)
 
     def execute_test_sql(self, stmt: Any) -> Any:
         """
@@ -453,6 +348,9 @@ class DatabricksSparkExecutor(BaseExecutor[SDF]):
         val = row[0] if row else None
         return (float(val) if val is not None else None, sql)
 
+    def _execute_sql_basic(self, sql: str) -> SDF:
+        return self.spark.sql(sql)
+
     def _execute_sql(self, sql: str) -> SDF:
         """
         Central Spark SQL runner.
@@ -465,13 +363,12 @@ class DatabricksSparkExecutor(BaseExecutor[SDF]):
         def _exec() -> SDF:
             return self.spark.sql(sql)
 
-        return run_sql_with_budget(
-            self,
+        return self.runtime_budget.run_sql(
             sql,
-            guard=self._BUDGET_GUARD,
             exec_fn=_exec,
-            estimate_fn=self._spark_plan_bytes,
-            post_estimate_fn=lambda _, __: self._spark_plan_bytes(sql),
+            stats_runtime=self.runtime_query_stats,
+            estimate_fn=self.runtime_budget_estimate_query_bytes,
+            stats_adapter=self.runtime_budget.spark_stats_adapter(sql),
         )
 
     # ---------- Frame hooks (required) ----------
@@ -498,7 +395,7 @@ class DatabricksSparkExecutor(BaseExecutor[SDF]):
         """Compatibility hook: create a simple SELECT * view over an existing table."""
         view_sql = self._sql_identifier(view_name)
         backing_sql = self._sql_identifier(backing_table)
-        self._execute_sql(f"CREATE OR REPLACE VIEW {view_sql} AS SELECT * FROM {backing_sql}")
+        self._execute_sql_basic(f"CREATE OR REPLACE VIEW {view_sql} AS SELECT * FROM {backing_sql}")
 
     def _validate_required(
         self, node_name: str, inputs: Any, requires: dict[str, set[str]]
@@ -600,28 +497,7 @@ class DatabricksSparkExecutor(BaseExecutor[SDF]):
                 self.spark.catalog.refreshByPath(path)
 
     def _record_spark_dataframe_stats(self, df: SDF, duration_ms: int) -> None:
-        adapter = SparkDataFrameStatsAdapter(self._spark_dataframe_bytes)
-        stats = adapter.collect(df, duration_ms=duration_ms)
-        self._record_query_stats(stats)
-
-    def _spark_dataframe_bytes(self, df: SDF) -> int | None:
-        try:
-            jdf = cast(Any, getattr(df, "_jdf", None))
-            if jdf is None:
-                return None
-
-            qe = jdf.queryExecution()
-            jplan = qe.optimizedPlan()
-
-            if self._jplan_uses_default_size(jplan):
-                return None
-
-            stats = jplan.stats()
-            size_attr = getattr(stats, "sizeInBytes", None)
-            size_val = size_attr() if callable(size_attr) else size_attr
-            return self._parse_spark_stats_size(size_val)
-        except Exception:
-            return None
+        self.runtime_query_stats.record_dataframe(df, duration_ms)
 
     # ---- SQL hooks ----
     def _format_relation_for_ref(self, name: str) -> str:
@@ -788,12 +664,12 @@ class DatabricksSparkExecutor(BaseExecutor[SDF]):
         self._format_handler.save_df_as_table(table_name, df)
 
         with suppress(Exception):
-            self._execute_sql(
+            self._execute_sql_basic(
                 f"ANALYZE TABLE {self._sql_identifier(table_name)} COMPUTE STATISTICS"
             )
 
     def _create_or_replace_view(self, target_sql: str, select_body: str, node: Node) -> None:
-        self._execute_sql(f"CREATE OR REPLACE VIEW {target_sql} AS {select_body}")
+        self._execute_sql_basic(f"CREATE OR REPLACE VIEW {target_sql} AS {select_body}")
 
     def _create_or_replace_table(self, target_sql: str, select_body: str, node: Node) -> None:
         preview = f"-- target={target_sql}\n{select_body}"
@@ -809,7 +685,7 @@ class DatabricksSparkExecutor(BaseExecutor[SDF]):
     ) -> None:
         view_sql = self._sql_identifier(view_name)
         backing_sql = self._sql_identifier(backing_table)
-        self._execute_sql(f"CREATE OR REPLACE VIEW {view_sql} AS SELECT * FROM {backing_sql}")
+        self._execute_sql_basic(f"CREATE OR REPLACE VIEW {view_sql} AS SELECT * FROM {backing_sql}")
 
     # ---- Meta hook ----
     def on_node_built(self, node: Node, relation: str, fingerprint: str) -> None:
@@ -927,7 +803,7 @@ class DatabricksSparkExecutor(BaseExecutor[SDF]):
         existing = {f.name for f in target_df.schema.fields}
         # Output schema from the SELECT
         body = self._first_select_body(select_sql).strip().rstrip(";\n\t ")
-        probe = self._execute_sql(f"SELECT * FROM ({body}) q LIMIT 0")
+        probe = self._execute_sql_basic(f"SELECT * FROM ({body}) q LIMIT 0")
         to_add = [f for f in probe.schema.fields if f.name not in existing]
         if not to_add:
             return
@@ -942,7 +818,7 @@ class DatabricksSparkExecutor(BaseExecutor[SDF]):
 
         cols_sql = ", ".join([f"`{f.name}` {_spark_sql_type(f.dataType)}" for f in to_add])
         table_sql = self._sql_identifier(relation)
-        self._execute_sql(f"ALTER TABLE {table_sql} ADD COLUMNS ({cols_sql})")
+        self._execute_sql_basic(f"ALTER TABLE {table_sql} ADD COLUMNS ({cols_sql})")
 
     # ── Snapshot runtime delegation ──────────────────────────────────────
     def run_snapshot_sql(self, node: Node, env: Environment) -> None:
@@ -988,7 +864,9 @@ class DatabricksSparkExecutor(BaseExecutor[SDF]):
             schema_part = self._strip_quotes(schema)
             if schema_part:
                 # Ensure database exists when a separate schema is provided.
-                self._execute_sql(f"CREATE DATABASE IF NOT EXISTS {self._q_ident(schema_part)}")
+                self._execute_sql_basic(
+                    f"CREATE DATABASE IF NOT EXISTS {self._q_ident(schema_part)}"
+                )
                 created_schema = True
                 parts = [schema_part, parts[0]]
 
@@ -1062,11 +940,11 @@ class DatabricksSparkExecutor(BaseExecutor[SDF]):
 
         # Drop view first; ignore errors if it's actually a table or missing.
         with suppress(Exception):
-            self._execute_sql(f"DROP VIEW IF EXISTS {ident}")
+            self._execute_sql_basic(f"DROP VIEW IF EXISTS {ident}")
 
         # Then drop table; ignore errors if it's actually a view or missing.
         with suppress(Exception):
-            self._execute_sql(f"DROP TABLE IF EXISTS {ident}")
+            self._execute_sql_basic(f"DROP TABLE IF EXISTS {ident}")
 
     def _introspect_columns_metadata(
         self,

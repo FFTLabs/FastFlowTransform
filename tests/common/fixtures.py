@@ -138,8 +138,8 @@ def exec_minimal(monkeypatch):
         SP.builder.master.return_value.appName.return_value.getOrCreate.return_value = fake_spark
         ex = DatabricksSparkExecutor()
     # JVM plan inspection loops forever on MagicMocks; skip in unit tests.
-    monkeypatch.setattr(ex, "_spark_plan_bytes", lambda *_, **__: None)
-    monkeypatch.setattr(ex, "_spark_dataframe_bytes", lambda *_, **__: None)
+    monkeypatch.setattr(ex.runtime_budget, "_spark_plan_bytes", lambda *_, **__: None)
+    monkeypatch.setattr(ex.runtime_budget, "dataframe_bytes", lambda *_, **__: None)
     # accept mocks as frames in unit tests
     monkeypatch.setattr(ex, "_is_frame", lambda obj: True)
     return ex
@@ -171,8 +171,8 @@ def exec_factory():
             fake_builder.getOrCreate.return_value = fake_spark
 
             ex = DatabricksSparkExecutor(**kwargs)
-            ex._spark_plan_bytes = lambda *_, **__: None
-            ex._spark_dataframe_bytes = lambda *_, **__: None
+            ex.runtime_budget._spark_plan_bytes = lambda *_, **__: None
+            ex.runtime_budget.dataframe_bytes = lambda *_, **__: None
         return ex, fake_builder, fake_spark
 
     return _make

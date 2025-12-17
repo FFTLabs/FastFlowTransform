@@ -126,8 +126,9 @@ class SparkDataFrameStatsAdapter:
         self.bytes_fn = bytes_fn
 
     def collect(
-        self, df: Any, *, duration_ms: int | None, estimated_bytes: int | None = None
+        self, result: Any, *, duration_ms: int | None, estimated_bytes: int | None = None
     ) -> QueryStats:
+        df = result
         bytes_val = estimated_bytes
         if bytes_val is None:
             try:
