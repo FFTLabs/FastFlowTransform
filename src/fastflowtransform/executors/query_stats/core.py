@@ -30,7 +30,7 @@ class _TrackedQueryJob:
     - Never raises from the callback; stats collection is strictly best-effort.
     """
 
-    def __init__(self, inner_job: Any, *, on_complete: Callable[[Any], None]) -> None:
+    def __init__(self, inner_job: Any, *, on_complete: Callable[[Any], Any]) -> None:
         self._inner_job = inner_job
         self._on_complete = on_complete
         self._done = False

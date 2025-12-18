@@ -14,6 +14,7 @@ from sqlalchemy import text
 
 import fastflowtransform.executors.bigquery.base as bq_base
 import fastflowtransform.executors.bigquery.pandas as bq_pandas
+import fastflowtransform.executors.budget.runtime.bigquery as bq_budget_runtime
 import fastflowtransform.typing as fft_typing
 from fastflowtransform import utest
 from fastflowtransform.core import REGISTRY
@@ -500,7 +501,7 @@ def bq_executor_fake(monkeypatch) -> BigQueryExecutor:
     # see the fake module.
     fake_bq = install_fake_bigquery(
         monkeypatch,
-        target_modules=[fft_typing, bq_base, bq_pandas],
+        target_modules=[fft_typing, bq_base, bq_pandas, bq_budget_runtime],
     )
 
     # Instantiate FakeClient via the fake module so the types line up

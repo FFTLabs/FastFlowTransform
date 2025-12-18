@@ -75,18 +75,6 @@ class SnowflakeSnowparkExecutor(SqlIdentifierMixin, BaseExecutor[SNDF]):
         val = row[0] if row else None
         return (float(val) if val is not None else None, sql)
 
-    # ---------- Cost estimation & central execution ----------
-
-    # def _estimate_query_bytes(self, sql: str) -> int | None:
-    #     """Compatibility shim that delegates to the budget runtime estimator."""
-    #     return self.runtime_budget.estimate_query_bytes(sql)
-
-    # def runtime_budget_estimate_query_bytes(self, sql: str) -> int | None:
-    #     """
-    #     Entry point for BudgetGuard to call into the runtime estimator.
-    #     """
-    #     return self.runtime_budget.estimate_query_bytes(sql)
-
     def _execute_sql_basic(self, sql: str) -> SNDF:
         return self.session.sql(sql)
 
@@ -182,17 +170,6 @@ class SnowflakeSnowparkExecutor(SqlIdentifierMixin, BaseExecutor[SNDF]):
         df.write.save_as_table(self._qualified(relation), mode="overwrite")
         duration_ms = int((perf_counter() - start) * 1000)
         self.runtime_query_stats.record_dataframe(df, duration_ms)
-
-    # def _estimate_frame_bytes(self, df: SNDF) -> int | None:
-    #     """
-    #     Best-effort bytes estimate for a Snowpark DataFrame.
-
-    #     Strategy:
-    #     1) Use DataFrame.queries["queries"] (public Snowpark API) to get SQL.
-    #     2) Optionally fall back to df._plan.sql() if queries is missing/empty.
-    #     3) Run the budget runtime estimator on the derived SQL.
-    #     """
-    #     return self.runtime_budget.dataframe_bytes(df)
 
     def _create_view_over_table(self, view_name: str, backing_table: str, node: Node) -> None:
         qv = self._qualified(view_name)

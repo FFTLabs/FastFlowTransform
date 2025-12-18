@@ -1,4 +1,5 @@
 from fastflowtransform.executors.query_stats.runtime.base import BaseQueryStatsRuntime
+from fastflowtransform.executors.query_stats.runtime.bigquery import BigQueryQueryStatsRuntime
 from fastflowtransform.executors.query_stats.runtime.databricks_spark import (
     DatabricksSparkQueryStatsRuntime,
 )
@@ -10,6 +11,7 @@ from fastflowtransform.executors.query_stats.runtime.snowflake_snowpark import (
 
 __all__ = [
     "BaseQueryStatsRuntime",
+    "BigQueryQueryStatsRuntime",
     "DatabricksSparkQueryStatsRuntime",
     "DuckQueryStatsRuntime",
     "PostgresQueryStatsRuntime",

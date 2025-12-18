@@ -5,12 +5,12 @@ from collections.abc import Iterable
 from typing import Any, TypeVar
 
 from fastflowtransform.core import Node, relation_for
-from fastflowtransform.executors._budget_runner import run_sql_with_budget
 from fastflowtransform.executors._sql_identifier import SqlIdentifierMixin
 from fastflowtransform.executors._test_utils import make_fetchable
 from fastflowtransform.executors.base import BaseExecutor
-from fastflowtransform.executors.budget.core import BudgetGuard
+from fastflowtransform.executors.budget.runtime.bigquery import BigQueryBudgetRuntime
 from fastflowtransform.executors.query_stats.core import _TrackedQueryJob
+from fastflowtransform.executors.query_stats.runtime.bigquery import BigQueryQueryStatsRuntime
 from fastflowtransform.meta import ensure_meta_table, upsert_meta
 from fastflowtransform.snapshots.runtime.bigquery import BigQuerySnapshotRuntime
 from fastflowtransform.typing import BadRequest, Client, NotFound, bigquery
@@ -32,12 +32,8 @@ class BigQueryBaseExecutor(SqlIdentifierMixin, BaseExecutor[TFrame]):
 
     # Subclasses override ENGINE_NAME ("bigquery", "bigquery_batch", ...)
     ENGINE_NAME = "bigquery_base"
-    _BUDGET_GUARD = BudgetGuard(
-        env_var="FF_BQ_MAX_BYTES",
-        estimator_attr="_estimate_query_bytes",
-        engine_label="BigQuery",
-        what="query",
-    )
+    runtime_query_stats: BigQueryQueryStatsRuntime
+    runtime_budget: BigQueryBudgetRuntime
 
     def __init__(
         self,
@@ -55,6 +51,8 @@ class BigQueryBaseExecutor(SqlIdentifierMixin, BaseExecutor[TFrame]):
             project=self.project,
             location=self.location,
         )
+        self.runtime_query_stats = BigQueryQueryStatsRuntime(self)
+        self.runtime_budget = BigQueryBudgetRuntime(self)
         self.snapshot_runtime = BigQuerySnapshotRuntime(self)
 
     # ---- Identifier helpers ----
@@ -180,6 +178,19 @@ class BigQueryBaseExecutor(SqlIdentifierMixin, BaseExecutor[TFrame]):
         val = delay[0] if delay else None
         return (float(val) if val is not None else None, sql)
 
+    def _execute_sql_basic(self, sql: str) -> _TrackedQueryJob:
+        job_config = bigquery.QueryJobConfig()
+        if self.dataset:
+            # Let unqualified tables resolve to project.dataset.table
+            job_config.default_dataset = bigquery.DatasetReference(self.project, self.dataset)
+
+        job = self.client.query(
+            sql,
+            job_config=job_config,
+            location=self.location,
+        )
+        return self.runtime_query_stats.wrap_job(job)
+
     def _execute_sql(self, sql: str) -> _TrackedQueryJob:
         """
         Central BigQuery query runner.
@@ -189,51 +200,14 @@ class BigQueryBaseExecutor(SqlIdentifierMixin, BaseExecutor[TFrame]):
         """
 
         def _exec() -> _TrackedQueryJob:
-            job_config = bigquery.QueryJobConfig()
-            if self.dataset:
-                # Let unqualified tables resolve to project.dataset.table
-                job_config.default_dataset = bigquery.DatasetReference(self.project, self.dataset)
+            return self._execute_sql_basic(sql)
 
-            job = self.client.query(
-                sql,
-                job_config=job_config,
-                location=self.location,
-            )
-            return _TrackedQueryJob(job, on_complete=self._record_query_job_stats)
-
-        return run_sql_with_budget(
-            self,
+        return self.runtime_budget.run_sql(
             sql,
-            guard=self._BUDGET_GUARD,
             exec_fn=_exec,
-            estimate_fn=self._estimate_query_bytes,
+            stats_runtime=self.runtime_query_stats,
             record_stats=False,
         )
-
-    # --- Cost estimation for the shared BudgetGuard -----------------
-
-    def _estimate_query_bytes(self, sql: str) -> int | None:
-        """
-        Estimate bytes for a BigQuery SQL statement using a dry-run.
-
-        Returns the estimated bytes, or None if estimation is not possible.
-        """
-        cfg = bigquery.QueryJobConfig(
-            dry_run=True,
-            use_query_cache=False,
-        )
-        if self.dataset:
-            # Let unqualified tables resolve to project.dataset.table
-            cfg.default_dataset = bigquery.DatasetReference(self.project, self.dataset)
-
-        job = self.client.query(
-            sql,
-            job_config=cfg,
-            location=self.location,
-        )
-        # Dry-run is free; we just need the job metadata
-        job.result()
-        return int(getattr(job, "total_bytes_processed", 0) or 0)
 
     # ---- DQ test table formatting (fft test) ----
     def _format_test_table(self, table: str | None) -> str | None:
@@ -275,7 +249,7 @@ class BigQueryBaseExecutor(SqlIdentifierMixin, BaseExecutor[TFrame]):
             ) from e
 
     def _create_or_replace_view(self, target_sql: str, select_body: str, node: Node) -> None:
-        self._execute_sql(f"CREATE OR REPLACE VIEW {target_sql} AS {select_body}").result()
+        self._execute_sql_basic(f"CREATE OR REPLACE VIEW {target_sql} AS {select_body}").result()
 
     def _create_or_replace_table(self, target_sql: str, select_body: str, node: Node) -> None:
         self._execute_sql(f"CREATE OR REPLACE TABLE {target_sql} AS {select_body}").result()
@@ -289,7 +263,9 @@ class BigQueryBaseExecutor(SqlIdentifierMixin, BaseExecutor[TFrame]):
         view_id = self._qualified_identifier(view_name)
         back_id = self._qualified_identifier(backing_table)
         self._ensure_dataset()
-        self._execute_sql(f"CREATE OR REPLACE VIEW {view_id} AS SELECT * FROM {back_id}").result()
+        self._execute_sql_basic(
+            f"CREATE OR REPLACE VIEW {view_id} AS SELECT * FROM {back_id}"
+        ).result()
 
     # ---- Meta hook ----
     def on_node_built(self, node: Node, relation: str, fingerprint: str) -> None:
@@ -424,7 +400,7 @@ class BigQueryBaseExecutor(SqlIdentifierMixin, BaseExecutor[TFrame]):
         for col in to_add:
             f = out_fields[col]
             typ = str(f.field_type) if hasattr(f, "field_type") else "STRING"
-            self._execute_sql(f"ALTER TABLE {target} ADD COLUMN {col} {typ}").result()
+            self._execute_sql_basic(f"ALTER TABLE {target} ADD COLUMN {col} {typ}").result()
 
     # ── Snapshots API (shared for pandas + BigFrames) ─────────────────────
 

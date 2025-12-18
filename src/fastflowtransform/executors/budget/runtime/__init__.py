@@ -1,4 +1,5 @@
 from fastflowtransform.executors.budget.runtime.base import BaseBudgetRuntime
+from fastflowtransform.executors.budget.runtime.bigquery import BigQueryBudgetRuntime
 from fastflowtransform.executors.budget.runtime.databricks_spark import (
     DatabricksSparkBudgetRuntime,
 )
@@ -10,6 +11,7 @@ from fastflowtransform.executors.budget.runtime.snowflake_snowpark import (
 
 __all__ = [
     "BaseBudgetRuntime",
+    "BigQueryBudgetRuntime",
     "DatabricksSparkBudgetRuntime",
     "DuckBudgetRuntime",
     "PostgresBudgetRuntime",
