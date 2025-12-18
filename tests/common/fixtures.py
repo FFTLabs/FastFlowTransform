@@ -45,12 +45,20 @@ except ModuleNotFoundError:  # pragma: no cover - import guard
 
 # Snowflake
 try:
+    from fastflowtransform.executors.budget.runtime.snowflake_snowpark import (
+        SnowflakeSnowparkBudgetRuntime,
+    )
+    from fastflowtransform.executors.query_stats.runtime.snowflake_snowpark import (
+        SnowflakeSnowparkQueryStatsRuntime,
+    )
     from fastflowtransform.executors.snowflake_snowpark import SnowflakeSnowparkExecutor
     from fastflowtransform.snapshots.runtime.snowflake_snowpark import (
         SnowflakeSnowparkSnapshotRuntime,
     )
 except ModuleNotFoundError:  # pragma: no cover
     SnowflakeSnowparkExecutor = None  # type: ignore[assignment]
+    SnowflakeSnowparkBudgetRuntime = None  # type: ignore[assignment]
+    SnowflakeSnowparkQueryStatsRuntime = None  # type: ignore[assignment]
     SnowflakeSnowparkSnapshotRuntime = None  # type: ignore[assignment]
 
 
@@ -451,6 +459,9 @@ def snowflake_executor_fake() -> Any:
     session = FakeSnowflakeSession()
     ex.session = session
 
+    # Wire runtimes to mirror real executor setup.
+    ex.runtime_query_stats = SnowflakeSnowparkQueryStatsRuntime(ex)
+    ex.runtime_budget = SnowflakeSnowparkBudgetRuntime(ex)
     # Wire snapshot runtime to mirror real executor setup.
     ex.snapshot_runtime = SnowflakeSnowparkSnapshotRuntime(ex)
 

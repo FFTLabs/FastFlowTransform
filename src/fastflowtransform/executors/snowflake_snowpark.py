@@ -1,7 +1,6 @@
 # src/fastflowtransform/executors/snowflake_snowpark.py
 from __future__ import annotations
 
-import json
 from collections.abc import Iterable
 from contextlib import suppress
 from time import perf_counter
@@ -11,13 +10,16 @@ import pandas as pd
 
 from fastflowtransform.contracts.runtime.snowflake_snowpark import SnowflakeSnowparkRuntimeContracts
 from fastflowtransform.core import Node, relation_for
-from fastflowtransform.executors._budget_runner import run_sql_with_budget
 from fastflowtransform.executors._sql_identifier import SqlIdentifierMixin
 from fastflowtransform.executors._test_utils import make_fetchable, rows_to_tuples
 from fastflowtransform.executors.base import BaseExecutor
-from fastflowtransform.executors.budget.core import BudgetGuard
+from fastflowtransform.executors.budget.runtime.snowflake_snowpark import (
+    SnowflakeSnowparkBudgetRuntime,
+)
 from fastflowtransform.executors.common import _q_ident
-from fastflowtransform.executors.query_stats.core import QueryStats
+from fastflowtransform.executors.query_stats.runtime.snowflake_snowpark import (
+    SnowflakeSnowparkQueryStatsRuntime,
+)
 from fastflowtransform.meta import ensure_meta_table, upsert_meta
 from fastflowtransform.snapshots.runtime.snowflake_snowpark import (
     SnowflakeSnowparkSnapshotRuntime,
@@ -28,14 +30,10 @@ from fastflowtransform.typing import SNDF, SnowparkSession as Session
 class SnowflakeSnowparkExecutor(SqlIdentifierMixin, BaseExecutor[SNDF]):
     ENGINE_NAME: str = "snowflake_snowpark"
     runtime_contracts: SnowflakeSnowparkRuntimeContracts
+    runtime_query_stats: SnowflakeSnowparkQueryStatsRuntime
+    runtime_budget: SnowflakeSnowparkBudgetRuntime
     snapshot_runtime: SnowflakeSnowparkSnapshotRuntime
     """Snowflake executor operating on Snowpark DataFrames (no pandas)."""
-    _BUDGET_GUARD = BudgetGuard(
-        env_var="FF_SF_MAX_BYTES",
-        estimator_attr="_estimate_query_bytes",
-        engine_label="Snowflake",
-        what="query",
-    )
 
     def __init__(self, cfg: dict):
         # cfg: {account, user, password, warehouse, database, schema, role?}
@@ -45,6 +43,8 @@ class SnowflakeSnowparkExecutor(SqlIdentifierMixin, BaseExecutor[SNDF]):
 
         self.allow_create_schema: bool = bool(cfg["allow_create_schema"])
         self._ensure_schema()
+        self.runtime_query_stats = SnowflakeSnowparkQueryStatsRuntime(self)
+        self.runtime_budget = SnowflakeSnowparkBudgetRuntime(self)
         self.runtime_contracts = SnowflakeSnowparkRuntimeContracts(self)
         self.snapshot_runtime = SnowflakeSnowparkSnapshotRuntime(self)
 
@@ -77,77 +77,18 @@ class SnowflakeSnowparkExecutor(SqlIdentifierMixin, BaseExecutor[SNDF]):
 
     # ---------- Cost estimation & central execution ----------
 
-    def _estimate_query_bytes(self, sql: str) -> int | None:
-        """
-        Best-effort Snowflake bytes estimation.
+    # def _estimate_query_bytes(self, sql: str) -> int | None:
+    #     """Compatibility shim that delegates to the budget runtime estimator."""
+    #     return self.runtime_budget.estimate_query_bytes(sql)
 
-        Uses `EXPLAIN USING TEXT` and tries to extract a "bytes=<n>"-style
-        metric from the textual plan. If parsing fails or Snowflake doesn't
-        expose such info, returns None and the guard is effectively disabled.
-        """
-        try:
-            body = self._selectable_body(sql)
-        except Exception:
-            body = sql
+    # def runtime_budget_estimate_query_bytes(self, sql: str) -> int | None:
+    #     """
+    #     Entry point for BudgetGuard to call into the runtime estimator.
+    #     """
+    #     return self.runtime_budget.estimate_query_bytes(sql)
 
-        try:
-            rows = self.session.sql(f"EXPLAIN USING JSON {body}").collect()
-            if not rows:
-                return None
-
-            parts: list[str] = []
-            for r in rows:
-                try:
-                    parts.append(str(r[0]))
-                except Exception:
-                    as_dict: dict[str, Any] = getattr(r, "asDict", lambda: {})()
-                    if as_dict:
-                        parts.extend(str(v) for v in as_dict.values())
-
-            plan_text = "\n".join(parts).strip()
-            if not plan_text:
-                return None
-
-            try:
-                plan_data = json.loads(plan_text)
-            except Exception:
-                return None
-
-            bytes_val = self._extract_bytes_from_plan(plan_data)
-            if bytes_val is None or bytes_val <= 0:
-                return None
-            return bytes_val
-        except Exception:
-            # Any parsing / EXPLAIN issues → no estimate, guard skipped
-            return None
-
-    def _extract_bytes_from_plan(self, plan_data: Any) -> int | None:
-        def _to_int(value: Any) -> int | None:
-            if value is None:
-                return None
-            try:
-                return int(value)
-            except Exception:
-                return None
-
-        if isinstance(plan_data, dict):
-            global_stats = plan_data.get("GlobalStats") or plan_data.get("globalStats")
-            if isinstance(global_stats, dict):
-                candidate = _to_int(
-                    global_stats.get("bytesAssigned") or global_stats.get("bytes_assigned")
-                )
-                if candidate:
-                    return candidate
-            for val in plan_data.values():
-                bytes_val = self._extract_bytes_from_plan(val)
-                if bytes_val:
-                    return bytes_val
-        elif isinstance(plan_data, list):
-            for item in plan_data:
-                bytes_val = self._extract_bytes_from_plan(item)
-                if bytes_val:
-                    return bytes_val
-        return None
+    def _execute_sql_basic(self, sql: str) -> SNDF:
+        return self.session.sql(sql)
 
     def _execute_sql(self, sql: str) -> SNDF:
         """
@@ -160,12 +101,10 @@ class SnowflakeSnowparkExecutor(SqlIdentifierMixin, BaseExecutor[SNDF]):
         def _exec() -> SNDF:
             return self.session.sql(sql)
 
-        return run_sql_with_budget(
-            self,
+        return self.runtime_budget.run_sql(
             sql,
-            guard=self._BUDGET_GUARD,
             exec_fn=_exec,
-            estimate_fn=self._estimate_query_bytes,
+            stats_runtime=self.runtime_query_stats,
         )
 
     def _exec_many(self, sql: str) -> None:
@@ -242,82 +181,23 @@ class SnowflakeSnowparkExecutor(SqlIdentifierMixin, BaseExecutor[SNDF]):
         start = perf_counter()
         df.write.save_as_table(self._qualified(relation), mode="overwrite")
         duration_ms = int((perf_counter() - start) * 1000)
-        bytes_est = self._estimate_frame_bytes(df)
-        self._record_query_stats(
-            QueryStats(
-                bytes_processed=bytes_est,
-                rows=None,
-                duration_ms=duration_ms,
-            )
-        )
+        self.runtime_query_stats.record_dataframe(df, duration_ms)
 
-    def _estimate_frame_bytes(self, df: SNDF) -> int | None:
-        """
-        Best-effort bytes estimate for a Snowpark DataFrame.
+    # def _estimate_frame_bytes(self, df: SNDF) -> int | None:
+    #     """
+    #     Best-effort bytes estimate for a Snowpark DataFrame.
 
-        Strategy:
-        1) Use DataFrame.queries["queries"] (public Snowpark API) to get SQL.
-        2) Optionally fall back to df._plan.sql() if queries is missing/empty.
-        3) Run our existing _estimate_query_bytes(sql_text).
-        """
-        try:
-            sql_text = self._snowpark_df_sql(df)
-            if not isinstance(sql_text, str) or not sql_text.strip():
-                return None
-            return self._estimate_query_bytes(sql_text)
-        except Exception:
-            return None
-
-    def _snowpark_df_sql(self, df: Any) -> str | None:
-        """
-        Extract the main SQL statement for a Snowpark DataFrame.
-
-        Uses the documented public APIs:
-        - DataFrame.queries -> {"queries": [sql1, sql2, ...], "post_actions": [...]}
-        - Optionally falls back to df._plan.sql() if needed.
-        """
-        # 1) Primary source: DataFrame.queries
-        queries_dict = getattr(df, "queries", None)
-
-        if isinstance(queries_dict, dict):
-            queries = queries_dict.get("queries")
-            if isinstance(queries, list) and queries:
-                # Pick the most likely "main" query.
-                # Snowflake examples use queries['queries'][0],
-                # but we can be a bit safer and pick the longest non-empty SQL.
-                candidates = [q.strip() for q in queries if isinstance(q, str) and q.strip()]
-                if candidates:
-                    # Heuristic: longest SQL string is usually the main SELECT/CTE.
-                    return max(candidates, key=len)
-
-        # 2) Fallback: internal plan (undocumented but widely used)
-        plan = getattr(df, "_plan", None)
-        if plan is not None:
-            # Prefer simplified plan if available
-            with suppress(Exception):
-                simplify = getattr(plan, "simplify", None)
-                if callable(simplify):
-                    simplified = simplify()
-                    to_sql = getattr(simplified, "sql", None)
-                    if callable(to_sql):
-                        sql = to_sql()
-                        if isinstance(sql, str) and sql.strip():
-                            return sql.strip()
-
-            # Raw plan.sql()
-            with suppress(Exception):
-                to_sql = getattr(plan, "sql", None)
-                if callable(to_sql):
-                    sql = to_sql()
-                    if isinstance(sql, str) and sql.strip():
-                        return sql.strip()
-
-        return None
+    #     Strategy:
+    #     1) Use DataFrame.queries["queries"] (public Snowpark API) to get SQL.
+    #     2) Optionally fall back to df._plan.sql() if queries is missing/empty.
+    #     3) Run the budget runtime estimator on the derived SQL.
+    #     """
+    #     return self.runtime_budget.dataframe_bytes(df)
 
     def _create_view_over_table(self, view_name: str, backing_table: str, node: Node) -> None:
         qv = self._qualified(view_name)
         qb = self._qualified(backing_table)
-        self._execute_sql(f"CREATE OR REPLACE VIEW {qv} AS SELECT * FROM {qb}").collect()
+        self._execute_sql_basic(f"CREATE OR REPLACE VIEW {qv} AS SELECT * FROM {qb}").collect()
 
     def _validate_required(
         self, node_name: str, inputs: Any, requires: dict[str, set[str]]
@@ -448,7 +328,7 @@ class SnowflakeSnowparkExecutor(SqlIdentifierMixin, BaseExecutor[SNDF]):
         return formatted
 
     def _create_or_replace_view(self, target_sql: str, select_body: str, node: Node) -> None:
-        self._execute_sql(f"CREATE OR REPLACE VIEW {target_sql} AS {select_body}").collect()
+        self._execute_sql_basic(f"CREATE OR REPLACE VIEW {target_sql} AS {select_body}").collect()
 
     def _create_or_replace_table(self, target_sql: str, select_body: str, node: Node) -> None:
         self._execute_sql(f"CREATE OR REPLACE TABLE {target_sql} AS {select_body}").collect()
@@ -458,7 +338,9 @@ class SnowflakeSnowparkExecutor(SqlIdentifierMixin, BaseExecutor[SNDF]):
     ) -> None:
         view_id = self._qualified(view_name)
         back_id = self._qualified(backing_table)
-        self._execute_sql(f"CREATE OR REPLACE VIEW {view_id} AS SELECT * FROM {back_id}").collect()
+        self._execute_sql_basic(
+            f"CREATE OR REPLACE VIEW {view_id} AS SELECT * FROM {back_id}"
+        ).collect()
 
     def _format_test_table(self, table: str | None) -> str | None:
         # Bypass mixin qualification to avoid double-qualifying already dotted names.
@@ -494,7 +376,7 @@ class SnowflakeSnowparkExecutor(SqlIdentifierMixin, BaseExecutor[SNDF]):
         limit 1
         """
         try:
-            return bool(self._execute_sql(q).collect())
+            return bool(self._execute_sql_basic(q).collect())
         except Exception:
             return False
 
@@ -555,7 +437,7 @@ class SnowflakeSnowparkExecutor(SqlIdentifierMixin, BaseExecutor[SNDF]):
         try:
             existing = {
                 r[0]
-                for r in self._execute_sql(
+                for r in self._execute_sql_basic(
                     f"""
                     select column_name
                     from {db_ident}.information_schema.columns
@@ -578,7 +460,7 @@ class SnowflakeSnowparkExecutor(SqlIdentifierMixin, BaseExecutor[SNDF]):
 
         # Column names are identifiers → _q is correct here
         cols_sql = ", ".join(f"{_q_ident(c)} STRING" for c in to_add)
-        self._execute_sql(f"ALTER TABLE {qrel} ADD COLUMN {cols_sql}").collect()
+        self._execute_sql_basic(f"ALTER TABLE {qrel} ADD COLUMN {cols_sql}").collect()
 
     # ---- Snapshot runtime delegation --------------------------------------
     def run_snapshot_sql(self, node: Node, env: Any) -> None:
@@ -779,7 +661,7 @@ class SnowflakeSnowparkExecutor(SqlIdentifierMixin, BaseExecutor[SNDF]):
         order by ordinal_position
         """
 
-        rows = self._execute_sql(sql).collect()
+        rows = self._execute_sql_basic(sql).collect()
         out: dict[str, str] = {}
 
         for r in rows or []:
@@ -816,7 +698,7 @@ class SnowflakeSnowparkExecutor(SqlIdentifierMixin, BaseExecutor[SNDF]):
         limit 1
         """
 
-        rows = self._execute_sql(sql).collect()
+        rows = self._execute_sql_basic(sql).collect()
         if not rows:
             return None
         r = rows[0]
