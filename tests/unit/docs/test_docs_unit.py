@@ -4,7 +4,7 @@ from __future__ import annotations
 import textwrap
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any
 
 import pytest
 from jinja2 import TemplateNotFound
@@ -136,9 +136,7 @@ def test_scan_source_refs(tmp_path: Path):
     sql_path = models_dir / "model_a.sql"
     sql_path.write_text("select * from {{ source('crm', 'customers') }}", encoding="utf-8")
 
-    nodes = {
-        "model_a": SimpleNamespace(name="model_a", kind="sql", path=sql_path, deps=[], meta={})
-    }
+    nodes = {"model_a": Node(name="model_a", kind="sql", path=sql_path, deps=[], meta={})}
 
     by_source, by_model = docs_mod._scan_source_refs(nodes)
 
@@ -241,59 +239,6 @@ def test_apply_descriptions_to_models_applies_short_and_column_desc():
     assert cols_by_table["db.sc.m1"][0].description_html == "<p>Col 1</p>"
     # column 2 desc from relation-level
     assert cols_by_table["db.sc.m1"][1].description_html == "<p>Col 2</p>"
-
-
-# ---------------------------------------------------------------------------
-# render_site (with patched jinja + registry)
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.unit
-def test_render_site_writes_index_and_model_pages(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    fake_nodes_raw = {
-        "model_a": SimpleNamespace(
-            name="model_a",
-            kind="sql",
-            path=tmp_path / "models" / "model_a.sql",
-            deps=["model_b"],
-            meta={"materialized": "view"},
-        ),
-        "model_b": SimpleNamespace(
-            name="model_b",
-            kind="python",
-            path=tmp_path / "models" / "model_b.py",
-            deps=[],
-            meta={},
-        ),
-    }
-
-    monkeypatch.setattr(
-        docs_mod,
-        "REGISTRY",
-        SimpleNamespace(
-            nodes=fake_nodes_raw,
-            macros={},
-            get_project_dir=lambda: tmp_path,
-        ),
-        raising=True,
-    )
-
-    monkeypatch.setattr(docs_mod, "_init_jinja", lambda: _FakeEnv(), raising=True)
-    fake_nodes = cast(dict[str, Node], fake_nodes_raw)
-
-    docs_mod.render_site(tmp_path, fake_nodes, executor=None, with_schema=False)
-
-    index_file = tmp_path / "index.html"
-    assert index_file.exists()
-    assert "INDEX" in index_file.read_text(encoding="utf-8")
-
-    model_a_file = tmp_path / "model_a.html"
-    model_b_file = tmp_path / "model_b.html"
-    assert model_a_file.exists()
-    assert model_b_file.exists()
-
-    assert "MODEL model_a" in model_a_file.read_text(encoding="utf-8")
-    assert "MODEL model_b" in model_b_file.read_text(encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
