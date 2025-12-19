@@ -15,6 +15,21 @@ function el(tag, attrs = {}, ...children) {
   return n;
 }
 
+function safeGet(key) {
+  try { return localStorage.getItem(key); } catch { return null; }
+}
+function safeSet(key, value) {
+  try { localStorage.setItem(key, value); } catch {}
+}
+function safeGetJSON(key, fallback) {
+  const raw = safeGet(key);
+  if (!raw) return fallback;
+  try { return JSON.parse(raw); } catch { return fallback; }
+}
+function safeSetJSON(key, obj) {
+  safeSet(key, JSON.stringify(obj));
+}
+
 function stripHtml(html) {
   if (!html) return "";
   const div = document.createElement("div");
@@ -97,114 +112,6 @@ function byName(arr, keyFn) {
 
 function pillForKind(kind) {
   return el("span", { class: `pill ${kind}` }, kind);
-}
-
-function renderSidebar(state, onNavigate) {
-  const { manifest, filter } = state;
-  const models = manifest.models || [];
-  const sources = manifest.sources || [];
-
-  const q = (filter || "").trim().toLowerCase();
-
-  const filteredModels = q
-    ? models.filter(m =>
-        (m.name || "").toLowerCase().includes(q) ||
-        (m.relation || "").toLowerCase().includes(q) ||
-        (m.description_short || "").toLowerCase().includes(q)
-      )
-    : models;
-
-  const filteredSources = q
-    ? sources.filter(s =>
-        (`${s.source_name}.${s.table_name}`).toLowerCase().includes(q) ||
-        (s.relation || "").toLowerCase().includes(q)
-      )
-    : sources;
-
-  return el(
-    "div",
-    { class: "sidebar" },
-    el(
-      "div",
-      { class: "brand" },
-      el("h1", {}, manifest.project?.name || "Docs"),
-      el("span", { class: "badge", title: `Generated: ${manifest.project?.generated_at || ""}` }, "SPA")
-    ),
-    el("div", { class: "searchWrap" },
-      el("input", {
-        class: "search",
-        type: "search",
-        placeholder: "Filter sidebar… (press /)",
-        value: filter || "",
-        oninput: (e) => onNavigate({ type: "filter", value: e.target.value }),
-      }),
-      el("span", { class: "searchKbd kbd" }, "/")
-    ),
-    el("div", { class: "searchTip" }, "Tip: Press / (or Ctrl+K) to search everything (models, sources, columns)."),
-    el(
-      "div",
-      { class: "section" },
-      el("h2", {}, `Models (${filteredModels.length})`),
-      el(
-        "ul",
-        { class: "list" },
-        ...filteredModels.map(m =>
-          el(
-            "li",
-            { class: "item" },
-            el(
-              "a",
-              {
-                href: `#/model/${escapeHashPart(m.name)}`,
-                onclick: (e) => { e.preventDefault(); location.hash = `#/model/${escapeHashPart(m.name)}`; },
-                title: m.description_short || m.name,
-              },
-              el("span", {}, m.name),
-              pillForKind(m.kind === "python" ? "python" : "sql")
-            )
-          )
-        )
-      )
-    ),
-    el(
-      "div",
-      { class: "section" },
-      el("h2", {}, `Sources (${filteredSources.length})`),
-      el(
-        "ul",
-        { class: "list" },
-        ...filteredSources.map(s => {
-          const key = `${s.source_name}.${s.table_name}`;
-          return el(
-            "li",
-            { class: "item" },
-            el(
-              "a",
-              {
-                href: `#/source/${escapeHashPart(s.source_name)}/${escapeHashPart(s.table_name)}`,
-                onclick: (e) => { e.preventDefault(); location.hash = `#/source/${escapeHashPart(s.source_name)}/${escapeHashPart(s.table_name)}`; },
-                title: s.relation || key,
-              },
-              el("span", {}, key),
-              el("span", { class: "pill" }, (s.consumers || []).length ? `${s.consumers.length}` : "–")
-            )
-          );
-        })
-      )
-    ),
-    el(
-      "div",
-      { class: "section" },
-      el("h2", {}, "Other"),
-      el("ul", { class: "list" },
-        el("li", { class: "item" },
-          el("a", {
-            href: "#/macros",
-            onclick: (e) => { e.preventDefault(); location.hash = "#/macros"; },
-          }, el("span", {}, "Macros"), el("span", { class: "pill" }, String((manifest.macros || []).length))))
-      )
-    )
-  );
 }
 
 function renderHome(state) {
@@ -465,7 +372,32 @@ async function main() {
   );
   ui.app.replaceChildren(shell);
 
-  const projKey = (manifest.project?.name || "fft").toLowerCase().replace(/\s+/g, "_");
+  const projKey = (manifest.project?.name || "fft")
+    .toLowerCase()
+    .replace(/\s+/g, "_")
+    .replace(/[^a-z0-9_]+/g, "");
+
+  const STORE = {
+    filter: `fft_docs:${projKey}:sidebar_filter`,
+    collapsed: `fft_docs:${projKey}:sidebar_collapsed`,
+    lastHash: `fft_docs:${projKey}:last_hash`,
+    paletteQuery: `fft_docs:${projKey}:palette_query`,
+  };
+
+  // Persisted UI state
+  state.filter = safeGet(STORE.filter) ?? "";
+  state.sidebarCollapsed = safeGetJSON(STORE.collapsed, {
+    models: false,
+    sources: false,
+    macros: false,
+  });
+
+  // Restore last route only if user is on the default route
+  const last = safeGet(STORE.lastHash);
+  if ((!location.hash || location.hash === "#/" || location.hash === "#") && last) {
+    location.hash = last;
+  }
+
   toastOnce({
     key: `fft_docs_search_toast_seen:${projKey}`,
     title: "Quick search",
@@ -620,6 +552,7 @@ async function main() {
       value: state.search.query || "",
       oninput: (e) => {
         state.search.query = e.target.value || "";
+        safeSet(STORE.paletteQuery, state.search.query);
         runSearch(state.search.query);
         renderPaletteResults(); // ✅ no app rerender
       },
@@ -691,8 +624,11 @@ async function main() {
   function openPalette(prefill = "") {
     buildPalette();
 
+    const remembered = safeGet(STORE.paletteQuery) ?? "";
+    const initial = prefill != null && prefill !== "" ? prefill : remembered;
+
     state.search.open = true;
-    state.search.query = prefill;
+    state.search.query = initial;
     state.search.selected = 0;
 
     state.ui.paletteOverlay.style.display = "flex";
@@ -724,6 +660,28 @@ async function main() {
     sourcesList: null,
     macrosCount: null,
   };
+  ui.sidebar.macrosList = null;
+  ui.sidebar.modelsSection = null;
+  ui.sidebar.sourcesSection = null;
+  ui.sidebar.macrosSection = null;
+
+  function sectionHeader(titleNode, key, labelWhenOpen) {
+    const btn = el("button", {
+      class: "btn",
+      style: "width:100%; display:flex; justify-content:space-between; align-items:center; padding:8px 10px;",
+      onclick: () => {
+        state.sidebarCollapsed[key] = !state.sidebarCollapsed[key];
+        safeSetJSON(STORE.collapsed, state.sidebarCollapsed);
+        applySidebarCollapse(); // show/hide without rebuilding
+      }
+    },
+      el("span", {}, labelWhenOpen),
+      el("span", { class: "kbd" }, state.sidebarCollapsed[key] ? "+" : "–")
+    );
+    // store reference for label updates
+    titleNode.replaceChildren(btn);
+    return btn;
+  }
 
   function buildSidebar() {
     if (ui.sidebar.root) return;
@@ -735,6 +693,7 @@ async function main() {
       value: state.filter || "",
       oninput: (e) => {
         state.filter = e.target.value || "";
+        safeSet(STORE.filter, state.filter);
         updateSidebarLists();
       },
       onkeydown: (e) => {
@@ -761,51 +720,53 @@ async function main() {
       },
     });
 
-    ui.sidebar.modelsTitle = el("h2", {}, "Models");
-    ui.sidebar.sourcesTitle = el("h2", {}, "Sources");
-    ui.sidebar.macrosCount = el("span", { class: "pill" }, "0");
+      ui.sidebar.modelsTitle = el("div");
+      ui.sidebar.sourcesTitle = el("div");
+      ui.sidebar.macrosTitle = el("div");
 
-    ui.sidebar.modelsList = el("ul", { class: "list" });
-    ui.sidebar.sourcesList = el("ul", { class: "list" });
+      ui.sidebar.modelsList = el("ul", { class: "list" });
+      ui.sidebar.sourcesList = el("ul", { class: "list" });
+      ui.sidebar.macrosList = el("ul", { class: "list" });
 
-    ui.sidebar.root = el(
-      "div",
-      { class: "sidebar" },
-      el(
+      ui.sidebar.modelsSection = el("div", { class: "section" }, ui.sidebar.modelsTitle, ui.sidebar.modelsList);
+      ui.sidebar.sourcesSection = el("div", { class: "section" }, ui.sidebar.sourcesTitle, ui.sidebar.sourcesList);
+      ui.sidebar.macrosSection = el("div", { class: "section" }, ui.sidebar.macrosTitle, ui.sidebar.macrosList);
+
+      ui.sidebar.root = el(
         "div",
-        { class: "brand" },
-        el("h1", {}, state.manifest.project?.name || "Docs"),
-        el("span", { class: "badge" }, "SPA")
-      ),
-      el(
-        "div",
-        { class: "searchWrap" },
-        ui.sidebar.input,
-        el("span", { class: "searchKbd kbd" }, "/")
-      ),
-      el(
-        "div",
-        { class: "searchTip" },
-        "Tip: Press / (or Ctrl+K) to search everything (models, sources, columns)."
-      ),
+        { class: "sidebar" },
+        el(
+          "div",
+          { class: "brand" },
+          el("h1", {}, state.manifest.project?.name || "Docs"),
+          el("span", { class: "badge", title: `Generated: ${state.manifest.project?.generated_at || ""}` }, "SPA")
+        ),
+        el(
+          "div",
+          { class: "searchWrap" },
+          ui.sidebar.input,
+          el("span", { class: "searchKbd kbd" }, "/")
+        ),
+        el("div", { class: "searchTip" }, "Tip: Press / (or Ctrl+K) to search everything (models, sources, columns)."),
+        ui.sidebar.modelsSection,
+        ui.sidebar.sourcesSection,
+        ui.sidebar.macrosSection,
+      );
 
-      el("div", { class: "section" }, ui.sidebar.modelsTitle, ui.sidebar.modelsList),
-      el("div", { class: "section" }, ui.sidebar.sourcesTitle, ui.sidebar.sourcesList),
+      ui.sidebarHost.replaceChildren(ui.sidebar.root);
 
-      el("div", { class: "section" },
-        el("h2", {}, "Other"),
-        el("ul", { class: "list" },
-          el("li", { class: "item" },
-            el("a", {
-              href: "#/macros",
-              onclick: (e) => { e.preventDefault(); location.hash = "#/macros"; },
-            }, el("span", {}, "Macros"), ui.sidebar.macrosCount)
-          )
-        )
-      )
-    );
+      // Turn titles into toggle headers
+      sectionHeader(ui.sidebar.modelsTitle, "models", "Models");
+      sectionHeader(ui.sidebar.sourcesTitle, "sources", "Sources");
+      sectionHeader(ui.sidebar.macrosTitle, "macros", "Macros");
 
-    ui.sidebarHost.replaceChildren(ui.sidebar.root);
+  }
+
+  function applySidebarCollapse() {
+    const c = state.sidebarCollapsed || {};
+    ui.sidebar.modelsList.style.display = c.models ? "none" : "";
+    ui.sidebar.sourcesList.style.display = c.sources ? "none" : "";
+    ui.sidebar.macrosList.style.display = c.macros ? "none" : "";
   }
 
   function updateSidebarLists() {
@@ -833,7 +794,6 @@ async function main() {
 
     ui.sidebar.modelsTitle.textContent = `Models (${filteredModels.length})`;
     ui.sidebar.sourcesTitle.textContent = `Sources (${filteredSources.length})`;
-    ui.sidebar.macrosCount.textContent = String((state.manifest.macros || []).length);
 
     ui.sidebar.modelsList.replaceChildren(
       ...filteredModels.map(m =>
@@ -865,6 +825,30 @@ async function main() {
         );
       })
     );
+
+    const macros = state.manifest.macros || [];
+    
+    sectionHeader(ui.sidebar.modelsTitle, "models", `Models (${filteredModels.length})`);
+    sectionHeader(ui.sidebar.sourcesTitle, "sources", `Sources (${filteredSources.length})`);
+    sectionHeader(ui.sidebar.macrosTitle, "macros", `Macros (${macros.length})`);
+
+    ui.sidebar.macrosList.replaceChildren(
+      ...macros.map(m =>
+        el("li", { class: "item" },
+          el("a", {
+            href: "#/macros",
+            onclick: (e) => { e.preventDefault(); location.hash = "#/macros"; },
+            title: m.path || m.name,
+          },
+            el("span", {}, m.name),
+            el("span", { class: "pill" }, m.kind)
+          )
+        )
+      )
+    );
+    
+    applySidebarCollapse();
+
   }
 
   function updateMain() {
@@ -907,16 +891,18 @@ async function main() {
   });
 
   runSearch("");
-  buildPalette();
 
   window.addEventListener("hashchange", () => {
+    safeSet(STORE.lastHash, location.hash || "#/");
     closePalette();   // optional: close palette on navigation
     updateMain();
   });
 
+  safeSet(STORE.lastHash, location.hash || "#/");
+
   buildSidebar();
   updateSidebarLists();
-
+  buildPalette();       // palette exists but hidden
   updateMain();
 
 }
