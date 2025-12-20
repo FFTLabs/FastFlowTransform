@@ -12,10 +12,10 @@ from typing import Any
 import yaml
 from jinja2 import Environment, FileSystemLoader, TemplateNotFound, select_autoescape
 from markupsafe import Markup
-from sqlalchemy import text
 
 from fastflowtransform.core import REGISTRY, Node, relation_for
 from fastflowtransform.dag import mermaid as dag_mermaid
+from fastflowtransform.executors.base import ColumnInfo
 from fastflowtransform.lineage import (
     infer_py_lineage,
     infer_sql_lineage,
@@ -57,22 +57,18 @@ def _safe_filename(name: str) -> str:
 
 def _collect_columns(executor: Any) -> dict[str, list[ColumnInfo]]:
     """
-    Best-effort schema discovery for supported engines.
+    Best-effort schema discovery delegated to the executor.
     Returns an empty mapping if unsupported or on errors.
     """
+    fn = getattr(executor, "collect_docs_columns", None)
+    if not callable(fn):
+        return {}
     try:
-        if hasattr(executor, "spark"):
-            return _columns_spark(executor.spark)
-        if hasattr(executor, "con"):  # DuckDB
-            return _columns_duckdb(executor.con)
-        if hasattr(executor, "engine"):  # Postgres
-            return _columns_postgres(executor.engine)
-        if hasattr(executor, "session"):
-            return _columns_snowflake(executor.session)
+        res = fn()
+        return res if isinstance(res, dict) else {}
     except Exception:
         # Fail-open: no schema info, UI will simply hide the columns card.
         return {}
-    return {}
 
 
 def _read_project_yaml_docs(project_dir: Path) -> dict[str, Any]:
@@ -757,117 +753,6 @@ def render_site(
             sources_index=sources_by_key,
         )
         _render_source_pages(env, out_dir, sources)
-
-
-@dataclass
-class ColumnInfo:
-    name: str
-    dtype: str
-    nullable: bool
-    description_html: str | None = None
-    lineage: list[dict[str, Any]] | None = None
-
-
-def _columns_duckdb(con: Any) -> dict[str, list[ColumnInfo]]:
-    rows = con.execute("""
-      select table_name, column_name, data_type, is_nullable
-      from information_schema.columns
-      where table_schema in ('main','temp')
-      order by table_name, ordinal_position
-    """).fetchall()
-    out: dict[str, list[ColumnInfo]] = {}
-    for t, c, dt, null in rows:
-        out.setdefault(t, []).append(ColumnInfo(c, str(dt), null in (True, "YES", "Yes")))
-    return out
-
-
-def _columns_postgres(engine: Any) -> dict[str, list[ColumnInfo]]:
-    with engine.begin() as conn:
-        rows = conn.execute(
-            text("""
-          select table_name, column_name, data_type, is_nullable
-          from information_schema.columns
-          where table_schema = current_schema()
-          order by table_name, ordinal_position
-        """)
-        ).fetchall()
-    out: dict[str, list[ColumnInfo]] = {}
-    for t, c, dt, null in rows:
-        out.setdefault(t, []).append(ColumnInfo(c, str(dt), null == "YES"))
-    return out
-
-
-def _columns_snowflake(session: Any) -> dict[str, list[ColumnInfo]]:
-    rows = session.sql("""
-      select table_name, column_name, data_type, is_nullable
-      from information_schema.columns
-      where table_schema = current_schema()
-      order by table_name, ordinal_position
-    """).collect()
-    out: dict[str, list[ColumnInfo]] = {}
-    for r in rows:
-        t = r["TABLE_NAME"]
-        c = r["COLUMN_NAME"]
-        dt = r["DATA_TYPE"]
-        null = r["IS_NULLABLE"]
-        out.setdefault(t, []).append(ColumnInfo(c, str(dt), null == "YES"))
-    return out
-
-
-def _columns_spark(spark: Any) -> dict[str, list[ColumnInfo]]:
-    """
-    Collect column metadata from a SparkSession (Databricks / Spark SQL).
-    Uses catalog.listTables/listColumns, available on vanilla Spark 3+.
-    """
-    try:
-        tables = list(spark.catalog.listTables())
-    except Exception:
-        return {}
-
-    out: dict[str, list[ColumnInfo]] = {}
-    seen: set[tuple[str | None, str]] = set()
-
-    def _list_columns(table_name: str, database: str | None) -> list[Any]:
-        ident = table_name if not database else f"{database}.{table_name}"
-        try:
-            return list(spark.catalog.listColumns(ident))
-        except TypeError:
-            return list(spark.catalog.listColumns(table_name, database))
-
-    for tbl in tables:
-        database = getattr(tbl, "database", None)
-        raw_name = getattr(tbl, "name", None)
-        if not raw_name:
-            continue
-        table_name = str(raw_name)
-        key = (database, table_name)
-        if key in seen:
-            continue
-        seen.add(key)
-        try:
-            cols = _list_columns(table_name, database)
-        except Exception:
-            continue
-        if not cols:
-            continue
-
-        keys: set[str] = {table_name}
-        catalog = getattr(tbl, "catalog", None)
-        if database:
-            keys.add(f"{database}.{table_name}")
-        if database and catalog:
-            keys.add(f"{catalog}.{database}.{table_name}")
-        for c in cols:
-            nullable = bool(getattr(c, "nullable", False))
-            dtype = str(getattr(c, "dataType", ""))
-            col_name = getattr(c, "name", None)
-            if not col_name:
-                continue
-            info = ColumnInfo(str(col_name), dtype, nullable)
-            for k in keys:
-                out.setdefault(k, []).append(info)
-
-    return out
 
 
 def read_docs_metadata(project_dir: Path) -> dict[str, Any]:

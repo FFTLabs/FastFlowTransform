@@ -16,7 +16,7 @@ from fastflowtransform.contracts.runtime.duckdb import DuckRuntimeContracts
 from fastflowtransform.core import Node
 from fastflowtransform.executors._sql_identifier import SqlIdentifierMixin
 from fastflowtransform.executors._test_utils import make_fetchable
-from fastflowtransform.executors.base import BaseExecutor, _scalar
+from fastflowtransform.executors.base import BaseExecutor, ColumnInfo, _scalar
 from fastflowtransform.executors.budget.runtime.duckdb import DuckBudgetRuntime
 from fastflowtransform.executors.common import _q_ident
 from fastflowtransform.executors.query_stats.runtime.duckdb import DuckQueryStatsRuntime
@@ -413,6 +413,42 @@ class DuckExecutor(SqlIdentifierMixin, BaseExecutor[pd.DataFrame]):
             self._execute_basic(f"drop view if exists {target}")
         with suppress(Exception):
             self._execute_basic(f"drop table if exists {target}")
+
+    def collect_docs_columns(self) -> dict[str, list[ColumnInfo]]:
+        """
+        Best-effort column metadata for docs (schema-aware, supports catalog).
+        """
+        where: list[str] = []
+        params: list[str] = []
+
+        if self.catalog:
+            where.append("lower(table_catalog) = lower(?)")
+            params.append(self.catalog)
+        if self.schema:
+            where.append("lower(table_schema) = lower(?)")
+            params.append(self.schema)
+        else:
+            where.append("table_schema in ('main','temp')")
+
+        where_sql = " AND ".join(where) if where else "1=1"
+        sql = f"""
+        select table_name, column_name, data_type, is_nullable
+        from information_schema.columns
+        where {where_sql}
+        order by table_schema, table_name, ordinal_position
+        """
+
+        try:
+            rows = self._execute_basic(sql, params or None).fetchall()
+        except Exception:
+            return {}
+
+        out: dict[str, list[ColumnInfo]] = {}
+        for table, col, dtype, nullable in rows:
+            out.setdefault(table, []).append(
+                ColumnInfo(col, str(dtype), str(nullable) in (True, "YES", "Yes"))
+            )
+        return out
 
     def _introspect_columns_metadata(
         self,

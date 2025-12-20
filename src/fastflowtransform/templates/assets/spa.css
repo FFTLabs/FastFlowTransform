@@ -177,3 +177,28 @@ hr{ border:0; border-top:1px solid var(--border); margin:16px 0; }
   cursor:pointer;
 }
 .toastBtn:hover{ border-color:var(--accent); }
+
+.tabs{ display:flex; gap:8px; flex-wrap:wrap; }
+.tab{
+  border:1px solid var(--border);
+  background:transparent;
+  color:var(--fg);
+  padding:6px 10px;
+  border-radius:999px;
+  cursor:pointer;
+  font-size:12px;
+}
+.tab:hover{ border-color:var(--accent); }
+.tab.active{
+  border-color: color-mix(in srgb, var(--accent), var(--border) 20%);
+  background: color-mix(in srgb, var(--accent), transparent 88%);
+}
+.tabPanel{ margin-top:12px; }
+
+tr.colHit td{
+  background: color-mix(in srgb, var(--accent), transparent 88%);
+}
+tr.colHit{
+  outline: 1px solid color-mix(in srgb, var(--accent), transparent 45%);
+  outline-offset: -1px;
+}

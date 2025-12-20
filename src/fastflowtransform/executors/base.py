@@ -7,6 +7,7 @@ import re
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TypeVar, cast
 
@@ -91,6 +92,15 @@ def _scalar(executor: BaseExecutor, sql: Any) -> Any:
 
 # Frame type (pandas.DataFrame, pyspark.sql.DataFrame, snowflake.snowpark.DataFrame, ...)
 TFrame = TypeVar("TFrame")
+
+
+@dataclass
+class ColumnInfo:
+    name: str
+    dtype: str
+    nullable: bool
+    description_html: str | None = None
+    lineage: list[dict[str, Any]] | None = None
 
 
 class _ThisProxy:
@@ -1193,6 +1203,13 @@ class BaseExecutor[TFrame](ABC):
         (e.g. Postgres timestamp variants, Snowflake VARCHAR(…) / NUMBER(…)).
         """
         return (t or "").strip().lower()
+
+    def collect_docs_columns(self) -> dict[str, list[ColumnInfo]]:
+        """
+        Return column metadata for docs rendering keyed by physical relation name.
+        Engines can override; default is empty mapping.
+        """
+        return {}
 
     # ── Seed loading hook ───────────────────────────────────────────────
     def load_seed(

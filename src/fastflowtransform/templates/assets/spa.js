@@ -79,15 +79,55 @@ function topN(items, n) {
 function escapeHashPart(s) {
   return encodeURIComponent(String(s || "")).replaceAll("%2F", "/");
 }
-function parseHash() {
-  const raw = (location.hash || "#/").slice(1);
-  const parts = raw.split("/").filter(Boolean);
+
+function parseHashWithQuery() {
+  const full = (location.hash || "#/").slice(1); // remove leading '#'
+  const [pathPart, queryPart] = full.split("?", 2);
+  const parts = pathPart.split("/").filter(Boolean);
+
+  const query = new URLSearchParams(queryPart || "");
+  return { parts, query };
+}
+
+function setTabInHash(tab) {
+  const full = (location.hash || "#/").slice(1);
+  const [pathPart, queryPart] = full.split("?", 2);
+  const q = new URLSearchParams(queryPart || "");
+  if (tab) q.set("tab", tab);
+  else q.delete("tab");
+  const next = q.toString() ? `${pathPart}?${q.toString()}` : `${pathPart}`;
+  location.hash = `#${next.startsWith("/") ? "" : "/"}${next}`;
+}
+
+function setModelQuery({ tab, col }) {
+  const full = (location.hash || "#/").slice(1);
+  const [pathPart, queryPart] = full.split("?", 2);
+  const q = new URLSearchParams(queryPart || "");
+
+  if (tab) q.set("tab", tab); else q.delete("tab");
+  if (col) q.set("col", col); else q.delete("col");
+
+  const next = q.toString() ? `${pathPart}?${q.toString()}` : `${pathPart}`;
+  location.hash = `#${next.startsWith("/") ? "" : "/"}${next}`;
+}
+
+function parseRoute() {
+  const { parts, query } = parseHashWithQuery();
   if (parts.length === 0) return { route: "home" };
-  if (parts[0] === "model" && parts[1]) return { route: "model", name: decodeURIComponent(parts.slice(1).join("/")) };
+
+  if (parts[0] === "model" && parts[1]) {
+    return {
+      route: "model",
+      name: decodeURIComponent(parts.slice(1).join("/")),
+      tab: query.get("tab") || "",
+      col: query.get("col") || "",
+    };
+  }
   if (parts[0] === "source" && parts[1] && parts[2]) {
     return { route: "source", source: decodeURIComponent(parts[1]), table: decodeURIComponent(parts[2]) };
   }
   if (parts[0] === "macros") return { route: "macros" };
+
   return { route: "home" };
 }
 
@@ -166,23 +206,20 @@ function renderHome(state) {
   return el("div", { class: "grid2" }, dagCard, stats);
 }
 
-function renderModel(state, name) {
-  const { manifest } = state;
-  const byModel = state.byModel;
-  const m = byModel.get(name);
-
+function renderModel(state, name, tabFromRoute, colFromRoute) {
+  const m = state.byModel.get(name);
   if (!m) {
     return el("div", { class: "card" }, el("h2", {}, "Model not found"), el("p", { class: "empty" }, name));
   }
 
-  const deps = (m.deps || []).map(d => el("a", { href: `#/model/${escapeHashPart(d)}` }, d));
-  const usedBy = (m.used_by || []).map(u => el("a", { href: `#/model/${escapeHashPart(u)}` }, u));
+  const active = (tabFromRoute || state.modelTabDefault || "overview").toLowerCase();
+  const hasCol = !!(colFromRoute && String(colFromRoute).trim());
 
-  const sourcesUsed = (m.sources_used || []).map(s =>
-    el("a", { href: `#/source/${escapeHashPart(s.source_name)}/${escapeHashPart(s.table_name)}` }, `${s.source_name}.${s.table_name}`)
-  );
+  let tab = ["overview","columns","lineage","code","meta"].includes(active) ? active : "overview";
+  // Only force columns if col is present AND the URL didn't explicitly set a tab
+  if (hasCol && !tabFromRoute) tab = "columns";
 
-  const head = el("div", { class: "card" },
+  const header = el("div", { class: "card" },
     el("div", { class: "grid2" },
       el("div", {},
         el("h2", {}, m.name),
@@ -195,46 +232,155 @@ function renderModel(state, name) {
         }, "Copy path")
       )
     ),
-    el("div", { class: "kv" },
-      el("div", { class: "k" }, "Kind"), el("div", {}, m.kind),
-      el("div", { class: "k" }, "Materialized"), el("div", {}, m.materialized || "—"),
-      el("div", { class: "k" }, "Path"), el("div", {}, el("code", {}, m.path || "—")),
-      el("div", { class: "k" }, "Deps"), el("div", {}, deps.length ? joinInline(deps) : el("span", { class: "empty" }, "—")),
-      el("div", { class: "k" }, "Used by"), el("div", {}, usedBy.length ? joinInline(usedBy) : el("span", { class: "empty" }, "—")),
-      el("div", { class: "k" }, "Sources"), el("div", {}, sourcesUsed.length ? joinInline(sourcesUsed) : el("span", { class: "empty" }, "—")),
-    )
+    renderTabs(tab, (next) => {
+      // Persist default for convenience
+      state.modelTabDefault = next;
+      safeSet(state.STORE.modelTab, next);
+
+      setModelQuery({
+        tab: next,
+        col: (next === "columns") ? (colFromRoute || "") : ""  // clear col when leaving Columns
+      });
+
+    })
   );
 
-  const desc = m.description_html
-    ? el("div", { class: "card" }, el("h2", {}, "Description"), el("div", { class: "desc", html: m.description_html }))
-    : null;
+  const panel = el("div", { class: "tabPanel" }, renderModelPanel(state, m, tab, colFromRoute));
 
-  const cols = (m.columns || []);
-  const colsCard = cols.length
-    ? el("div", { class: "card" },
-        el("h2", {}, "Columns"),
-        el("table", { class: "table" },
-          el("thead", {}, el("tr", {},
-            el("th", {}, "Name"),
-            el("th", {}, "Type"),
-            el("th", {}, "Nullable"),
-            el("th", {}, "Description"),
-            el("th", {}, "Lineage"),
-          )),
-          el("tbody", {},
-            ...cols.map(c => el("tr", {},
-              el("td", {}, el("code", {}, c.name)),
-              el("td", {}, el("code", {}, c.dtype || "")),
-              el("td", {}, c.nullable ? "true" : "false"),
-              el("td", { html: c.description_html || '<span class="empty">—</span>' }),
-              el("td", {}, renderLineage(c.lineage || []))
-            ))
+  return el("div", { class: "grid" }, header, panel);
+}
+
+function renderModelPanel(state, m, tab, colFromRoute) {
+  if (tab === "overview") {
+    const deps = (m.deps || []).map(d => el("a", { href: `#/model/${escapeHashPart(d)}` }, d));
+    const usedBy = (m.used_by || []).map(u => el("a", { href: `#/model/${escapeHashPart(u)}` }, u));
+    const sourcesUsed = (m.sources_used || []).map(s =>
+      el("a", { href: `#/source/${escapeHashPart(s.source_name)}/${escapeHashPart(s.table_name)}` }, `${s.source_name}.${s.table_name}`)
+    );
+
+    return el("div", { class: "grid" },
+      el("div", { class: "card" },
+        el("h3", {}, "Summary"),
+        el("div", { class: "kv" },
+          el("div", { class: "k" }, "Kind"), el("div", {}, m.kind),
+          el("div", { class: "k" }, "Materialized"), el("div", {}, m.materialized || "—"),
+          el("div", { class: "k" }, "Path"), el("div", {}, el("code", {}, m.path || "—")),
+          el("div", { class: "k" }, "Deps"), el("div", {}, deps.length ? joinInline(deps) : el("span", { class: "empty" }, "—")),
+          el("div", { class: "k" }, "Used by"), el("div", {}, usedBy.length ? joinInline(usedBy) : el("span", { class: "empty" }, "—")),
+          el("div", { class: "k" }, "Sources"), el("div", {}, sourcesUsed.length ? joinInline(sourcesUsed) : el("span", { class: "empty" }, "—")),
+        )
+      ),
+      m.description_html
+        ? el("div", { class: "card" }, el("h3", {}, "Description"), el("div", { class: "desc", html: m.description_html }))
+        : el("div", { class: "card" }, el("h3", {}, "Description"), el("p", { class: "empty" }, "No description."))
+    );
+  }
+
+  if (tab === "columns") {
+    const cols = m.columns || [];
+
+    const card = cols.length
+      ? el("div", { class: "card" },
+          el("h3", {}, `Columns (${cols.length})`),
+          el("table", { class: "table" },
+            el("thead", {}, el("tr", {},
+              el("th", {}, "Name"),
+              el("th", {}, "Type"),
+              el("th", {}, "Nullable"),
+              el("th", {}, "Description"),
+            )),
+            el("tbody", {},
+              ...cols.map(c => el(
+                "tr",
+                { id: `col-${cssSafeId(m.name)}-${cssSafeId(c.name)}` },
+                el("td", {}, el("code", {}, c.name)),
+                el("td", {}, el("code", {}, c.dtype || "")),
+                el("td", {}, c.nullable ? "true" : "false"),
+                el("td", { html: c.description_html || '<span class="empty">—</span>' }),
+              ))
+            )
           )
         )
-      )
-    : el("div", { class: "card" }, el("h2", {}, "Columns"), el("p", { class: "empty" }, manifest.project?.with_schema ? "No columns found." : "Schema collection disabled."));
+      : el("div", { class: "card" },
+          el("h3", {}, "Columns"),
+          el("p", { class: "empty" }, state.manifest.project?.with_schema ? "No columns found." : "Schema collection disabled.")
+        );
 
-  return el("div", { class: "grid" }, head, desc, colsCard);
+    // Scroll + highlight if col query param is present
+    const colName = (colFromRoute || "").trim();
+    if (cols.length && colName) {
+      queueMicrotask(() => {
+        const rowId = `col-${cssSafeId(m.name)}-${cssSafeId(colName)}`;
+        const row = document.getElementById(rowId);
+        if (!row) return;
+
+        // clear previous hit
+        document.querySelectorAll("tr.colHit").forEach(n => n.classList.remove("colHit"));
+
+        row.classList.add("colHit");
+        row.scrollIntoView({ block: "center", behavior: "smooth" });
+
+        // remove highlight after a moment (optional)
+        setTimeout(() => row.classList.remove("colHit"), 2200);
+      });
+    }
+
+    return card;
+  }
+
+  if (tab === "lineage") {
+    const cols = m.columns || [];
+    const rows = cols
+      .filter(c => (c.lineage || []).length)
+      .map(c =>
+        el("tr", {},
+          el("td", {}, el("code", {}, c.name)),
+          el("td", {}, renderLineage(c.lineage || []))
+        )
+      );
+
+    return el("div", { class: "card" },
+      el("h3", {}, "Column lineage"),
+      rows.length
+        ? el("table", { class: "table" },
+            el("thead", {}, el("tr", {}, el("th", {}, "Column"), el("th", {}, "Lineage"))),
+            el("tbody", {}, ...rows)
+          )
+        : el("p", { class: "empty" }, "No lineage available for this model’s columns.")
+    );
+  }
+
+  if (tab === "code") {
+    // Placeholder until we add compiled SQL / python source to manifest
+    return el("div", { class: "card" },
+      el("h3", {}, "Code"),
+      el("p", { class: "empty" }, "Code view not yet available. Next step: include rendered SQL / Python source in the manifest.")
+    );
+  }
+
+  if (tab === "meta") {
+    // Show a structured dump of whatever we have
+    const meta = {
+      name: m.name,
+      kind: m.kind,
+      relation: m.relation,
+      materialized: m.materialized,
+      path: m.path,
+      deps: m.deps || [],
+      used_by: m.used_by || [],
+      sources_used: m.sources_used || [],
+    };
+    return el("div", { class: "card" },
+      el("h3", {}, "Meta"),
+      el("pre", { class: "mono", style: "white-space:pre-wrap; margin:0;" }, JSON.stringify(meta, null, 2))
+    );
+  }
+
+  return el("div", { class: "card" }, el("p", { class: "empty" }, "Unknown tab."));
+}
+
+function cssSafeId(s) {
+  return String(s || "").replace(/[^a-zA-Z0-9_-]+/g, "_");
 }
 
 function renderSource(state, sourceName, tableName) {
@@ -335,6 +481,43 @@ function toastOnce({ key, title, body, actionLabel, onAction }) {
   setTimeout(() => { try { node.remove(); } catch {} }, 5500);
 }
 
+function renderTabs(active, onPick) {
+  const tabs = [
+    ["overview", "Overview"],
+    ["columns", "Columns"],
+    ["lineage", "Lineage"],
+    ["code", "Code"],
+    ["meta", "Meta"],
+  ];
+
+  return el("div", { class: "tabs" },
+    ...tabs.map(([id, label]) =>
+      el("button", {
+        class: `tab ${active === id ? "active" : ""}`,
+        onclick: () => onPick(id),
+      }, label)
+    )
+  );
+}
+
+function makeSnippet(text, query, maxLen = 90) {
+  const t = (text || "").replace(/\s+/g, " ").trim();
+  if (!t) return "";
+
+  const q = (query || "").trim().toLowerCase();
+  if (!q) return t.length > maxLen ? t.slice(0, maxLen - 1) + "…" : t;
+
+  const idx = t.toLowerCase().indexOf(q);
+  if (idx < 0) return t.length > maxLen ? t.slice(0, maxLen - 1) + "…" : t;
+
+  const start = Math.max(0, idx - Math.floor(maxLen * 0.35));
+  const end = Math.min(t.length, start + maxLen);
+
+  const prefix = start > 0 ? "…" : "";
+  const suffix = end < t.length ? "…" : "";
+  return prefix + t.slice(start, end) + suffix;
+}
+
 async function loadManifest() {
   const res = await fetch(MANIFEST_URL, { cache: "no-store" });
   if (!res.ok) throw new Error(`Failed to load manifest: ${res.status}`);
@@ -383,6 +566,9 @@ async function main() {
     lastHash: `fft_docs:${projKey}:last_hash`,
     paletteQuery: `fft_docs:${projKey}:palette_query`,
   };
+  STORE.modelTab = `fft_docs:${projKey}:model_tab_default`;
+  state.modelTabDefault = safeGet(STORE.modelTab) || "overview";
+  state.STORE = STORE;
 
   // Persisted UI state
   state.filter = safeGet(STORE.filter) ?? "";
@@ -448,9 +634,14 @@ async function main() {
 
       searchIndex.push({
         kind: "column",
+        model: m.name,
+        column: c.name,
+        relation: m.relation || "",
+        dtype: c.dtype || "",
+        descText: cDesc || "",
         title: `${m.name}.${c.name}`,
         subtitle: `${m.relation || ""}${c.dtype ? " • " + c.dtype : ""}`,
-        route: `#/model/${escapeHashPart(m.name)}`, // navigates to model; we can later auto-scroll to column
+        route: `#/model/${escapeHashPart(m.name)}?tab=columns&col=${escapeHashPart(c.name)}`,
         haystack: colHay,
       });
     }
@@ -513,6 +704,33 @@ async function main() {
     const results = state.search.results || [];
     const sel = Math.max(0, Math.min(state.search.selected || 0, results.length - 1));
 
+    const q = (state.search.query || "").trim();
+    const sub = (() => {
+      if (r.kind === "column") {
+        const parts = [
+          "COLUMN",
+          r.model || "",
+          r.relation ? `• ${r.relation}` : "",
+          r.dtype ? `• ${r.dtype}` : "",
+        ].filter(Boolean).join(" ");
+        const snip = makeSnippet(r.descText || "", q, 90);
+        return snip ? `${parts} • ${snip}` : parts;
+      }
+      if (r.kind === "model") {
+        const snip = makeSnippet((r.descText || ""), q, 90);
+        return snip ? `MODEL • ${r.subtitle || ""} • ${snip}` : `MODEL • ${r.subtitle || ""}`;
+      }
+      if (r.kind === "source") {
+        const snip = makeSnippet((r.descText || ""), q, 90);
+        return snip ? `SOURCE • ${r.subtitle || ""} • ${snip}` : `SOURCE • ${r.subtitle || ""}`;
+      }
+      return `${(r.kind || "").toUpperCase()} • ${r.subtitle || ""}`;
+    })();
+
+    const right = r.kind === "column" && r.dtype
+      ? el("span", { class: "pill" }, r.dtype)
+      : el("div", { class: "kbd" }, "↵");
+
     state.ui.paletteList.replaceChildren(
       ...(results.length
         ? results.map((r, idx) =>
@@ -525,9 +743,9 @@ async function main() {
             },
               el("div", { class: "resultMain" },
                 el("div", { class: "resultTitle" }, r.title),
-                el("div", { class: "resultSub" }, `${r.kind.toUpperCase()} • ${r.subtitle || ""}`)
+                el("div", { class: "resultSub" }, sub)
               ),
-              el("div", { class: "kbd" }, "↵")
+              right
             )
           )
         : [el("div", { class: "result" },
@@ -554,7 +772,7 @@ async function main() {
         state.search.query = e.target.value || "";
         safeSet(STORE.paletteQuery, state.search.query);
         runSearch(state.search.query);
-        renderPaletteResults(); // ✅ no app rerender
+        renderPaletteResults();
       },
       onkeydown: (e) => {
         // Key handling while focused in the input
@@ -658,7 +876,6 @@ async function main() {
     sourcesTitle: null,
     modelsList: null,
     sourcesList: null,
-    macrosCount: null,
   };
   ui.sidebar.macrosList = null;
   ui.sidebar.modelsSection = null;
@@ -852,9 +1069,9 @@ async function main() {
   }
 
   function updateMain() {
-    const route = parseHash();
+    const route = parseRoute();
     let view;
-    if (route.route === "model") view = renderModel(state, route.name);
+    if (route.route === "model") view = renderModel(state, route.name, route.tab, route.col);
     else if (route.route === "source") view = renderSource(state, route.source, route.table);
     else if (route.route === "macros") view = renderMacros(state);
     else view = renderHome(state);

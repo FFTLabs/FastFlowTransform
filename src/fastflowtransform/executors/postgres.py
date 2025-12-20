@@ -17,7 +17,7 @@ from fastflowtransform.core import Node
 from fastflowtransform.errors import ModelExecutionError, ProfileConfigError
 from fastflowtransform.executors._sql_identifier import SqlIdentifierMixin
 from fastflowtransform.executors._test_utils import make_fetchable
-from fastflowtransform.executors.base import BaseExecutor, _scalar
+from fastflowtransform.executors.base import BaseExecutor, ColumnInfo, _scalar
 from fastflowtransform.executors.budget.runtime.postgres import PostgresBudgetRuntime
 from fastflowtransform.executors.common import _q_ident
 from fastflowtransform.executors.query_stats.runtime.postgres import PostgresQueryStatsRuntime
@@ -568,6 +568,30 @@ class PostgresExecutor(SqlIdentifierMixin, BaseExecutor[pd.DataFrame]):
                     self._execute_sql_maintenance(
                         f"DROP TABLE IF EXISTS {qualified} CASCADE", conn=conn
                     )
+
+    def collect_docs_columns(self) -> dict[str, list[ColumnInfo]]:
+        """
+        Column metadata for docs, scoped to the effective schema.
+        """
+        sql = """
+          select table_name, column_name, data_type, is_nullable
+          from information_schema.columns
+          where table_schema = current_schema()
+          order by table_name, ordinal_position
+        """
+        try:
+            with self.engine.begin() as conn:
+                self._set_search_path(conn)
+                rows = conn.execute(text(sql)).fetchall()
+        except Exception:
+            return {}
+
+        out: dict[str, list[ColumnInfo]] = {}
+        for table, col, dtype, nullable in rows:
+            out.setdefault(table, []).append(
+                ColumnInfo(col, str(dtype), str(nullable).upper() == "YES")
+            )
+        return out
 
     def _introspect_columns_metadata(
         self,

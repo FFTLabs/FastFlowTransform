@@ -7,7 +7,7 @@ from typing import Any, TypeVar
 from fastflowtransform.core import Node, relation_for
 from fastflowtransform.executors._sql_identifier import SqlIdentifierMixin
 from fastflowtransform.executors._test_utils import make_fetchable
-from fastflowtransform.executors.base import BaseExecutor
+from fastflowtransform.executors.base import BaseExecutor, ColumnInfo
 from fastflowtransform.executors.budget.runtime.bigquery import BigQueryBudgetRuntime
 from fastflowtransform.executors.query_stats.core import _TrackedQueryJob
 from fastflowtransform.executors.query_stats.runtime.bigquery import BigQueryQueryStatsRuntime
@@ -493,6 +493,36 @@ class BigQueryBaseExecutor(SqlIdentifierMixin, BaseExecutor[TFrame]):
         rows = self._introspect_columns_metadata(table, column=None)
         # keys are lowercased to match the DuckRuntimeContracts verify logic
         return {name: dtype for (name, dtype) in rows}
+
+    def collect_docs_columns(self) -> dict[str, list[ColumnInfo]]:
+        """
+        Column metadata for docs (project+dataset scoped).
+        """
+        sql = f"""
+        select table_name, column_name, data_type, is_nullable
+        from `{self.project}.{self.dataset}.INFORMATION_SCHEMA.COLUMNS`
+        order by table_name, ordinal_position
+        """
+        try:
+            job = self.client.query(
+                sql,
+                job_config=bigquery.QueryJobConfig(
+                    default_dataset=bigquery.DatasetReference(self.project, self.dataset)
+                ),
+                location=self.location,
+            )
+            rows = list(job.result())
+        except Exception:
+            return {}
+
+        out: dict[str, list[ColumnInfo]] = {}
+        for row in rows:
+            table = str(row["table_name"])
+            col = str(row["column_name"])
+            dtype = str(row["data_type"])
+            nullable = str(row["is_nullable"]).upper() == "YES"
+            out.setdefault(table, []).append(ColumnInfo(col, dtype, nullable))
+        return out
 
     def load_seed(self, table: str, df: Any, schema: str | None = None) -> tuple[bool, str, bool]:
         dataset_id = schema or self.dataset

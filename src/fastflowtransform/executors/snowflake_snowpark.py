@@ -12,7 +12,7 @@ from fastflowtransform.contracts.runtime.snowflake_snowpark import SnowflakeSnow
 from fastflowtransform.core import Node, relation_for
 from fastflowtransform.executors._sql_identifier import SqlIdentifierMixin
 from fastflowtransform.executors._test_utils import make_fetchable, rows_to_tuples
-from fastflowtransform.executors.base import BaseExecutor
+from fastflowtransform.executors.base import BaseExecutor, ColumnInfo
 from fastflowtransform.executors.budget.runtime.snowflake_snowpark import (
     SnowflakeSnowparkBudgetRuntime,
 )
@@ -546,6 +546,40 @@ class SnowflakeSnowparkExecutor(SqlIdentifierMixin, BaseExecutor[SNDF]):
         # Then drop table; ignore errors if it's actually a view or doesn't exist.
         with suppress(Exception):
             self.session.sql(f"DROP TABLE IF EXISTS {qualified}").collect()
+
+    def collect_docs_columns(self) -> dict[str, list[ColumnInfo]]:
+        """
+        Best-effort column metadata for docs (scoped to configured DB/schema).
+        """
+        schema_pred = (
+            f"lower(table_schema) = '{self.schema.lower()}'"
+            if self.schema
+            else "table_schema = current_schema()"
+        )
+        catalog_pred = (
+            f" AND lower(table_catalog) = '{self.database.lower()}'" if self.database else ""
+        )
+        sql = f"""
+        select table_name, column_name, data_type, is_nullable
+        from information_schema.columns
+        where {schema_pred}{catalog_pred}
+        order by table_schema, table_name, ordinal_position
+        """
+        try:
+            rows = self.session.sql(sql).collect()
+        except Exception:
+            return {}
+
+        out: dict[str, list[ColumnInfo]] = {}
+        for r in rows:
+            table = r["TABLE_NAME"]
+            col = r["COLUMN_NAME"]
+            dtype = r["DATA_TYPE"]
+            nullable = r["IS_NULLABLE"]
+            out.setdefault(table, []).append(
+                ColumnInfo(col, str(dtype), str(nullable).upper() == "YES")
+            )
+        return out
 
     def _normalize_table_parts_for_introspection(self, table: str) -> tuple[str, str, str]:
         """

@@ -16,7 +16,7 @@ from fastflowtransform.contracts.runtime.databricks_spark import DatabricksSpark
 from fastflowtransform.core import REGISTRY, Node, relation_for
 from fastflowtransform.errors import ModelExecutionError
 from fastflowtransform.executors._test_utils import make_fetchable, rows_to_tuples
-from fastflowtransform.executors.base import BaseExecutor
+from fastflowtransform.executors.base import BaseExecutor, ColumnInfo
 from fastflowtransform.executors.budget.runtime.databricks_spark import (
     DatabricksSparkBudgetRuntime,
 )
@@ -931,6 +931,60 @@ class DatabricksSparkExecutor(BaseExecutor[SDF]):
         # Then drop table; ignore errors if it's actually a view or missing.
         with suppress(Exception):
             self._execute_sql_basic(f"DROP TABLE IF EXISTS {ident}")
+
+    def collect_docs_columns(self) -> dict[str, list[ColumnInfo]]:
+        """
+        Collect column metadata via Spark catalog for docs rendering.
+        """
+        try:
+            tables = list(self.spark.catalog.listTables())
+        except Exception:
+            return {}
+
+        out: dict[str, list[ColumnInfo]] = {}
+        seen: set[tuple[str | None, str]] = set()
+
+        def _list_columns(table_name: str, database: str | None) -> list[Any]:
+            ident = table_name if not database else f"{database}.{table_name}"
+            try:
+                return list(self.spark.catalog.listColumns(ident))
+            except TypeError:
+                return list(self.spark.catalog.listColumns(table_name, database))
+
+        for tbl in tables:
+            database = getattr(tbl, "database", None)
+            raw_name = getattr(tbl, "name", None)
+            if not raw_name:
+                continue
+            table_name = str(raw_name)
+            key = (database, table_name)
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                cols = _list_columns(table_name, database)
+            except Exception:
+                continue
+            if not cols:
+                continue
+
+            keys: set[str] = {table_name}
+            catalog = getattr(tbl, "catalog", None)
+            if database:
+                keys.add(f"{database}.{table_name}")
+            if database and catalog:
+                keys.add(f"{catalog}.{database}.{table_name}")
+            for c in cols:
+                nullable = bool(getattr(c, "nullable", False))
+                dtype = str(getattr(c, "dataType", ""))
+                col_name = getattr(c, "name", None)
+                if not col_name:
+                    continue
+                info = ColumnInfo(str(col_name), dtype, nullable)
+                for k in keys:
+                    out.setdefault(k, []).append(info)
+
+        return out
 
     def _introspect_columns_metadata(
         self,
