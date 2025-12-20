@@ -582,7 +582,7 @@ class PostgresExecutor(SqlIdentifierMixin, BaseExecutor[pd.DataFrame]):
         try:
             with self.engine.begin() as conn:
                 self._set_search_path(conn)
-                rows = conn.execute(text(sql)).fetchall()
+                rows = self._execute_sql_maintenance(sql, conn=conn).fetchall()
         except Exception:
             return {}
 

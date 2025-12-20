@@ -277,55 +277,7 @@ function renderModelPanel(state, m, tab, colFromRoute) {
   }
 
   if (tab === "columns") {
-    const cols = m.columns || [];
-
-    const card = cols.length
-      ? el("div", { class: "card" },
-          el("h3", {}, `Columns (${cols.length})`),
-          el("table", { class: "table" },
-            el("thead", {}, el("tr", {},
-              el("th", {}, "Name"),
-              el("th", {}, "Type"),
-              el("th", {}, "Nullable"),
-              el("th", {}, "Description"),
-            )),
-            el("tbody", {},
-              ...cols.map(c => el(
-                "tr",
-                { id: `col-${cssSafeId(m.name)}-${cssSafeId(c.name)}` },
-                el("td", {}, el("code", {}, c.name)),
-                el("td", {}, el("code", {}, c.dtype || "")),
-                el("td", {}, c.nullable ? "true" : "false"),
-                el("td", { html: c.description_html || '<span class="empty">—</span>' }),
-              ))
-            )
-          )
-        )
-      : el("div", { class: "card" },
-          el("h3", {}, "Columns"),
-          el("p", { class: "empty" }, state.manifest.project?.with_schema ? "No columns found." : "Schema collection disabled.")
-        );
-
-    // Scroll + highlight if col query param is present
-    const colName = (colFromRoute || "").trim();
-    if (cols.length && colName) {
-      queueMicrotask(() => {
-        const rowId = `col-${cssSafeId(m.name)}-${cssSafeId(colName)}`;
-        const row = document.getElementById(rowId);
-        if (!row) return;
-
-        // clear previous hit
-        document.querySelectorAll("tr.colHit").forEach(n => n.classList.remove("colHit"));
-
-        row.classList.add("colHit");
-        row.scrollIntoView({ block: "center", behavior: "smooth" });
-
-        // remove highlight after a moment (optional)
-        setTimeout(() => row.classList.remove("colHit"), 2200);
-      });
-    }
-
-    return card;
+    return buildColumnsCard(state, m, colFromRoute);
   }
 
   if (tab === "lineage") {
@@ -516,6 +468,398 @@ function makeSnippet(text, query, maxLen = 90) {
   const prefix = start > 0 ? "…" : "";
   const suffix = end < t.length ? "…" : "";
   return prefix + t.slice(start, end) + suffix;
+}
+
+function snippet(text, maxLen = 70) {
+  const t = (text || "").replace(/\s+/g, " ").trim();
+  if (!t) return "";
+  return t.length > maxLen ? t.slice(0, maxLen - 1) + "…" : t;
+}
+
+function buildColumnsCard(state, m, colFromRoute) {
+  const cols = m.columns || [];
+  const withSchema = !!state.manifest.project?.with_schema;
+
+  // UI state (persisted in memory per model; easy to persist later if you want)
+  state.colUI ||= {};
+  const uiState = (state.colUI[m.name] ||= {
+    q: "",
+    sortKey: "name",   // name | dtype | nullable | documented
+    sortDir: "asc",    // asc | desc
+    undocOnly: false,
+    lineageOnly: false, 
+    expanded: new Set(),
+  });
+
+  const card = el("div", { class: "card" });
+  const tools = el("div", { class: "colTools" });
+
+  const qInput = el("input", {
+    class: "input",
+    type: "search",
+    placeholder: "Filter columns…",
+    value: uiState.q || "",
+    oninput: (e) => {
+      uiState.q = e.target.value || "";
+      renderBody(); // updates tbody only
+    },
+  });
+
+  const undocBtn = el("button", {
+    class: "btn",
+    onclick: () => {
+      uiState.undocOnly = !uiState.undocOnly;
+      undocBtn.textContent = uiState.undocOnly ? "Showing undocumented" : "Undocumented only";
+      renderBody();
+    }
+  }, uiState.undocOnly ? "Showing undocumented" : "Undocumented only");
+
+  const lineageOnlyBtn = el("button", {
+    class: "btn",
+    onclick: () => {
+      uiState.lineageOnly = !uiState.lineageOnly;
+      lineageOnlyBtn.textContent = uiState.lineageOnly ? "Showing lineage-only" : "Lineage only";
+      renderBody();
+    }
+  }, uiState.lineageOnly ? "Showing lineage-only" : "Lineage only");
+
+  const expandAllBtn = el("button", {
+    class: "btn",
+    onclick: () => {
+      // Expand all rows currently visible (after filters)
+      const visible = getVisibleRows();
+      uiState.expanded = new Set(visible.map(c => c.name));
+      renderBody();
+      queueMicrotask(() => qInput.focus());
+    }
+  }, "Expand all");
+
+  const collapseAllBtn = el("button", {
+    class: "btn",
+    onclick: () => {
+      uiState.expanded.clear();
+      renderBody();
+      queueMicrotask(() => qInput.focus());
+    }
+  }, "Collapse all");
+
+  const countNode = el("span", { class: "colCount" }, "");
+
+  tools.append(
+    qInput,
+    undocBtn,
+    lineageOnlyBtn,
+    expandAllBtn,
+    collapseAllBtn,
+    countNode
+  );
+
+  const table = el("table", { class: "table" });
+  const thead = el("thead");
+  const tbody = el("tbody");
+  table.append(thead, tbody);
+
+  function sortArrow(key) {
+    if (uiState.sortKey !== key) return "";
+    return uiState.sortDir === "asc" ? "▲" : "▼";
+  }
+
+  function setSort(key) {
+    if (uiState.sortKey === key) uiState.sortDir = (uiState.sortDir === "asc" ? "desc" : "asc");
+    else { uiState.sortKey = key; uiState.sortDir = "asc"; }
+    renderBody();
+    renderHead();
+  }
+
+  function renderHead() {
+    thead.replaceChildren(
+      el("tr", {},
+        el("th", {},
+          el("button", { class: "thBtn", onclick: () => setSort("name") }, "Name", el("span", { class: "sortArrow" }, sortArrow("name")))
+        ),
+        el("th", {},
+          el("button", { class: "thBtn", onclick: () => setSort("dtype") }, "Type", el("span", { class: "sortArrow" }, sortArrow("dtype")))
+        ),
+        el("th", {},
+          el("button", { class: "thBtn", onclick: () => setSort("nullable") }, "Null", el("span", { class: "sortArrow" }, sortArrow("nullable")))
+        ),
+        el("th", {},
+          el("button", { class: "thBtn", onclick: () => setSort("documented") }, "Docs", el("span", { class: "sortArrow" }, sortArrow("documented")))
+        ),
+        el("th", {}, "Description")
+      )
+    );
+  }
+
+  function isDocumented(c) {
+    const txt = (c.description_text || "").trim();
+    const html = (c.description_html || "").trim();
+    return !!(txt || html);
+  }
+
+  function lineageCount(c) {
+    return (c.lineage || []).length;
+  }
+
+  function renderDrawer(c) {
+    const descHtml = (c.description_html && c.description_html.trim())
+      ? c.description_html
+      : '<span class="empty">No description.</span>';
+
+    const lin = c.lineage || [];
+    const linNode = lin.length
+      ? renderLineage(lin)
+      : el("span", { class: "empty" }, "No lineage available.");
+
+    const copyName = el("button", {
+      class: "btnTiny",
+      onclick: async (e) => {
+        e.stopPropagation();
+        await copyText(`${m.name}.${c.name}`);
+      }
+    }, "Copy name");
+
+    const copyRelation = el("button", {
+      class: "btnTiny",
+      onclick: async (e) => {
+        e.stopPropagation();
+        await copyText(`${m.relation || ""}`.trim());
+      }
+    }, "Copy relation");
+
+    const copyDtype = el("button", {
+      class: "btnTiny",
+      onclick: async (e) => {
+        e.stopPropagation();
+        await copyText(c.dtype || "");
+      }
+    }, "Copy dtype");
+
+    const copyLineageJSON = el("button", {
+      class: "btnTiny",
+      onclick: async (e) => {
+        e.stopPropagation();
+        await copyText(JSON.stringify(lin || [], null, 2));
+      }
+    }, "Copy lineage JSON");
+
+    const copyLineageCSV = el("button", {
+      class: "btnTiny",
+      onclick: async (e) => {
+        e.stopPropagation();
+        const rows = (lin || []).map(x =>
+          [x.from_relation ?? "", x.from_column ?? "", x.transformed ? "1" : "0"].join(",")
+        );
+        await copyText(["from_relation,from_column,transformed", ...rows].join("\n"));
+      }
+    }, "Copy lineage CSV");
+
+    return el("div", { class: "drawer" },
+      el("div", { class: "colTools" },
+        el("span", { class: "pillSmall" }, "COLUMN"),
+        el("code", {}, `${m.name}.${c.name}`),
+        el("span", { class: "colCount" }, lin.length ? `${lin.length} lineage refs` : "")
+      ),
+      el("div", { class: "drawerTools" },
+        copyName,
+        copyRelation,
+        copyDtype,
+        copyLineageJSON,
+        copyLineageCSV
+      ),
+      el("div", { class: "drawerGrid" },
+        el("div", { class: "drawerBox" },
+          el("div", { class: "drawerTitle" }, "Description"),
+          el("div", { class: "desc", html: descHtml })
+        ),
+        el("div", { class: "drawerBox" },
+          el("div", { class: "drawerTitle" }, "Lineage"),
+          linNode
+        )
+      )
+    );
+  }
+
+  function isDocumented(c) {
+    const txt = (c.description_text || "").trim();
+    const html = (c.description_html || "").trim();
+    return !!(txt || html);
+  }
+
+  function lineageCount(c) {
+    return (c.lineage || []).length;
+  }
+
+  function getVisibleRows() {
+    if (!withSchema || !cols.length) return [];
+    const q = (uiState.q || "").trim().toLowerCase();
+
+    let rows = cols.slice();
+
+    if (q) {
+      rows = rows.filter(c => {
+        const name = (c.name || "").toLowerCase();
+        const dtype = (c.dtype || "").toLowerCase();
+        const dtxt = (c.description_text || "").toLowerCase();
+        return name.includes(q) || dtype.includes(q) || dtxt.includes(q);
+      });
+    }
+
+    if (uiState.undocOnly) rows = rows.filter(c => !isDocumented(c));
+    if (uiState.lineageOnly) rows = rows.filter(c => lineageCount(c) > 0);
+
+    // Respect sort settings so "expand all" expands the visible ordering
+    const dir = uiState.sortDir === "asc" ? 1 : -1;
+    rows.sort((a, b) => {
+      if (uiState.sortKey === "name") return dir * String(a.name).localeCompare(String(b.name));
+      if (uiState.sortKey === "dtype") return dir * String(a.dtype || "").localeCompare(String(b.dtype || ""));
+      if (uiState.sortKey === "nullable") return dir * ((a.nullable === b.nullable) ? 0 : (a.nullable ? 1 : -1));
+      if (uiState.sortKey === "documented") {
+        const da = isDocumented(a) ? 1 : 0;
+        const db = isDocumented(b) ? 1 : 0;
+        return dir * (da - db);
+      }
+      return 0;
+    });
+
+    return rows;
+  }
+
+  function renderBody() {
+    if (!withSchema) {
+      tbody.replaceChildren(
+        el("tr", {}, el("td", { colspan: "5" }, "Schema collection disabled."))
+      );
+      countNode.textContent = "";
+      return;
+    }
+
+    if (!cols.length) {
+      tbody.replaceChildren(
+        el("tr", {}, el("td", { colspan: "5" }, "No columns found."))
+      );
+      countNode.textContent = "";
+      return;
+    }
+
+    const q = (uiState.q || "").trim().toLowerCase();
+    let rows = cols.slice();
+
+    // filter
+    if (q) {
+      rows = rows.filter(c => {
+        const name = (c.name || "").toLowerCase();
+        const dtype = (c.dtype || "").toLowerCase();
+        const dtxt = (c.description_text || "").toLowerCase();
+        return name.includes(q) || dtype.includes(q) || dtxt.includes(q);
+      });
+    }
+
+    // undocumented-only toggle
+    if (uiState.undocOnly) rows = rows.filter(c => !isDocumented(c));
+
+    if (uiState.lineageOnly) rows = rows.filter(c => lineageCount(c) > 0);
+
+    const undocCount = cols.filter(c => !isDocumented(c)).length;
+    const linCount = cols.filter(c => lineageCount(c) > 0).length;
+    countNode.textContent = `Showing ${rows.length}/${cols.length} • Undocumented: ${undocCount} • With lineage: ${linCount}`;
+
+    // sort
+    const dir = uiState.sortDir === "asc" ? 1 : -1;
+    rows.sort((a, b) => {
+      if (uiState.sortKey === "name") return dir * String(a.name).localeCompare(String(b.name));
+      if (uiState.sortKey === "dtype") return dir * String(a.dtype || "").localeCompare(String(b.dtype || ""));
+      if (uiState.sortKey === "nullable") return dir * ((a.nullable === b.nullable) ? 0 : (a.nullable ? 1 : -1));
+      if (uiState.sortKey === "documented") {
+        const da = isDocumented(a) ? 1 : 0;
+        const db = isDocumented(b) ? 1 : 0;
+        return dir * (da - db);
+      }
+      return 0;
+    });
+
+    // build tbody
+    const out = [];
+    for (const c of rows) {
+      const documented = isDocumented(c);
+      const linN = lineageCount(c);
+
+      const rowId = `col-${cssSafeId(m.name)}-${cssSafeId(c.name)}`;
+
+      const tr = el("tr", {
+        id: rowId,
+        class: `colRow ${documented ? "" : "undoc"}`,
+        onclick: () => {
+          if (uiState.expanded.has(c.name)) uiState.expanded.delete(c.name);
+          else uiState.expanded.add(c.name);
+          renderBody(); // re-render tbody only
+          // keep focus in filter input
+          queueMicrotask(() => qInput.focus());
+        }
+      },
+        el("td", {}, el("code", {}, c.name)),
+        el("td", {}, el("code", {}, c.dtype || "")),
+        el("td", {},
+          c.nullable
+            ? el("span", { class: "pillSmall pillBad" }, "NULL")
+            : el("span", { class: "pillSmall pillGood" }, "NOT NULL")
+        ),
+        el("td", {},
+          documented
+            ? el("span", { class: "pillSmall pillGood" }, "DOCS")
+            : el("span", { class: "pillSmall pillBad" }, "MISSING")
+        ),
+        el("td", {},
+          // short preview + lineage count
+          (c.description_text && c.description_text.trim())
+            ? el("span", {}, snippet(c.description_text, 70), linN ? ` • ${linN} lineage` : "")
+            : el("span", { class: "empty" }, "—", linN ? ` • ${linN} lineage` : "")
+        ),
+      );
+
+      out.push(tr);
+
+      if (uiState.expanded.has(c.name)) {
+        out.push(
+          el("tr", { class: "drawerRow" },
+            el("td", { colspan: "5" }, renderDrawer(c))
+          )
+        );
+      }
+    }
+
+    tbody.replaceChildren(...out);
+
+    // Column deep-link: highlight + scroll + auto-expand
+    const colName = (colFromRoute || "").trim();
+    if (colName) {
+      // ensure expanded
+      uiState.expanded.add(colName);
+
+      queueMicrotask(() => {
+        const rowId = `col-${cssSafeId(m.name)}-${cssSafeId(colName)}`;
+        const row = document.getElementById(rowId);
+        if (!row) return;
+
+        document.querySelectorAll("tr.colHit").forEach(n => n.classList.remove("colHit"));
+        row.classList.add("colHit");
+        row.scrollIntoView({ block: "center", behavior: "smooth" });
+        setTimeout(() => row.classList.remove("colHit"), 2200);
+      });
+    }
+  }
+
+  // initial render
+  card.append(el("h3", {}, `Columns (${cols.length})`), tools, table);
+  renderHead();
+  renderBody();
+
+  return card;
+}
+
+async function copyText(text) {
+  try { await navigator.clipboard.writeText(String(text ?? "")); return true; }
+  catch { return false; }
 }
 
 async function loadManifest() {

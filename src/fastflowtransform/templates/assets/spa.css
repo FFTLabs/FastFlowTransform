@@ -202,3 +202,84 @@ tr.colHit{
   outline: 1px solid color-mix(in srgb, var(--accent), transparent 45%);
   outline-offset: -1px;
 }
+
+/* Column table UX */
+.thBtn{
+  border:0;
+  background:transparent;
+  color:var(--muted);
+  font: inherit;
+  font-weight:600;
+  font-size:12px;
+  cursor:pointer;
+  padding:0;
+  display:inline-flex;
+  gap:6px;
+  align-items:center;
+}
+.thBtn:hover{ color: var(--fg); }
+.sortArrow{ opacity:.75; font-size:11px; }
+
+.pillSmall{
+  font-size:11px;
+  padding:1px 8px;
+  border-radius:999px;
+  border:1px solid var(--border);
+  color:var(--muted);
+  display:inline-block;
+}
+.pillGood{ color: color-mix(in srgb, var(--accent2), var(--muted) 30%); }
+.pillBad{ color: color-mix(in srgb, var(--warn), var(--muted) 30%); }
+
+.colRow{ cursor:pointer; }
+.colRow:hover td{ background: color-mix(in srgb, var(--accent), transparent 94%); }
+.colRow.undoc td{ background: color-mix(in srgb, var(--warn), transparent 92%); }
+
+.drawerRow td{
+  padding: 0;
+  border-bottom: 1px solid var(--border);
+}
+.drawer{
+  padding: 12px 12px;
+  background: color-mix(in srgb, var(--card), transparent 0%);
+  border-top: 1px dashed color-mix(in srgb, var(--border), transparent 30%);
+}
+.drawerGrid{
+  display:grid;
+  gap:12px;
+  grid-template-columns: 1.4fr 1fr;
+}
+@media (max-width: 900px){ .drawerGrid{ grid-template-columns: 1fr; } }
+
+.drawerTitle{ margin:0 0 6px 0; font-size:12px; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); }
+.drawerBox{ border:1px solid var(--border); border-radius:14px; padding:10px 10px; }
+
+.colTools{
+  display:flex;
+  gap:10px;
+  flex-wrap:wrap;
+  align-items:center;
+  margin-bottom:10px;
+}
+
+.colCount{ color: var(--muted); font-size:12px; }
+
+/* Small icon-ish buttons */
+.btnTiny{
+  border:1px solid var(--border);
+  background:transparent;
+  color:var(--fg);
+  padding:4px 8px;
+  border-radius:10px;
+  cursor:pointer;
+  font-size:12px;
+}
+.btnTiny:hover{ border-color:var(--accent); }
+
+.drawerTools{
+  display:flex;
+  gap:8px;
+  flex-wrap:wrap;
+  align-items:center;
+  margin-top:10px;
+}
