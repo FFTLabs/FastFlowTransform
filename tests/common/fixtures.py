@@ -14,6 +14,7 @@ from sqlalchemy import text
 
 import fastflowtransform.executors.bigquery.base as bq_base
 import fastflowtransform.executors.bigquery.pandas as bq_pandas
+import fastflowtransform.executors.budget.runtime.bigquery as bq_budget_runtime
 import fastflowtransform.typing as fft_typing
 from fastflowtransform import utest
 from fastflowtransform.core import REGISTRY
@@ -45,9 +46,21 @@ except ModuleNotFoundError:  # pragma: no cover - import guard
 
 # Snowflake
 try:
+    from fastflowtransform.executors.budget.runtime.snowflake_snowpark import (
+        SnowflakeSnowparkBudgetRuntime,
+    )
+    from fastflowtransform.executors.query_stats.runtime.snowflake_snowpark import (
+        SnowflakeSnowparkQueryStatsRuntime,
+    )
     from fastflowtransform.executors.snowflake_snowpark import SnowflakeSnowparkExecutor
+    from fastflowtransform.snapshots.runtime.snowflake_snowpark import (
+        SnowflakeSnowparkSnapshotRuntime,
+    )
 except ModuleNotFoundError:  # pragma: no cover
     SnowflakeSnowparkExecutor = None  # type: ignore[assignment]
+    SnowflakeSnowparkBudgetRuntime = None  # type: ignore[assignment]
+    SnowflakeSnowparkQueryStatsRuntime = None  # type: ignore[assignment]
+    SnowflakeSnowparkSnapshotRuntime = None  # type: ignore[assignment]
 
 
 # ---- Jinja env ----------------------------------------------------------------
@@ -134,8 +147,8 @@ def exec_minimal(monkeypatch):
         SP.builder.master.return_value.appName.return_value.getOrCreate.return_value = fake_spark
         ex = DatabricksSparkExecutor()
     # JVM plan inspection loops forever on MagicMocks; skip in unit tests.
-    monkeypatch.setattr(ex, "_spark_plan_bytes", lambda *_, **__: None)
-    monkeypatch.setattr(ex, "_spark_dataframe_bytes", lambda *_, **__: None)
+    monkeypatch.setattr(ex.runtime_budget, "_spark_plan_bytes", lambda *_, **__: None)
+    monkeypatch.setattr(ex.runtime_budget, "dataframe_bytes", lambda *_, **__: None)
     # accept mocks as frames in unit tests
     monkeypatch.setattr(ex, "_is_frame", lambda obj: True)
     return ex
@@ -167,8 +180,8 @@ def exec_factory():
             fake_builder.getOrCreate.return_value = fake_spark
 
             ex = DatabricksSparkExecutor(**kwargs)
-            ex._spark_plan_bytes = lambda *_, **__: None
-            ex._spark_dataframe_bytes = lambda *_, **__: None
+            ex.runtime_budget._spark_plan_bytes = lambda *_, **__: None
+            ex.runtime_budget.dataframe_bytes = lambda *_, **__: None
         return ex, fake_builder, fake_spark
 
     return _make
@@ -447,6 +460,12 @@ def snowflake_executor_fake() -> Any:
     session = FakeSnowflakeSession()
     ex.session = session
 
+    # Wire runtimes to mirror real executor setup.
+    ex.runtime_query_stats = SnowflakeSnowparkQueryStatsRuntime(ex)
+    ex.runtime_budget = SnowflakeSnowparkBudgetRuntime(ex)
+    # Wire snapshot runtime to mirror real executor setup.
+    ex.snapshot_runtime = SnowflakeSnowparkSnapshotRuntime(ex)
+
     return ex
 
 
@@ -482,7 +501,7 @@ def bq_executor_fake(monkeypatch) -> BigQueryExecutor:
     # see the fake module.
     fake_bq = install_fake_bigquery(
         monkeypatch,
-        target_modules=[fft_typing, bq_base, bq_pandas],
+        target_modules=[fft_typing, bq_base, bq_pandas, bq_budget_runtime],
     )
 
     # Instantiate FakeClient via the fake module so the types line up

@@ -1,71 +1,35 @@
 # fastflowtransform/executors/duckdb.py
 from __future__ import annotations
 
-import json
-import re
 import uuid
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from contextlib import suppress
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, cast
 
 import duckdb
 import pandas as pd
 from duckdb import CatalogException
+from jinja2 import Environment
 
 from fastflowtransform.contracts.runtime.duckdb import DuckRuntimeContracts
 from fastflowtransform.core import Node
-from fastflowtransform.executors._budget_runner import run_sql_with_budget
-from fastflowtransform.executors._snapshot_sql_mixin import SnapshotSqlMixin
 from fastflowtransform.executors._sql_identifier import SqlIdentifierMixin
 from fastflowtransform.executors._test_utils import make_fetchable
-from fastflowtransform.executors.base import BaseExecutor, _scalar
-from fastflowtransform.executors.budget import BudgetGuard
+from fastflowtransform.executors.base import BaseExecutor, ColumnInfo, _scalar
+from fastflowtransform.executors.budget.runtime.duckdb import DuckBudgetRuntime
+from fastflowtransform.executors.common import _q_ident
+from fastflowtransform.executors.query_stats.runtime.duckdb import DuckQueryStatsRuntime
 from fastflowtransform.meta import ensure_meta_table, upsert_meta
+from fastflowtransform.snapshots.runtime.duckdb import DuckSnapshotRuntime
 
 
-def _q(ident: str) -> str:
-    return '"' + ident.replace('"', '""') + '"'
-
-
-class DuckExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[pd.DataFrame]):
+class DuckExecutor(SqlIdentifierMixin, BaseExecutor[pd.DataFrame]):
     ENGINE_NAME: str = "duckdb"
     runtime_contracts: DuckRuntimeContracts
-
-    _FIXED_TYPE_SIZES: ClassVar[dict[str, int]] = {
-        "boolean": 1,
-        "bool": 1,
-        "tinyint": 1,
-        "smallint": 2,
-        "integer": 4,
-        "int": 4,
-        "bigint": 8,
-        "float": 4,
-        "real": 4,
-        "double": 8,
-        "double precision": 8,
-        "decimal": 16,
-        "numeric": 16,
-        "uuid": 16,
-        "json": 64,
-        "jsonb": 64,
-        "timestamp": 8,
-        "timestamp_ntz": 8,
-        "timestamp_ltz": 8,
-        "timestamptz": 8,
-        "date": 4,
-        "time": 4,
-        "interval": 16,
-    }
-    _VARCHAR_DEFAULT_WIDTH = 64
-    _VARCHAR_MAX_WIDTH = 1024
-    _DEFAULT_ROW_WIDTH = 128
-    _BUDGET_GUARD = BudgetGuard(
-        env_var="FF_DUCKDB_MAX_BYTES",
-        estimator_attr="_estimate_query_bytes",
-        engine_label="DuckDB",
-        what="query",
-    )
+    runtime_query_stats: DuckQueryStatsRuntime
+    runtime_budget: DuckBudgetRuntime
+    snapshot_runtime: DuckSnapshotRuntime
 
     def __init__(
         self, db_path: str = ":memory:", schema: str | None = None, catalog: str | None = None
@@ -78,18 +42,35 @@ class DuckExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[pd.DataFra
         self.schema = schema.strip() if isinstance(schema, str) and schema.strip() else None
         catalog_override = catalog.strip() if isinstance(catalog, str) and catalog.strip() else None
         self.catalog = self._detect_catalog()
-        self._table_row_width_cache: dict[tuple[str | None, str], int] = {}
         if catalog_override:
             if self._apply_catalog_override(catalog_override):
                 self.catalog = catalog_override
             else:
                 self.catalog = self._detect_catalog()
-        if self.schema:
-            safe_schema = _q(self.schema)
-            self._execute_sql(f"create schema if not exists {safe_schema}")
-            self._execute_sql(f"set schema '{self.schema}'")
-
+        self.runtime_query_stats = DuckQueryStatsRuntime(self)
+        self.runtime_budget = DuckBudgetRuntime(self)
         self.runtime_contracts = DuckRuntimeContracts(self)
+        self.snapshot_runtime = DuckSnapshotRuntime(self)
+
+        if self.schema:
+            safe_schema = _q_ident(self.schema)
+            self._execute_basic(f"create schema if not exists {safe_schema}")
+            self._execute_basic(f"set schema '{self.schema}'")
+
+    def _execute_basic(self, sql: str, params: Any | None = None) -> duckdb.DuckDBPyConnection:
+        """
+        Minimal helper to execute a statement and return the DuckDB cursor.
+        Centralises raw connection use for test + runtime helpers.
+        """
+        return self.con.execute(sql, params) if params is not None else self.con.execute(sql)
+
+    def _execute_fetchall(self, sql: str, params: Any | None = None) -> list[Any]:
+        """
+        Helper for runtimes that need full result sets without exposing cursors.
+        """
+        res = self._execute_basic(sql, params)
+        fetchall = getattr(res, "fetchall", None)
+        return list(cast(Iterable[Any], fetchall())) if callable(fetchall) else []
 
     def execute_test_sql(self, stmt: Any) -> Any:
         """
@@ -104,15 +85,15 @@ class DuckExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[pd.DataFra
                 and isinstance(s[0], str)
                 and isinstance(s[1], dict)
             ):
-                return self.con.execute(s[0], s[1])
+                return self._execute_basic(s[0], s[1])
             if isinstance(s, str):
-                return self.con.execute(s)
+                return self._execute_basic(s)
             if isinstance(s, Iterable) and not isinstance(s, (bytes, bytearray, str)):
                 res = None
                 for item in s:
                     res = _run_one(item)
                 return res
-            return self.con.execute(str(s))
+            return self._execute_basic(str(s))
 
         return make_fetchable(_run_one(stmt))
 
@@ -138,294 +119,19 @@ class DuckExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[pd.DataFra
             return self.con.execute(sql, *args, **kwargs)
 
         def _rows(result: Any) -> int | None:
-            rc = getattr(result, "rowcount", None)
-            if isinstance(rc, int) and rc >= 0:
-                return rc
-            return None
+            return self.runtime_query_stats.rowcount_from_result(result)
 
-        return run_sql_with_budget(
-            self,
+        return self.runtime_budget.run_sql(
             sql,
-            guard=self._BUDGET_GUARD,
             exec_fn=_exec,
+            stats_runtime=self.runtime_query_stats,
             rowcount_extractor=_rows,
-            estimate_fn=self._estimate_query_bytes,
         )
 
-    # --- Cost estimation for the shared BudgetGuard -----------------
-
-    def _estimate_query_bytes(self, sql: str) -> int | None:
-        """
-        Estimate query size via DuckDB's EXPLAIN (FORMAT JSON).
-
-        The JSON plan exposes an \"Estimated Cardinality\" per node.
-        We walk the parsed tree, take the highest non-zero estimate and
-        return it as a byte-estimate surrogate (row count ≈ bytes) so the
-        cost guard can still make a meaningful decision without executing
-        the query.
-        """
-        try:
-            body = self._selectable_body(sql).strip().rstrip(";\n\t ")
-        except AttributeError:
-            body = sql.strip().rstrip(";\n\t ")
-
-        lower = body.lower()
-        if not lower.startswith(("select", "with")):
-            return None
-
-        explain_sql = f"EXPLAIN (FORMAT JSON) {body}"
-        try:
-            rows = self.con.execute(explain_sql).fetchall()
-        except Exception:
-            return None
-
-        if not rows:
-            return None
-
-        fragments: list[str] = []
-        for row in rows:
-            for cell in row:
-                if cell is None:
-                    continue
-                fragments.append(str(cell))
-
-        if not fragments:
-            return None
-
-        plan_text = "\n".join(fragments).strip()
-        start = plan_text.find("[")
-        end = plan_text.rfind("]")
-        if start == -1 or end == -1 or end <= start:
-            return None
-
-        try:
-            plan_data = json.loads(plan_text[start : end + 1])
-        except Exception:
-            return None
-
-        def _to_int(value: Any) -> int | None:
-            if value is None:
-                return None
-            if isinstance(value, (int, float)):
-                try:
-                    converted = int(value)
-                except Exception:
-                    return None
-                return converted
-            text = str(value)
-            match = re.search(r"(\d+(?:\.\d+)?)", text)
-            if not match:
-                return None
-            try:
-                return int(float(match.group(1)))
-            except ValueError:
-                return None
-
-        def _walk_node(node: dict[str, Any]) -> int:
-            best = 0
-            extra = node.get("extra_info") or {}
-            for key in (
-                "Estimated Cardinality",
-                "estimated_cardinality",
-                "Cardinality",
-                "cardinality",
-            ):
-                candidate = _to_int(extra.get(key))
-                if candidate is not None:
-                    best = max(best, candidate)
-            candidate = _to_int(node.get("cardinality"))
-            if candidate is not None:
-                best = max(best, candidate)
-            for child in node.get("children") or []:
-                if isinstance(child, dict):
-                    best = max(best, _walk_node(child))
-            return best
-
-        nodes: list[Any]
-        nodes = plan_data if isinstance(plan_data, list) else [plan_data]
-
-        estimate = 0
-        for entry in nodes:
-            if isinstance(entry, dict):
-                estimate = max(estimate, _walk_node(entry))
-
-        if estimate <= 0:
-            return None
-
-        tables = self._collect_tables_from_plan(nodes)
-        row_width = self._row_width_for_tables(tables)
-        if row_width <= 0:
-            row_width = self._DEFAULT_ROW_WIDTH
-
-        bytes_estimate = int(estimate * row_width)
-        return bytes_estimate if bytes_estimate > 0 else None
-
-    def _collect_tables_from_plan(self, nodes: list[dict[str, Any]]) -> set[tuple[str | None, str]]:
-        tables: set[tuple[str | None, str]] = set()
-
-        def _walk(entry: dict[str, Any]) -> None:
-            extra = entry.get("extra_info") or {}
-            table_val = extra.get("Table")
-            schema_val = extra.get("Schema") or extra.get("Database") or extra.get("Catalog")
-            if isinstance(table_val, str) and table_val.strip():
-                schema, table = self._split_identifier(table_val, schema_val)
-                if table:
-                    tables.add((schema, table))
-            for child in entry.get("children") or []:
-                if isinstance(child, dict):
-                    _walk(child)
-
-        for node in nodes:
-            if isinstance(node, dict):
-                _walk(node)
-        return tables
-
-    def _split_identifier(
-        self, identifier: str, explicit_schema: str | None
-    ) -> tuple[str | None, str]:
-        parts = [part.strip() for part in identifier.split(".") if part.strip()]
-        if not parts:
-            return explicit_schema, identifier
-        if len(parts) >= 2:
-            schema_candidate = self._strip_quotes(parts[-2])
-            table_candidate = self._strip_quotes(parts[-1])
-            return schema_candidate or explicit_schema, table_candidate
-        return explicit_schema, self._strip_quotes(parts[-1])
-
-    def _strip_quotes(self, value: str) -> str:
-        if value.startswith('"') and value.endswith('"'):
-            return value[1:-1]
-        return value
-
-    def _row_width_for_tables(self, tables: Iterable[tuple[str | None, str]]) -> int:
-        widths: list[int] = []
-        for schema, table in tables:
-            width = self._row_width_for_table(schema, table)
-            if width > 0:
-                widths.append(width)
-        return max(widths) if widths else 0
-
-    def _row_width_for_table(self, schema: str | None, table: str) -> int:
-        key = (schema or "", table.lower())
-        cached = self._table_row_width_cache.get(key)
-        if cached:
-            return cached
-
-        columns = self._columns_for_table(table, schema)
-        width = sum(self._estimate_column_width(col) for col in columns)
-        if width <= 0:
-            width = self._DEFAULT_ROW_WIDTH
-        self._table_row_width_cache[key] = width
-        return width
-
-    def _columns_for_table(
-        self, table: str, schema: str | None
-    ) -> list[tuple[str | None, int | None, int | None, int | None]]:
-        table_lower = table.lower()
-        columns: list[tuple[str | None, int | None, int | None, int | None]] = []
-        seen_schemas: set[str | None] = set()
-        for candidate in self._schema_candidates(schema):
-            if candidate in seen_schemas:
-                continue
-            seen_schemas.add(candidate)
-            if candidate is not None:
-                try:
-                    rows = self.con.execute(
-                        """
-                        select lower(data_type) as dtype,
-                               character_maximum_length,
-                               numeric_precision,
-                               numeric_scale
-                        from information_schema.columns
-                        where lower(table_name)=lower(?)
-                          and lower(table_schema)=lower(?)
-                        order by ordinal_position
-                        """,
-                        [table_lower, candidate.lower()],
-                    ).fetchall()
-                except Exception:
-                    continue
-            else:
-                try:
-                    rows = self.con.execute(
-                        """
-                        select lower(data_type) as dtype,
-                               character_maximum_length,
-                               numeric_precision,
-                               numeric_scale
-                        from information_schema.columns
-                        where lower(table_name)=lower(?)
-                        order by lower(table_schema), ordinal_position
-                        """,
-                        [table_lower],
-                    ).fetchall()
-                except Exception:
-                    continue
-            if rows:
-                return rows
-        return columns
-
-    def _schema_candidates(self, schema: str | None) -> list[str | None]:
-        candidates: list[str | None] = []
-
-        def _add(value: str | None) -> None:
-            normalized = self._normalize_schema(value)
-            if normalized not in candidates:
-                candidates.append(normalized)
-
-        _add(schema)
-        _add(self.schema)
-        for alt in ("main", "temp"):
-            _add(alt)
-        _add(None)
-        return candidates
-
-    def _normalize_schema(self, schema: str | None) -> str | None:
-        if not schema:
-            return None
-        stripped = schema.strip()
-        return stripped or None
-
-    def _estimate_column_width(
-        self, column_info: tuple[str | None, int | None, int | None, int | None]
-    ) -> int:
-        dtype_raw, char_max, numeric_precision, _ = column_info
-        dtype = self._normalize_data_type(dtype_raw)
-        if dtype and dtype in self._FIXED_TYPE_SIZES:
-            return self._FIXED_TYPE_SIZES[dtype]
-
-        if dtype in {"character", "varchar", "char", "text", "string"}:
-            if char_max and char_max > 0:
-                return min(char_max, self._VARCHAR_MAX_WIDTH)
-            return self._VARCHAR_DEFAULT_WIDTH
-
-        if dtype in {"varbinary", "blob", "binary"}:
-            if char_max and char_max > 0:
-                return min(char_max, self._VARCHAR_MAX_WIDTH)
-            return self._VARCHAR_DEFAULT_WIDTH
-
-        if dtype in {"numeric", "decimal"} and numeric_precision and numeric_precision > 0:
-            return min(max(int(numeric_precision), 16), 128)
-
-        return 16
-
-    def _normalize_data_type(self, dtype: str | None) -> str | None:
-        if not dtype:
-            return None
-        stripped = dtype.strip().lower()
-        if "(" in stripped:
-            stripped = stripped.split("(", 1)[0].strip()
-        if stripped.endswith("[]"):
-            stripped = stripped[:-2]
-        return stripped or None
-
     def _detect_catalog(self) -> str | None:
-        try:
-            rows = self._execute_sql("PRAGMA database_list").fetchall()
-            if rows:
-                return str(rows[0][1])
-        except Exception:
-            return None
+        rows = self._execute_basic("PRAGMA database_list").fetchall()
+        if rows:
+            return str(rows[0][1])
         return None
 
     def _apply_catalog_override(self, name: str) -> bool:
@@ -436,9 +142,11 @@ class DuckExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[pd.DataFra
             if self.db_path != ":memory:":
                 resolved = str(Path(self.db_path).resolve())
                 with suppress(Exception):
-                    self._execute_sql(f"detach database {_q(alias)}")
-                self._execute_sql(f"attach database '{resolved}' as {_q(alias)} (READ_ONLY FALSE)")
-            self._execute_sql(f"set catalog '{alias}'")
+                    self._execute_basic(f"detach database {_q_ident(alias)}")
+                self._execute_basic(
+                    f"attach database '{resolved}' as {_q_ident(alias)} (READ_ONLY FALSE)"
+                )
+            self._execute_basic(f"set catalog '{alias}'")
             return True
         except Exception:
             return False
@@ -471,7 +179,7 @@ class DuckExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[pd.DataFra
 
     # ---- Frame hooks ----
     def _quote_identifier(self, ident: str) -> str:
-        return _q(ident)
+        return _q_ident(ident)
 
     def _should_include_catalog(
         self, catalog: str | None, schema: str | None, *, explicit: bool
@@ -511,7 +219,7 @@ class DuckExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[pd.DataFra
         except CatalogException as e:
             existing = [
                 r[0]
-                for r in self._execute_sql(
+                for r in self._execute_basic(
                     "select table_name from information_schema.tables "
                     "where table_schema in ('main','temp')"
                 ).fetchall()
@@ -533,7 +241,7 @@ class DuckExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[pd.DataFra
                 self.con.unregister(tmp)
             except Exception:
                 # housekeeping only; stats here are not important but harmless if recorded
-                self._execute_sql(f'drop view if exists "{tmp}"')
+                self._execute_basic(f'drop view if exists "{tmp}"')
 
     def _create_or_replace_view_from_table(
         self, view_name: str, backing_table: str, node: Node
@@ -574,10 +282,10 @@ class DuckExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[pd.DataFra
             where_tables.append("table_schema in ('main','temp')")
         where = " AND ".join(where_tables)
         sql_tables = f"select 1 from information_schema.tables where {where} limit 1"
-        if self._execute_sql(sql_tables, params).fetchone():
+        if self._execute_basic(sql_tables, params).fetchone():
             return True
         sql_views = f"select 1 from information_schema.views where {where} limit 1"
-        return bool(self._execute_sql(sql_views, params).fetchone())
+        return bool(self._execute_basic(sql_views, params).fetchone())
 
     def create_table_as(self, relation: str, select_sql: str) -> None:
         # Use only the SELECT body and strip trailing semicolons for safety.
@@ -617,11 +325,11 @@ class DuckExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[pd.DataFra
         """
         # Probe: empty projection from the SELECT (cleaned to avoid parser issues).
         body = self._first_select_body(select_sql).strip().rstrip(";\n\t ")
-        probe = self._execute_sql(f"select * from ({body}) as q limit 0")
+        probe = self._execute_basic(f"select * from ({body}) as q limit 0")
         cols = [c[0] for c in probe.description or []]
         existing = {
             r[0]
-            for r in self._execute_sql(
+            for r in self._execute_basic(
                 "select column_name from information_schema.columns "
                 + "where lower(table_name)=lower(?)"
                 + (" and lower(table_schema)=lower(?)" if self.schema else ""),
@@ -630,12 +338,12 @@ class DuckExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[pd.DataFra
         }
         add = [c for c in cols if c not in existing]
         for c in add:
-            col = _q(c)
+            col = _q_ident(c)
             target = self._qualified(relation)
             try:
-                self._execute_sql(f"alter table {target} add column {col} varchar")
+                self._execute_basic(f"alter table {target} add column {col} varchar")
             except Exception:
-                self._execute_sql(f"alter table {target} add column {col} varchar")
+                self._execute_basic(f"alter table {target} add column {col} varchar")
 
     def execute_hook_sql(self, sql: str) -> None:
         """
@@ -645,37 +353,27 @@ class DuckExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[pd.DataFra
         """
         self._exec_many(sql)
 
-    # ---- Snapshot mixin hooks ----
-    def _snapshot_target_identifier(self, rel_name: str) -> str:
-        return self._qualified(rel_name)
+    # ---- Snapshot runtime delegation ----
+    def run_snapshot_sql(self, node: Node, env: Environment) -> None:
+        """
+        Delegate snapshot materialization to the DuckDB snapshot runtime.
+        """
+        self.snapshot_runtime.run_snapshot_sql(node, env)
 
-    def _snapshot_current_timestamp(self) -> str:
-        return "current_timestamp"
-
-    def _snapshot_null_timestamp(self) -> str:
-        return "cast(null as timestamp)"
-
-    def _snapshot_null_hash(self) -> str:
-        return "cast(null as varchar)"
-
-    def _snapshot_hash_expr(self, check_cols: list[str], src_alias: str) -> str:
-        concat_expr = self._snapshot_concat_expr(check_cols, src_alias)
-        return f"cast(md5({concat_expr}) as varchar)"
-
-    def _snapshot_cast_as_string(self, expr: str) -> str:
-        return f"cast({expr} as varchar)"
-
-    def _snapshot_source_ref(
-        self, rel_name: str, select_body: str
-    ) -> tuple[str, Callable[[], None]]:
-        src_view_name = f"__ff_snapshot_src_{rel_name}".replace(".", "_")
-        src_quoted = _q(src_view_name)
-        self._execute_sql(f"create or replace temp view {src_quoted} as {select_body}")
-
-        def _cleanup() -> None:
-            self._execute_sql(f"drop view if exists {src_quoted}")
-
-        return src_quoted, _cleanup
+    def snapshot_prune(
+        self,
+        relation: str,
+        unique_key: list[str],
+        keep_last: int,
+        *,
+        dry_run: bool = False,
+    ) -> None:
+        self.snapshot_runtime.snapshot_prune(
+            relation,
+            unique_key,
+            keep_last,
+            dry_run=dry_run,
+        )
 
         # ---- Unit-test helpers -------------------------------------------------
 
@@ -689,13 +387,13 @@ class DuckExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[pd.DataFra
         self.con.register(tmp, df)
         try:
             target = self._qualified(relation)
-            self._execute_sql(f"create or replace table {target} as select * from {tmp}")
+            self._execute_basic(f"create or replace table {target} as select * from {tmp}")
         finally:
             with suppress(Exception):
                 self.con.unregister(tmp)
             # Fallback for older DuckDB where unregister might not exist
             with suppress(Exception):
-                self._execute_sql(f'drop view if exists "{tmp}"')
+                self._execute_basic(f'drop view if exists "{tmp}"')
 
     def utest_read_relation(self, relation: str) -> pd.DataFrame:
         """
@@ -712,9 +410,45 @@ class DuckExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[pd.DataFra
         target = self._qualified(relation)
         # best-effort; ignore failures
         with suppress(Exception):
-            self._execute_sql(f"drop view if exists {target}")
+            self._execute_basic(f"drop view if exists {target}")
         with suppress(Exception):
-            self._execute_sql(f"drop table if exists {target}")
+            self._execute_basic(f"drop table if exists {target}")
+
+    def collect_docs_columns(self) -> dict[str, list[ColumnInfo]]:
+        """
+        Best-effort column metadata for docs (schema-aware, supports catalog).
+        """
+        where: list[str] = []
+        params: list[str] = []
+
+        if self.catalog:
+            where.append("lower(table_catalog) = lower(?)")
+            params.append(self.catalog)
+        if self.schema:
+            where.append("lower(table_schema) = lower(?)")
+            params.append(self.schema)
+        else:
+            where.append("table_schema in ('main','temp')")
+
+        where_sql = " AND ".join(where) if where else "1=1"
+        sql = f"""
+        select table_name, column_name, data_type, is_nullable
+        from information_schema.columns
+        where {where_sql}
+        order by table_schema, table_name, ordinal_position
+        """
+
+        try:
+            rows = self._execute_basic(sql, params or None).fetchall()
+        except Exception:
+            return {}
+
+        out: dict[str, list[ColumnInfo]] = {}
+        for table, col, dtype, nullable in rows:
+            out.setdefault(table, []).append(
+                ColumnInfo(col, str(dtype), str(nullable) in (True, "YES", "Yes"))
+            )
+        return out
 
     def _introspect_columns_metadata(
         self,
@@ -753,7 +487,7 @@ class DuckExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[pd.DataFra
             "order by table_schema, ordinal_position"
         )
 
-        rows = self._execute_sql(sql, params).fetchall()
+        rows = self._execute_basic(sql, params).fetchall()
 
         # Normalize to plain strings
         return [(str(name), str(dtype)) for (name, dtype) in rows]
@@ -783,7 +517,7 @@ class DuckExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[pd.DataFra
         qualified = self._qualify_identifier(table, schema=target_schema, catalog=self.catalog)
 
         if target_schema and "." not in table:
-            safe_schema = _q(target_schema)
+            safe_schema = _q_ident(target_schema)
             self._execute_sql(f"create schema if not exists {safe_schema}")
             created_schema = True
 
@@ -795,6 +529,6 @@ class DuckExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[pd.DataFra
             with suppress(Exception):
                 self.con.unregister(tmp)
             with suppress(Exception):
-                self._execute_sql(f'drop view if exists "{tmp}"')
+                self._execute_basic(f'drop view if exists "{tmp}"')
 
         return True, qualified, created_schema

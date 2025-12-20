@@ -4,7 +4,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any, Protocol
 
-from fastflowtransform.executors.query_stats import QueryStats
+from fastflowtransform.executors.query_stats.core import QueryStats
 
 
 class QueryStatsAdapter(Protocol):
@@ -126,8 +126,9 @@ class SparkDataFrameStatsAdapter:
         self.bytes_fn = bytes_fn
 
     def collect(
-        self, df: Any, *, duration_ms: int | None, estimated_bytes: int | None = None
+        self, result: Any, *, duration_ms: int | None, estimated_bytes: int | None = None
     ) -> QueryStats:
+        df = result
         bytes_val = estimated_bytes
         if bytes_val is None:
             try:

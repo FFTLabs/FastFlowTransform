@@ -7,7 +7,8 @@ import pandas as pd
 import pytest
 
 from fastflowtransform.core import Node
-from fastflowtransform.executors.duckdb import DuckExecutor, _q
+from fastflowtransform.executors.common import _q_ident
+from fastflowtransform.executors.duckdb import DuckExecutor
 
 
 @pytest.fixture
@@ -101,14 +102,14 @@ def test_create_or_replace_view_from_table(duck_exec: DuckExecutor):
 def test_format_relation_for_ref(duck_exec: DuckExecutor):
     rel = duck_exec._format_relation_for_ref("my_model")
     # relation_for("my_model") → "my_model"
-    assert rel == _q("my_model")
+    assert rel == _q_ident("my_model")
 
 
 @pytest.mark.unit
 @pytest.mark.duckdb
 def test_format_relation_for_ref_with_schema(duck_exec_schema: DuckExecutor):
     rel = duck_exec_schema._format_relation_for_ref("my_model")
-    assert rel == f'"demo_schema".{_q("my_model")}'
+    assert rel == f'"demo_schema".{_q_ident("my_model")}'
 
 
 @pytest.mark.unit

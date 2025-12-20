@@ -7,6 +7,7 @@ import re
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TypeVar, cast
 
@@ -21,8 +22,8 @@ from fastflowtransform.config.sources import resolve_source_entry
 from fastflowtransform.core import REGISTRY, Node, relation_for
 from fastflowtransform.errors import ModelExecutionError
 from fastflowtransform.executors._query_stats_adapter import JobStatsAdapter
-from fastflowtransform.executors.budget import BudgetGuard
-from fastflowtransform.executors.query_stats import QueryStats
+from fastflowtransform.executors.budget.core import BudgetGuard
+from fastflowtransform.executors.query_stats.core import QueryStats
 from fastflowtransform.incremental import _normalize_unique_key
 from fastflowtransform.logging import echo, echo_debug
 from fastflowtransform.validation import validate_required_columns
@@ -54,8 +55,6 @@ def _python_incremental_merge_default(
         return combined
 
     combined = pd.concat([df_old, df_new], ignore_index=True)
-
-    # Nur Update-Spalten verwenden, die es wirklich gibt
     update_cols = [c for c in update_cols if c in combined.columns]
 
     sort_cols = unique_key + update_cols if update_cols else unique_key
@@ -95,6 +94,15 @@ def _scalar(executor: BaseExecutor, sql: Any) -> Any:
 TFrame = TypeVar("TFrame")
 
 
+@dataclass
+class ColumnInfo:
+    name: str
+    dtype: str
+    nullable: bool
+    description_html: str | None = None
+    lineage: list[dict[str, Any]] | None = None
+
+
 class _ThisProxy:
     """
     Jinja compatible proxy for {{ this }}:
@@ -128,15 +136,14 @@ class BaseExecutor[TFrame](ABC):
       - (optional) _frame_name
     """
 
-    # Standard meta columns used by snapshot materialization.
-    SNAPSHOT_VALID_FROM_COL = "_ff_valid_from"
-    SNAPSHOT_VALID_TO_COL = "_ff_valid_to"
-    SNAPSHOT_IS_CURRENT_COL = "_ff_is_current"
-    SNAPSHOT_HASH_COL = "_ff_snapshot_hash"
-    SNAPSHOT_UPDATED_AT_COL = "_ff_updated_at"
+    ENGINE_NAME: str = "generic"
 
     _ff_contracts: Mapping[str, ContractsFileModel] | None = None
     _ff_project_contracts: ProjectContractsModel | None = None
+
+    @property
+    def engine_name(self) -> str:
+        return getattr(self, "ENGINE_NAME", "generic")
 
     def configure_contracts(
         self,
@@ -1126,23 +1133,6 @@ class BaseExecutor[TFrame](ABC):
         return bool(incremental_cfg)
 
     # ── Snapshot API ──────────────────────────────────────────────────
-    def snapshot_prune(
-        self,
-        relation: str,
-        unique_key: list[str],
-        keep_last: int,
-        *,
-        dry_run: bool = False,
-    ) -> None:  # pragma: no cover - abstract
-        """
-        Prune old snapshot versions for the given relation.
-
-        Engines may implement this in a best-effort manner. Default: not supported.
-        """
-        raise NotImplementedError(
-            f"Snapshot pruning is not implemented for engine '{self.engine_name}'."
-        )
-
     @staticmethod
     def _meta_is_snapshot(meta: Mapping[str, Any] | None) -> bool:
         """
@@ -1214,6 +1204,13 @@ class BaseExecutor[TFrame](ABC):
         """
         return (t or "").strip().lower()
 
+    def collect_docs_columns(self) -> dict[str, list[ColumnInfo]]:
+        """
+        Return column metadata for docs rendering keyed by physical relation name.
+        Engines can override; default is empty mapping.
+        """
+        return {}
+
     # ── Seed loading hook ───────────────────────────────────────────────
     def load_seed(
         self, table: str, df: Any, schema: str | None = None
@@ -1225,9 +1222,3 @@ class BaseExecutor[TFrame](ABC):
         raise NotImplementedError(
             f"Seeding is not implemented for executor engine '{self.engine_name}'."
         )
-
-    ENGINE_NAME: str = "generic"
-
-    @property
-    def engine_name(self) -> str:
-        return getattr(self, "ENGINE_NAME", "generic")

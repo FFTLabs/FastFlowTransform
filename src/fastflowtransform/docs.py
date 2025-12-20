@@ -1,18 +1,21 @@
 # fastflowtransform/docs.py
 from __future__ import annotations
 
+import json
 import re
+import shutil
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import yaml
 from jinja2 import Environment, FileSystemLoader, TemplateNotFound, select_autoescape
 from markupsafe import Markup
-from sqlalchemy import text
 
 from fastflowtransform.core import REGISTRY, Node, relation_for
 from fastflowtransform.dag import mermaid as dag_mermaid
+from fastflowtransform.executors.base import ColumnInfo
 from fastflowtransform.lineage import (
     infer_py_lineage,
     infer_sql_lineage,
@@ -54,22 +57,18 @@ def _safe_filename(name: str) -> str:
 
 def _collect_columns(executor: Any) -> dict[str, list[ColumnInfo]]:
     """
-    Best-effort schema discovery for supported engines.
+    Best-effort schema discovery delegated to the executor.
     Returns an empty mapping if unsupported or on errors.
     """
+    fn = getattr(executor, "collect_docs_columns", None)
+    if not callable(fn):
+        return {}
     try:
-        if hasattr(executor, "spark"):
-            return _columns_spark(executor.spark)
-        if hasattr(executor, "con"):  # DuckDB
-            return _columns_duckdb(executor.con)
-        if hasattr(executor, "engine"):  # Postgres
-            return _columns_postgres(executor.engine)
-        if hasattr(executor, "session"):
-            return _columns_snowflake(executor.session)
+        res = fn()
+        return res if isinstance(res, dict) else {}
     except Exception:
         # Fail-open: no schema info, UI will simply hide the columns card.
         return {}
-    return {}
 
 
 def _read_project_yaml_docs(project_dir: Path) -> dict[str, Any]:
@@ -153,6 +152,152 @@ def _init_jinja() -> Environment:
         loader=FileSystemLoader([str(tmpl_dir)]),
         autoescape=select_autoescape(["html", "xml"]),
     )
+
+
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _html_to_text(s: str | None) -> str | None:
+    if not s:
+        return None
+    # fast + good-enough for docs descriptions
+    txt = _TAG_RE.sub("", s)
+    txt = re.sub(r"\s+", " ", txt).strip()
+    return txt or None
+
+
+def _copy_template_assets(out_dir: Path) -> None:
+    """
+    Copy packaged static assets from templates/assets -> <out_dir>/assets.
+    Safe no-op if no assets exist.
+    """
+    tmpl_dir = Path(__file__).parent / "templates"
+    src = tmpl_dir / "assets"
+    if not src.exists() or not src.is_dir():
+        return
+    dst = out_dir / "assets"
+    dst.mkdir(parents=True, exist_ok=True)
+    for p in src.rglob("*"):
+        if p.is_dir():
+            continue
+        rel = p.relative_to(src)
+        target = dst / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(p, target)
+
+
+def _project_name(proj_dir: Path | None) -> str:
+    if not proj_dir:
+        return "FastFlowTransform"
+    cfg_path = proj_dir / "project.yml"
+    try:
+        if cfg_path.exists():
+            cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+            if isinstance(cfg, dict) and cfg.get("name"):
+                return str(cfg["name"])
+    except Exception:
+        pass
+    return proj_dir.name
+
+
+def _build_spa_manifest(
+    *,
+    proj_name: str,
+    env_name: str | None,
+    with_schema: bool,
+    mermaid_src: str,
+    models: list[ModelDoc],
+    sources: list[SourceDoc],
+    macros: list[dict[str, str]],
+    used_by: dict[str, list[str]],
+    cols_by_table: dict[str, list[ColumnInfo]],
+    model_source_refs: dict[str, list[tuple[str, str]]],
+    sources_by_key: dict[tuple[str, str], SourceDoc],
+) -> dict[str, Any]:
+    def _col_to_dict(c: ColumnInfo) -> dict[str, Any]:
+        html = c.description_html
+        html_s = str(html) if html is not None else None
+        return {
+            "name": c.name,
+            "dtype": c.dtype,
+            "nullable": bool(c.nullable),
+            "description_html": c.description_html,
+            "description_text": _html_to_text(html_s),
+            "lineage": c.lineage or [],
+        }
+
+    out_models: list[dict[str, Any]] = []
+    for m in models:
+        # model -> sources used (source(), table)
+        src_keys = model_source_refs.get(m.name, []) or []
+        src_used = []
+        for k in src_keys:
+            doc = sources_by_key.get(k)
+            if not doc:
+                continue
+            src_used.append(
+                {
+                    "source_name": doc.source_name,
+                    "table_name": doc.table_name,
+                    "relation": doc.relation,
+                }
+            )
+
+        cols = []
+        if with_schema and m.relation in cols_by_table:
+            cols = [_col_to_dict(c) for c in (cols_by_table.get(m.relation) or [])]
+
+        model_desc_html = m.description_html
+        model_desc_html_s = str(model_desc_html) if model_desc_html is not None else None
+
+        out_models.append(
+            {
+                "name": m.name,
+                "kind": m.kind,
+                "path": m.path,
+                "relation": m.relation,
+                "deps": list(m.deps or []),
+                "used_by": list(used_by.get(m.name, []) or []),
+                "materialized": m.materialized,
+                "description_html": m.description_html,
+                "description_text": _html_to_text(model_desc_html_s),
+                "description_short": m.description_short,
+                "sources_used": src_used,
+                "columns": cols,
+            }
+        )
+
+    out_sources: list[dict[str, Any]] = []
+    for s in sources:
+        src_desc_html = s.description_html
+        src_desc_html_s = str(src_desc_html) if src_desc_html is not None else None
+
+        out_sources.append(
+            {
+                "source_name": s.source_name,
+                "table_name": s.table_name,
+                "relation": s.relation,
+                "description_html": s.description_html,
+                "description_text": _html_to_text(src_desc_html_s),
+                "loaded_at_field": s.loaded_at_field,
+                "warn_after_minutes": s.warn_after_minutes,
+                "error_after_minutes": s.error_after_minutes,
+                "consumers": list(s.consumers or []),
+            }
+        )
+
+    return {
+        "project": {
+            "name": proj_name,
+            "generated_at": datetime.now(UTC).isoformat(),
+            "env": env_name,
+            "with_schema": bool(with_schema),
+        },
+        "dag": {"mermaid": mermaid_src},
+        "models": out_models,
+        "sources": out_sources,
+        "macros": macros,
+    }
 
 
 def _get_project_dir() -> Path | None:
@@ -509,8 +654,11 @@ def render_site(
     executor: Any | None = None,
     *,
     with_schema: bool = True,
+    spa: bool = True,
+    legacy_pages: bool = False,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
+    _copy_template_assets(out_dir)
     env = _init_jinja()
     source_consumers, model_source_refs = _scan_source_refs(nodes)
 
@@ -535,141 +683,76 @@ def render_site(
     _apply_descriptions_to_models(models, docs_meta, cols_by_table, with_schema=with_schema)
     _infer_and_attach_lineage(models, executor, docs_meta, cols_by_table, with_schema=with_schema)
 
-    _render_index(
-        env,
-        out_dir,
-        mermaid_src=Markup(mermaid_src),
-        models=models,
-        sources=sources,
-        materialization_legend=mat_legend,
-        macros=macro_list,
-    )
-
     used_by = _reverse_deps(nodes)
-    _render_model_pages(
-        env,
-        out_dir,
-        models=models,
-        used_by=used_by,
-        cols_by_table=cols_by_table,
-        materialization_legend=mat_legend,
-        macros=macro_list,
-        model_sources=model_source_refs,
-        sources_index=sources_by_key,
-    )
 
-    _render_source_pages(env, out_dir, sources)
+    if spa:
+        _copy_template_assets(out_dir)
+        proj_name = _project_name(proj_dir)
+        env_name = getattr(REGISTRY, "active_engine", None)  # best-effort, not perfect
+        manifest = _build_spa_manifest(
+            proj_name=proj_name,
+            env_name=env_name,
+            with_schema=with_schema,
+            mermaid_src=str(mermaid_src),
+            models=models,
+            sources=sources,
+            macros=macro_list,
+            used_by=used_by,
+            cols_by_table=cols_by_table,
+            model_source_refs=model_source_refs,
+            sources_by_key=sources_by_key,
+        )
+        assets_dir = out_dir / "assets"
+        assets_dir.mkdir(parents=True, exist_ok=True)
+        (assets_dir / "docs_manifest.json").write_text(
+            json.dumps(manifest, indent=2), encoding="utf-8"
+        )
 
+        # SPA shell (index.html.j2)
+        _render_index(
+            env,
+            out_dir,
+            project_name=proj_name,
+            manifest_path="assets/docs_manifest.json",
+        )
 
-@dataclass
-class ColumnInfo:
-    name: str
-    dtype: str
-    nullable: bool
-    description_html: str | None = None
-    lineage: list[dict[str, Any]] | None = None
-
-
-def _columns_duckdb(con: Any) -> dict[str, list[ColumnInfo]]:
-    rows = con.execute("""
-      select table_name, column_name, data_type, is_nullable
-      from information_schema.columns
-      where table_schema in ('main','temp')
-      order by table_name, ordinal_position
-    """).fetchall()
-    out: dict[str, list[ColumnInfo]] = {}
-    for t, c, dt, null in rows:
-        out.setdefault(t, []).append(ColumnInfo(c, str(dt), null in (True, "YES", "Yes")))
-    return out
-
-
-def _columns_postgres(engine: Any) -> dict[str, list[ColumnInfo]]:
-    with engine.begin() as conn:
-        rows = conn.execute(
-            text("""
-          select table_name, column_name, data_type, is_nullable
-          from information_schema.columns
-          where table_schema = current_schema()
-          order by table_name, ordinal_position
-        """)
-        ).fetchall()
-    out: dict[str, list[ColumnInfo]] = {}
-    for t, c, dt, null in rows:
-        out.setdefault(t, []).append(ColumnInfo(c, str(dt), null == "YES"))
-    return out
-
-
-def _columns_snowflake(session: Any) -> dict[str, list[ColumnInfo]]:
-    rows = session.sql("""
-      select table_name, column_name, data_type, is_nullable
-      from information_schema.columns
-      where table_schema = current_schema()
-      order by table_name, ordinal_position
-    """).collect()
-    out: dict[str, list[ColumnInfo]] = {}
-    for r in rows:
-        t = r["TABLE_NAME"]
-        c = r["COLUMN_NAME"]
-        dt = r["DATA_TYPE"]
-        null = r["IS_NULLABLE"]
-        out.setdefault(t, []).append(ColumnInfo(c, str(dt), null == "YES"))
-    return out
-
-
-def _columns_spark(spark: Any) -> dict[str, list[ColumnInfo]]:
-    """
-    Collect column metadata from a SparkSession (Databricks / Spark SQL).
-    Uses catalog.listTables/listColumns, available on vanilla Spark 3+.
-    """
-    try:
-        tables = list(spark.catalog.listTables())
-    except Exception:
-        return {}
-
-    out: dict[str, list[ColumnInfo]] = {}
-    seen: set[tuple[str | None, str]] = set()
-
-    def _list_columns(table_name: str, database: str | None) -> list[Any]:
-        ident = table_name if not database else f"{database}.{table_name}"
-        try:
-            return list(spark.catalog.listColumns(ident))
-        except TypeError:
-            return list(spark.catalog.listColumns(table_name, database))
-
-    for tbl in tables:
-        database = getattr(tbl, "database", None)
-        raw_name = getattr(tbl, "name", None)
-        if not raw_name:
-            continue
-        table_name = str(raw_name)
-        key = (database, table_name)
-        if key in seen:
-            continue
-        seen.add(key)
-        try:
-            cols = _list_columns(table_name, database)
-        except Exception:
-            continue
-        if not cols:
-            continue
-
-        keys: set[str] = {table_name}
-        catalog = getattr(tbl, "catalog", None)
-        if database:
-            keys.add(f"{database}.{table_name}")
-        if database and catalog:
-            keys.add(f"{catalog}.{database}.{table_name}")
-        for c in cols:
-            nullable = bool(getattr(c, "nullable", False))
-            dtype = str(getattr(c, "dataType", ""))
-            col_name = getattr(c, "name", None)
-            if not col_name:
-                continue
-            info = ColumnInfo(str(col_name), dtype, nullable)
-            for k in keys:
-                out.setdefault(k, []).append(info)
-
-    return out
+        # Optional legacy pages (useful during transition)
+        if legacy_pages:
+            _render_model_pages(
+                env,
+                out_dir,
+                models=models,
+                used_by=used_by,
+                cols_by_table=cols_by_table,
+                materialization_legend=mat_legend,
+                macros=macro_list,
+                model_sources=model_source_refs,
+                sources_index=sources_by_key,
+            )
+            _render_source_pages(env, out_dir, sources)
+    else:
+        # Legacy behavior
+        _render_index(
+            env,
+            out_dir,
+            mermaid_src=Markup(mermaid_src),
+            models=models,
+            sources=sources,
+            materialization_legend=mat_legend,
+            macros=macro_list,
+        )
+        _render_model_pages(
+            env,
+            out_dir,
+            models=models,
+            used_by=used_by,
+            cols_by_table=cols_by_table,
+            materialization_legend=mat_legend,
+            macros=macro_list,
+            model_sources=model_source_refs,
+            sources_index=sources_by_key,
+        )
+        _render_source_pages(env, out_dir, sources)
 
 
 def read_docs_metadata(project_dir: Path) -> dict[str, Any]:

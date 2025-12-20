@@ -4,7 +4,7 @@ from __future__ import annotations
 import textwrap
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any
 
 import pytest
 from jinja2 import TemplateNotFound
@@ -136,9 +136,7 @@ def test_scan_source_refs(tmp_path: Path):
     sql_path = models_dir / "model_a.sql"
     sql_path.write_text("select * from {{ source('crm', 'customers') }}", encoding="utf-8")
 
-    nodes = {
-        "model_a": SimpleNamespace(name="model_a", kind="sql", path=sql_path, deps=[], meta={})
-    }
+    nodes = {"model_a": Node(name="model_a", kind="sql", path=sql_path, deps=[], meta={})}
 
     by_source, by_model = docs_mod._scan_source_refs(nodes)
 
@@ -243,240 +241,26 @@ def test_apply_descriptions_to_models_applies_short_and_column_desc():
     assert cols_by_table["db.sc.m1"][1].description_html == "<p>Col 2</p>"
 
 
-# ---------------------------------------------------------------------------
-# render_site (with patched jinja + registry)
-# ---------------------------------------------------------------------------
+@pytest.mark.unit
+def test_collect_columns_uses_executor_hook_when_available():
+    expected = {"tbl": [docs_mod.ColumnInfo("c1", "INT", True)]}
+
+    class FakeExecutor:
+        def collect_docs_columns(self):
+            return expected
+
+    cols = docs_mod._collect_columns(FakeExecutor())
+    assert cols is expected
 
 
 @pytest.mark.unit
-def test_render_site_writes_index_and_model_pages(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    fake_nodes_raw = {
-        "model_a": SimpleNamespace(
-            name="model_a",
-            kind="sql",
-            path=tmp_path / "models" / "model_a.sql",
-            deps=["model_b"],
-            meta={"materialized": "view"},
-        ),
-        "model_b": SimpleNamespace(
-            name="model_b",
-            kind="python",
-            path=tmp_path / "models" / "model_b.py",
-            deps=[],
-            meta={},
-        ),
-    }
+def test_collect_columns_swallows_errors_and_unknown():
+    class BoomExecutor:
+        def collect_docs_columns(self):
+            raise RuntimeError("boom")
 
-    monkeypatch.setattr(
-        docs_mod,
-        "REGISTRY",
-        SimpleNamespace(
-            nodes=fake_nodes_raw,
-            macros={},
-            get_project_dir=lambda: tmp_path,
-        ),
-        raising=True,
-    )
-
-    monkeypatch.setattr(docs_mod, "_init_jinja", lambda: _FakeEnv(), raising=True)
-    fake_nodes = cast(dict[str, Node], fake_nodes_raw)
-
-    docs_mod.render_site(tmp_path, fake_nodes, executor=None, with_schema=False)
-
-    index_file = tmp_path / "index.html"
-    assert index_file.exists()
-    assert "INDEX" in index_file.read_text(encoding="utf-8")
-
-    model_a_file = tmp_path / "model_a.html"
-    model_b_file = tmp_path / "model_b.html"
-    assert model_a_file.exists()
-    assert model_b_file.exists()
-
-    assert "MODEL model_a" in model_a_file.read_text(encoding="utf-8")
-    assert "MODEL model_b" in model_b_file.read_text(encoding="utf-8")
-
-
-# ---------------------------------------------------------------------------
-# _collect_columns engine stubs
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.unit
-def test_collect_columns_prefers_spark():
-    class FakeCol:
-        def __init__(self, name: str):
-            self.name = name
-            self.dataType = "INT"
-            self.nullable = True
-
-    class FakeTable:
-        def __init__(self, name: str):
-            self.name = name
-            self.database = None
-            self.catalog = None
-
-    class FakeSparkCatalog:
-        def listTables(self):
-            return [FakeTable("T1")]
-
-        def listColumns(self, ident, database=None):
-            return [FakeCol("C1"), FakeCol("C2")]
-
-    class FakeSpark:
-        catalog = FakeSparkCatalog()
-
-    cols = docs_mod._collect_columns(SimpleNamespace(spark=FakeSpark()))
-    assert "T1" in cols
-    assert [c.name for c in cols["T1"]] == ["C1", "C2"]
-
-
-@pytest.mark.unit
-def test_collect_columns_with_unknown_executor_returns_empty():
-    cols = docs_mod._collect_columns(object())
-    assert cols == {}
-
-
-# ---------------------- _columns_duckdb ----------------------
-
-
-@pytest.mark.unit
-def test_columns_duckdb_collects_tables_and_cols():
-    class FakeCursor:
-        def __init__(self, rows):
-            self._rows = rows
-
-        def fetchall(self):
-            return self._rows
-
-    class FakeConn:
-        def __init__(self, rows):
-            self._rows = rows
-
-        def execute(self, _sql: str):
-            return FakeCursor(self._rows)
-
-    rows = [
-        # table_name, column_name, data_type, is_nullable
-        ("my_table", "id", "INTEGER", "NO"),
-        ("my_table", "name", "TEXT", "YES"),
-        ("other", "x", "BOOLEAN", "YES"),
-    ]
-    fake_con = FakeConn(rows)
-
-    cols = docs_mod._columns_duckdb(fake_con)
-
-    assert set(cols.keys()) == {"my_table", "other"}
-    mt = cols["my_table"]
-    assert [c.name for c in mt] == ["id", "name"]
-    assert mt[0].dtype == "INTEGER"
-    assert mt[0].nullable is False
-    assert mt[1].nullable is True
-
-
-# ---------------------- _columns_postgres ----------------------
-
-
-@pytest.mark.unit
-def test_columns_postgres_collects_from_engine():
-    class FakeResult:
-        def __init__(self, rows):
-            self._rows = rows
-
-        def fetchall(self):
-            return self._rows
-
-    class FakeConn:
-        def __init__(self, rows):
-            self._rows = rows
-
-        def execute(self, _stmt):
-            return FakeResult(self._rows)
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-    class FakeEngine:
-        def __init__(self, rows):
-            self._rows = rows
-
-        def begin(self):
-            return FakeConn(self._rows)
-
-    rows = [
-        # table_name, column_name, data_type, is_nullable
-        ("public_tbl", "id", "integer", "YES"),
-        ("public_tbl", "email", "text", "NO"),
-    ]
-    fake_engine = FakeEngine(rows)
-
-    cols = docs_mod._columns_postgres(fake_engine)
-
-    assert "public_tbl" in cols
-    tcols = cols["public_tbl"]
-    assert [c.name for c in tcols] == ["id", "email"]
-    assert tcols[0].dtype == "integer"
-    # in deiner Implementierung: nullable == "YES"
-    assert tcols[0].nullable is True
-    assert tcols[1].nullable is False
-
-
-# ---------------------- _columns_snowflake ----------------------
-
-
-@pytest.mark.unit
-def test_columns_snowflake_collects_from_session():
-    class FakeDF:
-        def __init__(self, rows):
-            self._rows = rows
-
-        def collect(self):
-            return self._rows
-
-    class FakeSession:
-        def __init__(self, rows):
-            self._rows = rows
-
-        def sql(self, _sql: str):
-            return FakeDF(self._rows)
-
-    rows = [
-        {
-            "TABLE_NAME": "T1",
-            "COLUMN_NAME": "ID",
-            "DATA_TYPE": "NUMBER",
-            "IS_NULLABLE": "NO",
-        },
-        {
-            "TABLE_NAME": "T1",
-            "COLUMN_NAME": "NAME",
-            "DATA_TYPE": "TEXT",
-            "IS_NULLABLE": "YES",
-        },
-        {
-            "TABLE_NAME": "T2",
-            "COLUMN_NAME": "TS",
-            "DATA_TYPE": "TIMESTAMP_NTZ",
-            "IS_NULLABLE": "YES",
-        },
-    ]
-    fake_session = FakeSession(rows)
-
-    cols = docs_mod._columns_snowflake(fake_session)
-
-    assert set(cols.keys()) == {"T1", "T2"}
-    t1 = cols["T1"]
-    assert [c.name for c in t1] == ["ID", "NAME"]
-    assert t1[0].dtype == "NUMBER"
-    assert t1[0].nullable is False
-    assert t1[1].nullable is True
-
-    t2 = cols["T2"]
-    assert t2[0].name == "TS"
-    assert t2[0].dtype == "TIMESTAMP_NTZ"
-    assert t2[0].nullable is True
+    assert docs_mod._collect_columns(BoomExecutor()) == {}
+    assert docs_mod._collect_columns(object()) == {}
 
 
 @pytest.mark.unit

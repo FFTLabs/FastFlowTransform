@@ -10,7 +10,6 @@ import pandas as pd
 from fastflowtransform.contracts.runtime.bigquery import BigQueryRuntimeContracts
 from fastflowtransform.core import Node
 from fastflowtransform.executors.bigquery.base import BigQueryBaseExecutor
-from fastflowtransform.executors.query_stats import QueryStats
 from fastflowtransform.typing import BadRequest, Client, LoadJobConfig, NotFound, bigquery
 
 
@@ -89,15 +88,7 @@ class BigQueryExecutor(BigQueryBaseExecutor[pd.DataFrame]):
         return "pandas"
 
     def _record_dataframe_stats(self, df: pd.DataFrame, duration_ms: int) -> None:
-        rows = len(df)
-        bytes_val = int(df.memory_usage(deep=True).sum()) if rows > 0 else 0
-        self._record_query_stats(
-            QueryStats(
-                bytes_processed=bytes_val if bytes_val > 0 else None,
-                rows=rows if rows > 0 else None,
-                duration_ms=duration_ms,
-            )
-        )
+        self.runtime_query_stats.record_dataframe(df, duration_ms)
 
         # ---- Unit-test helpers (pandas) ---------------------------------------
 

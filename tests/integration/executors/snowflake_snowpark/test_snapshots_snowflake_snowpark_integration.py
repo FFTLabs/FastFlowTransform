@@ -11,7 +11,7 @@ from tests.common.snapshot_helpers import (
     patch_render_sql,
 )
 
-from fastflowtransform.executors.base import BaseExecutor
+from fastflowtransform.snapshots.runtime.base import BaseSnapshotRuntime
 
 SQL_TS_FIRST = """
 select 1 as id,
@@ -60,10 +60,10 @@ def test_snowflake_timestamp_snapshot_emits_create_table(
 
     sql = _all_sql(ex).upper()
     assert "CREATE OR REPLACE TABLE" in sql
-    assert BaseExecutor.SNAPSHOT_VALID_FROM_COL.upper() in sql
-    assert BaseExecutor.SNAPSHOT_VALID_TO_COL.upper() in sql
-    assert BaseExecutor.SNAPSHOT_IS_CURRENT_COL.upper() in sql
-    assert BaseExecutor.SNAPSHOT_UPDATED_AT_COL.upper() in sql
+    assert BaseSnapshotRuntime.SNAPSHOT_VALID_FROM_COL.upper() in sql
+    assert BaseSnapshotRuntime.SNAPSHOT_VALID_TO_COL.upper() in sql
+    assert BaseSnapshotRuntime.SNAPSHOT_IS_CURRENT_COL.upper() in sql
+    assert BaseSnapshotRuntime.SNAPSHOT_UPDATED_AT_COL.upper() in sql
     # timestamp strategy should not rely on a hash column
     # but we allow the implementation to include it if desired
 
@@ -82,7 +82,7 @@ def test_snowflake_check_snapshot_emits_hash_column(
     sql = _all_sql(ex).upper()
     # first run should create the table with a hash column in the projection
     assert "CREATE OR REPLACE TABLE" in sql
-    assert BaseExecutor.SNAPSHOT_HASH_COL.upper() in sql
+    assert BaseSnapshotRuntime.SNAPSHOT_HASH_COL.upper() in sql
 
 
 @pytest.mark.snowflake_snowpark

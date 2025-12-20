@@ -59,7 +59,11 @@ def _reset_snapshot_table(executor, node_name: str) -> None:
 
 def _read_spark(ex: DatabricksSparkExecutor, relation: str):
     physical = ex._physical_identifier(relation)
-    return ex.spark.table(physical).toPandas().sort_values(["id", ex.SNAPSHOT_VALID_FROM_COL])
+    return (
+        ex.spark.table(physical)
+        .toPandas()
+        .sort_values(["id", ex.snapshot_runtime.SNAPSHOT_VALID_FROM_COL])
+    )
 
 
 @pytest.mark.databricks_spark

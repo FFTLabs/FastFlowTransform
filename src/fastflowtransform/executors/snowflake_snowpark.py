@@ -1,8 +1,7 @@
 # src/fastflowtransform/executors/snowflake_snowpark.py
 from __future__ import annotations
 
-import json
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from contextlib import suppress
 from time import perf_counter
 from typing import Any, cast
@@ -11,27 +10,30 @@ import pandas as pd
 
 from fastflowtransform.contracts.runtime.snowflake_snowpark import SnowflakeSnowparkRuntimeContracts
 from fastflowtransform.core import Node, relation_for
-from fastflowtransform.executors._budget_runner import run_sql_with_budget
-from fastflowtransform.executors._snapshot_sql_mixin import SnapshotSqlMixin
 from fastflowtransform.executors._sql_identifier import SqlIdentifierMixin
 from fastflowtransform.executors._test_utils import make_fetchable, rows_to_tuples
-from fastflowtransform.executors.base import BaseExecutor
-from fastflowtransform.executors.budget import BudgetGuard
-from fastflowtransform.executors.query_stats import QueryStats
+from fastflowtransform.executors.base import BaseExecutor, ColumnInfo
+from fastflowtransform.executors.budget.runtime.snowflake_snowpark import (
+    SnowflakeSnowparkBudgetRuntime,
+)
+from fastflowtransform.executors.common import _q_ident
+from fastflowtransform.executors.query_stats.runtime.snowflake_snowpark import (
+    SnowflakeSnowparkQueryStatsRuntime,
+)
 from fastflowtransform.meta import ensure_meta_table, upsert_meta
+from fastflowtransform.snapshots.runtime.snowflake_snowpark import (
+    SnowflakeSnowparkSnapshotRuntime,
+)
 from fastflowtransform.typing import SNDF, SnowparkSession as Session
 
 
-class SnowflakeSnowparkExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[SNDF]):
+class SnowflakeSnowparkExecutor(SqlIdentifierMixin, BaseExecutor[SNDF]):
     ENGINE_NAME: str = "snowflake_snowpark"
     runtime_contracts: SnowflakeSnowparkRuntimeContracts
+    runtime_query_stats: SnowflakeSnowparkQueryStatsRuntime
+    runtime_budget: SnowflakeSnowparkBudgetRuntime
+    snapshot_runtime: SnowflakeSnowparkSnapshotRuntime
     """Snowflake executor operating on Snowpark DataFrames (no pandas)."""
-    _BUDGET_GUARD = BudgetGuard(
-        env_var="FF_SF_MAX_BYTES",
-        estimator_attr="_estimate_query_bytes",
-        engine_label="Snowflake",
-        what="query",
-    )
 
     def __init__(self, cfg: dict):
         # cfg: {account, user, password, warehouse, database, schema, role?}
@@ -41,7 +43,10 @@ class SnowflakeSnowparkExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecut
 
         self.allow_create_schema: bool = bool(cfg["allow_create_schema"])
         self._ensure_schema()
+        self.runtime_query_stats = SnowflakeSnowparkQueryStatsRuntime(self)
+        self.runtime_budget = SnowflakeSnowparkBudgetRuntime(self)
         self.runtime_contracts = SnowflakeSnowparkRuntimeContracts(self)
+        self.snapshot_runtime = SnowflakeSnowparkSnapshotRuntime(self)
 
     def execute_test_sql(self, stmt: Any) -> Any:
         """
@@ -70,79 +75,8 @@ class SnowflakeSnowparkExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecut
         val = row[0] if row else None
         return (float(val) if val is not None else None, sql)
 
-    # ---------- Cost estimation & central execution ----------
-
-    def _estimate_query_bytes(self, sql: str) -> int | None:
-        """
-        Best-effort Snowflake bytes estimation.
-
-        Uses `EXPLAIN USING TEXT` and tries to extract a "bytes=<n>"-style
-        metric from the textual plan. If parsing fails or Snowflake doesn't
-        expose such info, returns None and the guard is effectively disabled.
-        """
-        try:
-            body = self._selectable_body(sql)
-        except Exception:
-            body = sql
-
-        try:
-            rows = self.session.sql(f"EXPLAIN USING JSON {body}").collect()
-            if not rows:
-                return None
-
-            parts: list[str] = []
-            for r in rows:
-                try:
-                    parts.append(str(r[0]))
-                except Exception:
-                    as_dict: dict[str, Any] = getattr(r, "asDict", lambda: {})()
-                    if as_dict:
-                        parts.extend(str(v) for v in as_dict.values())
-
-            plan_text = "\n".join(parts).strip()
-            if not plan_text:
-                return None
-
-            try:
-                plan_data = json.loads(plan_text)
-            except Exception:
-                return None
-
-            bytes_val = self._extract_bytes_from_plan(plan_data)
-            if bytes_val is None or bytes_val <= 0:
-                return None
-            return bytes_val
-        except Exception:
-            # Any parsing / EXPLAIN issues → no estimate, guard skipped
-            return None
-
-    def _extract_bytes_from_plan(self, plan_data: Any) -> int | None:
-        def _to_int(value: Any) -> int | None:
-            if value is None:
-                return None
-            try:
-                return int(value)
-            except Exception:
-                return None
-
-        if isinstance(plan_data, dict):
-            global_stats = plan_data.get("GlobalStats") or plan_data.get("globalStats")
-            if isinstance(global_stats, dict):
-                candidate = _to_int(
-                    global_stats.get("bytesAssigned") or global_stats.get("bytes_assigned")
-                )
-                if candidate:
-                    return candidate
-            for val in plan_data.values():
-                bytes_val = self._extract_bytes_from_plan(val)
-                if bytes_val:
-                    return bytes_val
-        elif isinstance(plan_data, list):
-            for item in plan_data:
-                bytes_val = self._extract_bytes_from_plan(item)
-                if bytes_val:
-                    return bytes_val
-        return None
+    def _execute_sql_basic(self, sql: str) -> SNDF:
+        return self.session.sql(sql)
 
     def _execute_sql(self, sql: str) -> SNDF:
         """
@@ -155,12 +89,10 @@ class SnowflakeSnowparkExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecut
         def _exec() -> SNDF:
             return self.session.sql(sql)
 
-        return run_sql_with_budget(
-            self,
+        return self.runtime_budget.run_sql(
             sql,
-            guard=self._BUDGET_GUARD,
             exec_fn=_exec,
-            estimate_fn=self._estimate_query_bytes,
+            stats_runtime=self.runtime_query_stats,
         )
 
     def _exec_many(self, sql: str) -> None:
@@ -174,9 +106,6 @@ class SnowflakeSnowparkExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecut
             self._execute_sql(stmt).collect()
 
     # ---------- Helpers ----------
-    def _q(self, s: str) -> str:
-        return '"' + s.replace('"', '""') + '"'
-
     def _quote_identifier(self, ident: str) -> str:
         # Keep identifiers unquoted to match legacy Snowflake behaviour.
         return ident
@@ -193,9 +122,9 @@ class SnowflakeSnowparkExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecut
         # Always include database when present; Snowflake expects DB.SCHEMA.TABLE.
         return bool(catalog)
 
-    def _qualified(self, rel: str) -> str:
+    def _qualified(self, relation: str, *, quoted: bool = False) -> str:
         # DATABASE.SCHEMA.TABLE  (no quotes)
-        return self._format_identifier(rel, purpose="physical", quote=False)
+        return self._format_identifier(relation, purpose="physical", quote=quoted)
 
     def _ensure_schema(self) -> None:
         """
@@ -211,8 +140,8 @@ class SnowflakeSnowparkExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecut
             # Misconfigured; let downstream errors surface naturally.
             return
 
-        db = self._q(self.database)
-        sch = self._q(self.schema)
+        db = _q_ident(self.database)
+        sch = _q_ident(self.schema)
         with suppress(Exception):
             # Fully qualified CREATE SCHEMA is allowed in Snowflake.
             self.session.sql(f"CREATE SCHEMA IF NOT EXISTS {db}.{sch}").collect()
@@ -240,82 +169,12 @@ class SnowflakeSnowparkExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecut
         start = perf_counter()
         df.write.save_as_table(self._qualified(relation), mode="overwrite")
         duration_ms = int((perf_counter() - start) * 1000)
-        bytes_est = self._estimate_frame_bytes(df)
-        self._record_query_stats(
-            QueryStats(
-                bytes_processed=bytes_est,
-                rows=None,
-                duration_ms=duration_ms,
-            )
-        )
-
-    def _estimate_frame_bytes(self, df: SNDF) -> int | None:
-        """
-        Best-effort bytes estimate for a Snowpark DataFrame.
-
-        Strategy:
-        1) Use DataFrame.queries["queries"] (public Snowpark API) to get SQL.
-        2) Optionally fall back to df._plan.sql() if queries is missing/empty.
-        3) Run our existing _estimate_query_bytes(sql_text).
-        """
-        try:
-            sql_text = self._snowpark_df_sql(df)
-            if not isinstance(sql_text, str) or not sql_text.strip():
-                return None
-            return self._estimate_query_bytes(sql_text)
-        except Exception:
-            return None
-
-    def _snowpark_df_sql(self, df: Any) -> str | None:
-        """
-        Extract the main SQL statement for a Snowpark DataFrame.
-
-        Uses the documented public APIs:
-        - DataFrame.queries -> {"queries": [sql1, sql2, ...], "post_actions": [...]}
-        - Optionally falls back to df._plan.sql() if needed.
-        """
-        # 1) Primary source: DataFrame.queries
-        queries_dict = getattr(df, "queries", None)
-
-        if isinstance(queries_dict, dict):
-            queries = queries_dict.get("queries")
-            if isinstance(queries, list) and queries:
-                # Pick the most likely "main" query.
-                # Snowflake examples use queries['queries'][0],
-                # but we can be a bit safer and pick the longest non-empty SQL.
-                candidates = [q.strip() for q in queries if isinstance(q, str) and q.strip()]
-                if candidates:
-                    # Heuristic: longest SQL string is usually the main SELECT/CTE.
-                    return max(candidates, key=len)
-
-        # 2) Fallback: internal plan (undocumented but widely used)
-        plan = getattr(df, "_plan", None)
-        if plan is not None:
-            # Prefer simplified plan if available
-            with suppress(Exception):
-                simplify = getattr(plan, "simplify", None)
-                if callable(simplify):
-                    simplified = simplify()
-                    to_sql = getattr(simplified, "sql", None)
-                    if callable(to_sql):
-                        sql = to_sql()
-                        if isinstance(sql, str) and sql.strip():
-                            return sql.strip()
-
-            # Raw plan.sql()
-            with suppress(Exception):
-                to_sql = getattr(plan, "sql", None)
-                if callable(to_sql):
-                    sql = to_sql()
-                    if isinstance(sql, str) and sql.strip():
-                        return sql.strip()
-
-        return None
+        self.runtime_query_stats.record_dataframe(df, duration_ms)
 
     def _create_view_over_table(self, view_name: str, backing_table: str, node: Node) -> None:
         qv = self._qualified(view_name)
         qb = self._qualified(backing_table)
-        self._execute_sql(f"CREATE OR REPLACE VIEW {qv} AS SELECT * FROM {qb}").collect()
+        self._execute_sql_basic(f"CREATE OR REPLACE VIEW {qv} AS SELECT * FROM {qb}").collect()
 
     def _validate_required(
         self, node_name: str, inputs: Any, requires: dict[str, set[str]]
@@ -389,8 +248,8 @@ class SnowflakeSnowparkExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecut
 
         created_schema = False
         if target_db and target_schema and getattr(self, "allow_create_schema", False):
-            db_ident = self._q(target_db)
-            schema_ident = self._q(target_schema)
+            db_ident = _q_ident(target_db)
+            schema_ident = _q_ident(target_schema)
             try:
                 self.session.sql(f"CREATE SCHEMA IF NOT EXISTS {db_ident}.{schema_ident}").collect()
                 created_schema = True
@@ -446,7 +305,7 @@ class SnowflakeSnowparkExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecut
         return formatted
 
     def _create_or_replace_view(self, target_sql: str, select_body: str, node: Node) -> None:
-        self._execute_sql(f"CREATE OR REPLACE VIEW {target_sql} AS {select_body}").collect()
+        self._execute_sql_basic(f"CREATE OR REPLACE VIEW {target_sql} AS {select_body}").collect()
 
     def _create_or_replace_table(self, target_sql: str, select_body: str, node: Node) -> None:
         self._execute_sql(f"CREATE OR REPLACE TABLE {target_sql} AS {select_body}").collect()
@@ -456,7 +315,9 @@ class SnowflakeSnowparkExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecut
     ) -> None:
         view_id = self._qualified(view_name)
         back_id = self._qualified(backing_table)
-        self._execute_sql(f"CREATE OR REPLACE VIEW {view_id} AS SELECT * FROM {back_id}").collect()
+        self._execute_sql_basic(
+            f"CREATE OR REPLACE VIEW {view_id} AS SELECT * FROM {back_id}"
+        ).collect()
 
     def _format_test_table(self, table: str | None) -> str | None:
         # Bypass mixin qualification to avoid double-qualifying already dotted names.
@@ -481,7 +342,7 @@ class SnowflakeSnowparkExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecut
     # ── Incremental API (parity with DuckDB/PG) ──────────────────────────
     def exists_relation(self, relation: str) -> bool:
         """Check existence via information_schema.tables."""
-        db = self._q(self.database)
+        db = _q_ident(self.database)
         schema_lit = f"'{self.schema.upper()}'"
         rel_lit = f"'{relation.upper()}'"
         q = f"""
@@ -492,7 +353,7 @@ class SnowflakeSnowparkExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecut
         limit 1
         """
         try:
-            return bool(self._execute_sql(q).collect())
+            return bool(self._execute_sql_basic(q).collect())
         except Exception:
             return False
 
@@ -546,14 +407,14 @@ class SnowflakeSnowparkExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecut
         qrel = self._qualified(relation)
 
         # Use identifiers in FROM, but *string literals* in WHERE
-        db_ident = self._q(self.database)
+        db_ident = _q_ident(self.database)
         schema_lit = self.schema.replace("'", "''")
         rel_lit = relation.replace("'", "''")
 
         try:
             existing = {
                 r[0]
-                for r in self._execute_sql(
+                for r in self._execute_sql_basic(
                     f"""
                     select column_name
                     from {db_ident}.information_schema.columns
@@ -575,45 +436,27 @@ class SnowflakeSnowparkExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecut
             return
 
         # Column names are identifiers → _q is correct here
-        cols_sql = ", ".join(f"{self._q(c)} STRING" for c in to_add)
-        self._execute_sql(f"ALTER TABLE {qrel} ADD COLUMN {cols_sql}").collect()
+        cols_sql = ", ".join(f"{_q_ident(c)} STRING" for c in to_add)
+        self._execute_sql_basic(f"ALTER TABLE {qrel} ADD COLUMN {cols_sql}").collect()
 
-    # ---- Snapshot API (mixin hooks) --------------------------------------
-    def _snapshot_target_identifier(self, rel_name: str) -> str:
-        return self._qualified(rel_name)
+    # ---- Snapshot runtime delegation --------------------------------------
+    def run_snapshot_sql(self, node: Node, env: Any) -> None:
+        self.snapshot_runtime.run_snapshot_sql(node, env)
 
-    def _snapshot_current_timestamp(self) -> str:
-        return "CURRENT_TIMESTAMP()"
-
-    def _snapshot_create_keyword(self) -> str:
-        return "CREATE OR REPLACE TABLE"
-
-    def _snapshot_null_timestamp(self) -> str:
-        return "CAST(NULL AS TIMESTAMP)"
-
-    def _snapshot_null_hash(self) -> str:
-        return "CAST(NULL AS VARCHAR)"
-
-    def _snapshot_hash_expr(self, check_cols: list[str], src_alias: str) -> str:
-        concat_expr = self._snapshot_concat_expr(check_cols, src_alias)
-        return f"CAST(MD5({concat_expr}) AS VARCHAR)"
-
-    def _snapshot_cast_as_string(self, expr: str) -> str:
-        return f"CAST({expr} AS VARCHAR)"
-
-    def _snapshot_source_ref(
-        self, rel_name: str, select_body: str
-    ) -> tuple[str, Callable[[], None]]:
-        src_name = f"__ff_snapshot_src_{rel_name}".replace(".", "_")
-        src_quoted = self._q(src_name)
-        self._execute_sql(
-            f"CREATE OR REPLACE TEMPORARY VIEW {src_quoted} AS {select_body}"
-        ).collect()
-
-        def _cleanup() -> None:
-            self._execute_sql(f"DROP VIEW IF EXISTS {src_quoted}").collect()
-
-        return src_quoted, _cleanup
+    def snapshot_prune(
+        self,
+        relation: str,
+        unique_key: list[str],
+        keep_last: int,
+        *,
+        dry_run: bool = False,
+    ) -> None:
+        self.snapshot_runtime.snapshot_prune(
+            relation,
+            unique_key,
+            keep_last,
+            dry_run=dry_run,
+        )
 
     def execute_hook_sql(self, sql: str) -> None:
         """
@@ -704,6 +547,40 @@ class SnowflakeSnowparkExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecut
         with suppress(Exception):
             self.session.sql(f"DROP TABLE IF EXISTS {qualified}").collect()
 
+    def collect_docs_columns(self) -> dict[str, list[ColumnInfo]]:
+        """
+        Best-effort column metadata for docs (scoped to configured DB/schema).
+        """
+        schema_pred = (
+            f"lower(table_schema) = '{self.schema.lower()}'"
+            if self.schema
+            else "table_schema = current_schema()"
+        )
+        catalog_pred = (
+            f" AND lower(table_catalog) = '{self.database.lower()}'" if self.database else ""
+        )
+        sql = f"""
+        select table_name, column_name, data_type, is_nullable
+        from information_schema.columns
+        where {schema_pred}{catalog_pred}
+        order by table_schema, table_name, ordinal_position
+        """
+        try:
+            rows = self.session.sql(sql).collect()
+        except Exception:
+            return {}
+
+        out: dict[str, list[ColumnInfo]] = {}
+        for r in rows:
+            table = r["TABLE_NAME"]
+            col = r["COLUMN_NAME"]
+            dtype = r["DATA_TYPE"]
+            nullable = r["IS_NULLABLE"]
+            out.setdefault(table, []).append(
+                ColumnInfo(col, str(dtype), str(nullable).upper() == "YES")
+            )
+        return out
+
     def _normalize_table_parts_for_introspection(self, table: str) -> tuple[str, str, str]:
         """
         Return (database, schema, table_name) for a possibly qualified identifier.
@@ -778,7 +655,7 @@ class SnowflakeSnowparkExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecut
         """
         db, sch, tbl = self._normalize_table_parts_for_introspection(table)
 
-        db_ident = self._q(db)
+        db_ident = _q_ident(db)
         schema_lit = sch.replace("'", "''").upper()
         table_lit = tbl.replace("'", "''").upper()
 
@@ -795,7 +672,7 @@ class SnowflakeSnowparkExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecut
         order by ordinal_position
         """
 
-        rows = self._execute_sql(sql).collect()
+        rows = self._execute_sql_basic(sql).collect()
         out: dict[str, str] = {}
 
         for r in rows or []:
@@ -814,7 +691,7 @@ class SnowflakeSnowparkExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecut
         """
         db, sch, tbl = self._normalize_table_parts_for_introspection(table)
 
-        db_ident = self._q(db)
+        db_ident = _q_ident(db)
         schema_lit = sch.replace("'", "''").upper()
         table_lit = tbl.replace("'", "''").upper()
         col_lit = (column or "").replace("'", "''").upper()
@@ -832,7 +709,7 @@ class SnowflakeSnowparkExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecut
         limit 1
         """
 
-        rows = self._execute_sql(sql).collect()
+        rows = self._execute_sql_basic(sql).collect()
         if not rows:
             return None
         r = rows[0]

@@ -5,20 +5,20 @@ from collections.abc import Iterable
 from typing import Any, TypeVar
 
 from fastflowtransform.core import Node, relation_for
-from fastflowtransform.executors._budget_runner import run_sql_with_budget
-from fastflowtransform.executors._snapshot_sql_mixin import SnapshotSqlMixin
 from fastflowtransform.executors._sql_identifier import SqlIdentifierMixin
 from fastflowtransform.executors._test_utils import make_fetchable
-from fastflowtransform.executors.base import BaseExecutor
-from fastflowtransform.executors.budget import BudgetGuard
-from fastflowtransform.executors.query_stats import _TrackedQueryJob
+from fastflowtransform.executors.base import BaseExecutor, ColumnInfo
+from fastflowtransform.executors.budget.runtime.bigquery import BigQueryBudgetRuntime
+from fastflowtransform.executors.query_stats.core import _TrackedQueryJob
+from fastflowtransform.executors.query_stats.runtime.bigquery import BigQueryQueryStatsRuntime
 from fastflowtransform.meta import ensure_meta_table, upsert_meta
+from fastflowtransform.snapshots.runtime.bigquery import BigQuerySnapshotRuntime
 from fastflowtransform.typing import BadRequest, Client, NotFound, bigquery
 
 TFrame = TypeVar("TFrame")
 
 
-class BigQueryBaseExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[TFrame]):
+class BigQueryBaseExecutor(SqlIdentifierMixin, BaseExecutor[TFrame]):
     """
     Shared BigQuery executor logic (SQL, incremental, meta, DQ helpers).
 
@@ -32,12 +32,8 @@ class BigQueryBaseExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[TF
 
     # Subclasses override ENGINE_NAME ("bigquery", "bigquery_batch", ...)
     ENGINE_NAME = "bigquery_base"
-    _BUDGET_GUARD = BudgetGuard(
-        env_var="FF_BQ_MAX_BYTES",
-        estimator_attr="_estimate_query_bytes",
-        engine_label="BigQuery",
-        what="query",
-    )
+    runtime_query_stats: BigQueryQueryStatsRuntime
+    runtime_budget: BigQueryBudgetRuntime
 
     def __init__(
         self,
@@ -55,6 +51,9 @@ class BigQueryBaseExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[TF
             project=self.project,
             location=self.location,
         )
+        self.runtime_query_stats = BigQueryQueryStatsRuntime(self)
+        self.runtime_budget = BigQueryBudgetRuntime(self)
+        self.snapshot_runtime = BigQuerySnapshotRuntime(self)
 
     # ---- Identifier helpers ----
     def _bq_quote(self, value: str) -> str:
@@ -179,6 +178,19 @@ class BigQueryBaseExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[TF
         val = delay[0] if delay else None
         return (float(val) if val is not None else None, sql)
 
+    def _execute_sql_basic(self, sql: str) -> _TrackedQueryJob:
+        job_config = bigquery.QueryJobConfig()
+        if self.dataset:
+            # Let unqualified tables resolve to project.dataset.table
+            job_config.default_dataset = bigquery.DatasetReference(self.project, self.dataset)
+
+        job = self.client.query(
+            sql,
+            job_config=job_config,
+            location=self.location,
+        )
+        return self.runtime_query_stats.wrap_job(job)
+
     def _execute_sql(self, sql: str) -> _TrackedQueryJob:
         """
         Central BigQuery query runner.
@@ -188,51 +200,14 @@ class BigQueryBaseExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[TF
         """
 
         def _exec() -> _TrackedQueryJob:
-            job_config = bigquery.QueryJobConfig()
-            if self.dataset:
-                # Let unqualified tables resolve to project.dataset.table
-                job_config.default_dataset = bigquery.DatasetReference(self.project, self.dataset)
+            return self._execute_sql_basic(sql)
 
-            job = self.client.query(
-                sql,
-                job_config=job_config,
-                location=self.location,
-            )
-            return _TrackedQueryJob(job, on_complete=self._record_query_job_stats)
-
-        return run_sql_with_budget(
-            self,
+        return self.runtime_budget.run_sql(
             sql,
-            guard=self._BUDGET_GUARD,
             exec_fn=_exec,
-            estimate_fn=self._estimate_query_bytes,
+            stats_runtime=self.runtime_query_stats,
             record_stats=False,
         )
-
-    # --- Cost estimation for the shared BudgetGuard -----------------
-
-    def _estimate_query_bytes(self, sql: str) -> int | None:
-        """
-        Estimate bytes for a BigQuery SQL statement using a dry-run.
-
-        Returns the estimated bytes, or None if estimation is not possible.
-        """
-        cfg = bigquery.QueryJobConfig(
-            dry_run=True,
-            use_query_cache=False,
-        )
-        if self.dataset:
-            # Let unqualified tables resolve to project.dataset.table
-            cfg.default_dataset = bigquery.DatasetReference(self.project, self.dataset)
-
-        job = self.client.query(
-            sql,
-            job_config=cfg,
-            location=self.location,
-        )
-        # Dry-run is free; we just need the job metadata
-        job.result()
-        return int(getattr(job, "total_bytes_processed", 0) or 0)
 
     # ---- DQ test table formatting (fft test) ----
     def _format_test_table(self, table: str | None) -> str | None:
@@ -274,7 +249,7 @@ class BigQueryBaseExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[TF
             ) from e
 
     def _create_or_replace_view(self, target_sql: str, select_body: str, node: Node) -> None:
-        self._execute_sql(f"CREATE OR REPLACE VIEW {target_sql} AS {select_body}").result()
+        self._execute_sql_basic(f"CREATE OR REPLACE VIEW {target_sql} AS {select_body}").result()
 
     def _create_or_replace_table(self, target_sql: str, select_body: str, node: Node) -> None:
         self._execute_sql(f"CREATE OR REPLACE TABLE {target_sql} AS {select_body}").result()
@@ -288,30 +263,9 @@ class BigQueryBaseExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[TF
         view_id = self._qualified_identifier(view_name)
         back_id = self._qualified_identifier(backing_table)
         self._ensure_dataset()
-        self._execute_sql(f"CREATE OR REPLACE VIEW {view_id} AS SELECT * FROM {back_id}").result()
-
-    # ---- Snapshot mixin hooks ----
-    def _snapshot_prepare_target(self) -> None:
-        self._ensure_dataset()
-
-    def _snapshot_target_identifier(self, rel_name: str) -> str:
-        return self._qualified_identifier(rel_name)
-
-    def _snapshot_current_timestamp(self) -> str:
-        return "CURRENT_TIMESTAMP()"
-
-    def _snapshot_null_timestamp(self) -> str:
-        return "CAST(NULL AS TIMESTAMP)"
-
-    def _snapshot_null_hash(self) -> str:
-        return "CAST(NULL AS STRING)"
-
-    def _snapshot_hash_expr(self, check_cols: list[str], src_alias: str) -> str:
-        concat_expr = self._snapshot_concat_expr(check_cols, src_alias)
-        return f"TO_HEX(MD5({concat_expr}))"
-
-    def _snapshot_cast_as_string(self, expr: str) -> str:
-        return f"CAST({expr} AS STRING)"
+        self._execute_sql_basic(
+            f"CREATE OR REPLACE VIEW {view_id} AS SELECT * FROM {back_id}"
+        ).result()
 
     # ---- Meta hook ----
     def on_node_built(self, node: Node, relation: str, fingerprint: str) -> None:
@@ -446,7 +400,7 @@ class BigQueryBaseExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[TF
         for col in to_add:
             f = out_fields[col]
             typ = str(f.field_type) if hasattr(f, "field_type") else "STRING"
-            self._execute_sql(f"ALTER TABLE {target} ADD COLUMN {col} {typ}").result()
+            self._execute_sql_basic(f"ALTER TABLE {target} ADD COLUMN {col} {typ}").result()
 
     # ── Snapshots API (shared for pandas + BigFrames) ─────────────────────
 
@@ -455,6 +409,25 @@ class BigQueryBaseExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[TF
         Execute one SQL statement for pre/post/on_run hooks.
         """
         self._execute_sql(sql).result()
+
+    # ---- Snapshot runtime delegation (shared for pandas + BigFrames) ----
+    def run_snapshot_sql(self, node: Node, env: Any) -> None:
+        self.snapshot_runtime.run_snapshot_sql(node, env)
+
+    def snapshot_prune(
+        self,
+        relation: str,
+        unique_key: list[str],
+        keep_last: int,
+        *,
+        dry_run: bool = False,
+    ) -> None:
+        self.snapshot_runtime.snapshot_prune(
+            relation,
+            unique_key,
+            keep_last,
+            dry_run=dry_run,
+        )
 
     def _introspect_columns_metadata(
         self,
@@ -520,6 +493,36 @@ class BigQueryBaseExecutor(SqlIdentifierMixin, SnapshotSqlMixin, BaseExecutor[TF
         rows = self._introspect_columns_metadata(table, column=None)
         # keys are lowercased to match the DuckRuntimeContracts verify logic
         return {name: dtype for (name, dtype) in rows}
+
+    def collect_docs_columns(self) -> dict[str, list[ColumnInfo]]:
+        """
+        Column metadata for docs (project+dataset scoped).
+        """
+        sql = f"""
+        select table_name, column_name, data_type, is_nullable
+        from `{self.project}.{self.dataset}.INFORMATION_SCHEMA.COLUMNS`
+        order by table_name, ordinal_position
+        """
+        try:
+            job = self.client.query(
+                sql,
+                job_config=bigquery.QueryJobConfig(
+                    default_dataset=bigquery.DatasetReference(self.project, self.dataset)
+                ),
+                location=self.location,
+            )
+            rows = list(job.result())
+        except Exception:
+            return {}
+
+        out: dict[str, list[ColumnInfo]] = {}
+        for row in rows:
+            table = str(row["table_name"])
+            col = str(row["column_name"])
+            dtype = str(row["data_type"])
+            nullable = str(row["is_nullable"]).upper() == "YES"
+            out.setdefault(table, []).append(ColumnInfo(col, dtype, nullable))
+        return out
 
     def load_seed(self, table: str, df: Any, schema: str | None = None) -> tuple[bool, str, bool]:
         dataset_id = schema or self.dataset

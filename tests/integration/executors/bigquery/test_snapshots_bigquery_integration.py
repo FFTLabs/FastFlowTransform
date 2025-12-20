@@ -9,13 +9,13 @@ from tests.common.snapshot_helpers import (
 )
 
 from fastflowtransform.core import relation_for
-from fastflowtransform.executors.base import BaseExecutor
+from fastflowtransform.snapshots.runtime.base import BaseSnapshotRuntime
 
-VF_COL = BaseExecutor.SNAPSHOT_VALID_FROM_COL
-VT_COL = BaseExecutor.SNAPSHOT_VALID_TO_COL
-IS_CUR_COL = BaseExecutor.SNAPSHOT_IS_CURRENT_COL
-HASH_COL = BaseExecutor.SNAPSHOT_HASH_COL
-UPD_META_COL = BaseExecutor.SNAPSHOT_UPDATED_AT_COL
+VF_COL = BaseSnapshotRuntime.SNAPSHOT_VALID_FROM_COL
+VT_COL = BaseSnapshotRuntime.SNAPSHOT_VALID_TO_COL
+IS_CUR_COL = BaseSnapshotRuntime.SNAPSHOT_IS_CURRENT_COL
+HASH_COL = BaseSnapshotRuntime.SNAPSHOT_HASH_COL
+UPD_META_COL = BaseSnapshotRuntime.SNAPSHOT_UPDATED_AT_COL
 
 # Simple SQL bodies - they're never actually executed by a real engine,
 # we only inspect the resulting BigQuery SQL sent to the fake client.

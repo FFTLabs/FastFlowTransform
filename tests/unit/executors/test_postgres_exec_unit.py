@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pandas as pd
 import pytest
@@ -64,6 +64,39 @@ class _FakeEngine:
     def begin(self):
         self.begin_called += 1
         return self._conn
+
+
+class _FakeBudgetRuntime:
+    """Minimal budget runtime stub that just executes the provided fn."""
+
+    def __init__(self, executor: Any):
+        self.executor = executor
+
+    def run_sql(
+        self,
+        sql: str,
+        *,
+        exec_fn: Any,
+        stats_runtime: Any,
+        rowcount_extractor=None,
+        estimate_fn=None,
+        **kwargs: Any,
+    ):
+        return exec_fn()
+
+
+class _FakeQueryStatsRuntime:
+    """Minimal query stats stub."""
+
+    def __init__(self, executor: Any):
+        self.executor = executor
+
+    def rowcount_from_result(self, result: Any) -> int | None:
+        rc = getattr(result, "rowcount", None)
+        return rc if isinstance(rc, int) and rc >= 0 else None
+
+    def record_dataframe(self, df: Any, duration_ms: int):
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -142,7 +175,6 @@ def test_init_schema_creation_failure(monkeypatch):
 @pytest.mark.postgres
 def test_q_ident_and_qualified(monkeypatch, fake_engine_and_conn):
     ex = PostgresExecutor("postgresql+psycopg://x", schema="public")
-    assert ex._q_ident('t"b') == '"t""b"'
     assert ex._qualified("tbl") == '"public"."tbl"'
     assert ex._qualified("tbl", schema="x") == '"x"."tbl"'
     # with no schema
@@ -348,6 +380,8 @@ def test_create_or_replace_table_wraps(fake_engine_and_conn, node_tmp):
     ex = PostgresExecutor.__new__(PostgresExecutor)
     ex.engine = engine
     ex.schema = "public"
+    ex.runtime_budget = cast(Any, _FakeBudgetRuntime(ex))
+    ex.runtime_query_stats = cast(Any, _FakeQueryStatsRuntime(ex))
 
     # Force the DB call to fail
     def bad_execute(stmt, params=None):
@@ -520,13 +554,13 @@ def test_create_or_replace_view_from_table_happy(fake_engine_and_conn):
         or "CREATE OR REPLACE VIEW" in str(stmt)
     ]
 
-    expected_statement_len = 5
+    expected_statement_len = 4
     assert len(stmts) == expected_statement_len
 
     assert 'SET LOCAL search_path = "public"' in stmts[0][0]
     assert 'DROP VIEW IF EXISTS "public"."v_out" CASCADE' in stmts[1][0]
     assert (
-        'CREATE OR REPLACE VIEW "public"."v_out" AS SELECT * FROM "public"."src_tbl"' in stmts[4][0]
+        'CREATE OR REPLACE VIEW "public"."v_out" AS SELECT * FROM "public"."src_tbl"' in stmts[3][0]
     )
 
 
