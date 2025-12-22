@@ -220,6 +220,153 @@ function graphTransformDirection(graph, dir) {
   return { ...graph, direction: "TB", nodes, bounds };
 }
 
+function buildAdj(graph) {
+  const out = new Map();
+  const inn = new Map();
+  for (const e of (graph.edges || [])) {
+    if (!out.has(e.from)) out.set(e.from, []);
+    if (!inn.has(e.to)) inn.set(e.to, []);
+    out.get(e.from).push(e.to);
+    inn.get(e.to).push(e.from);
+  }
+  return { out, inn };
+}
+
+function bfsCollect(startId, getNeighbors, depth) {
+  const dist = new Map();
+  const q = [startId];
+  dist.set(startId, 0);
+
+  while (q.length) {
+    const id = q.shift();
+    const d = dist.get(id);
+    if (d >= depth) continue;
+
+    const nbrs = getNeighbors(id) || [];
+    for (const nb of nbrs) {
+      if (!dist.has(nb)) {
+        dist.set(nb, d + 1);
+        q.push(nb);
+      }
+    }
+  }
+  return dist; // Map(id -> distance)
+}
+
+function buildNeighborhoodGraph(fullGraph, centerId, opts) {
+  const depth = Math.max(1, Math.min(8, Number(opts?.depth || 2)));
+  const mode = (opts?.mode || "both").toLowerCase(); // "up" | "down" | "both"
+
+  const nodeById = new Map((fullGraph.nodes || []).map(n => [n.id, n]));
+  if (!nodeById.has(centerId)) return { nodes: [], edges: [], bounds: { minx:0,miny:0,maxx:0,maxy:0,width:0,height:0 }, direction:"LR" };
+
+  const { out, inn } = buildAdj(fullGraph);
+
+  const upDist = (mode === "down") ? new Map([[centerId, 0]])
+    : bfsCollect(centerId, (id) => inn.get(id), depth);
+
+  const downDist = (mode === "up") ? new Map([[centerId, 0]])
+    : bfsCollect(centerId, (id) => out.get(id), depth);
+
+  // Collect included ids
+  const ids = new Set([centerId]);
+  for (const [id] of upDist) ids.add(id);
+  for (const [id] of downDist) ids.add(id);
+
+  // Build nodes (copy w/h from fullGraph)
+  const nodes = [...ids].map(id => {
+    const n = nodeById.get(id);
+    return { ...n, x: 0, y: 0 }; // x/y will be recomputed
+  });
+
+  // Keep only edges fully inside
+  const idSet = new Set(ids);
+  const edges = (fullGraph.edges || []).filter(e => idSet.has(e.from) && idSet.has(e.to));
+
+  // Assign layers: upstream negative, downstream positive
+  const layer = new Map();
+  layer.set(centerId, 0);
+  for (const [id, d] of upDist) {
+    if (id === centerId) continue;
+    layer.set(id, -d);
+  }
+  for (const [id, d] of downDist) {
+    if (id === centerId) continue;
+    // if something is both up and down (cycle), keep the smaller magnitude, prefer downstream for ties
+    if (!layer.has(id) || Math.abs(d) < Math.abs(layer.get(id))) layer.set(id, d);
+    else if (Math.abs(d) === Math.abs(layer.get(id)) && layer.get(id) < 0) layer.set(id, d);
+  }
+
+  // Group by layer
+  const byLayer = new Map();
+  for (const n of nodes) {
+    const L = layer.get(n.id) ?? 0;
+    if (!byLayer.has(L)) byLayer.set(L, []);
+    byLayer.get(L).push(n);
+  }
+  const layers = [...byLayer.keys()].sort((a,b)=>a-b);
+
+  // Order within each layer: use original rank/x/y as a stable hint
+  for (const L of layers) {
+    byLayer.get(L).sort((a,b) => (a.rank ?? 0) - (b.rank ?? 0) || (a.y ?? 0) - (b.y ?? 0) || (a.x ?? 0) - (b.x ?? 0));
+  }
+
+  // Layout parameters
+  const PAD = 20;
+  const GAP_Y = 18;
+  const GAP_X = 70;
+
+  // Column widths per layer
+  const colW = new Map();
+  for (const L of layers) {
+    let mw = 0;
+    for (const n of byLayer.get(L)) mw = Math.max(mw, Number(n.w || 0));
+    colW.set(L, mw);
+  }
+
+  // X positions by layer with variable column widths
+  const xPos = new Map();
+  let x = PAD;
+  for (const L of layers) {
+    xPos.set(L, x);
+    x += colW.get(L) + GAP_X;
+  }
+
+  // Y packing per column; then vertically center columns to the tallest column
+  const colH = new Map();
+  for (const L of layers) {
+    const col = byLayer.get(L);
+    let h = 0;
+    for (const n of col) h += Number(n.h || 0);
+    if (col.length > 1) h += GAP_Y * (col.length - 1);
+    colH.set(L, h);
+  }
+  const maxColH = Math.max(...layers.map(L => colH.get(L) || 0), 0);
+
+  for (const L of layers) {
+    const col = byLayer.get(L);
+    const startY = PAD + Math.max(0, (maxColH - (colH.get(L) || 0)) / 2);
+    let y = startY;
+    for (const n of col) {
+      n.x = xPos.get(L);
+      n.y = y;
+      y += Number(n.h || 0) + GAP_Y;
+    }
+  }
+
+  // Bounds
+  let minx = Infinity, miny = Infinity, maxx = -Infinity, maxy = -Infinity;
+  for (const n of nodes) {
+    minx = Math.min(minx, n.x);
+    miny = Math.min(miny, n.y);
+    maxx = Math.max(maxx, n.x + n.w);
+    maxy = Math.max(maxy, n.y + n.h);
+  }
+  const bounds = { minx, miny, maxx, maxy, width: (maxx - minx + PAD), height: (maxy - miny + PAD) };
+
+  return { ...fullGraph, nodes, edges, bounds, direction: "LR" };
+}
+
 function renderHome(state) {
   const { manifest } = state;
   const graph = manifest.dag?.graph;
@@ -234,14 +381,13 @@ function renderHome(state) {
     }, label);
 
   const depthPill = el("span", { class: "pill" }, `Depth ${state.graphUI.depth}`);
-
   const depthSlider = el("input", {
     type: "range", min: "1", max: "8",
     value: String(state.graphUI.depth),
     oninput: (e) => {
       state.graphUI.depth = Number(e.target.value || 2);
       depthPill.textContent = `Depth ${state.graphUI.depth}`;
-      state._graphCtl?.refresh?.();
+      rerenderMini();
     }
   });
 
@@ -263,14 +409,14 @@ function renderHome(state) {
 
     state.graphUI.dir = dir;
 
-    // ✅ update segmented control UI
+    // update segmented control UI
     lrBtn.classList.toggle("active", dir === "LR");
     tbBtn.classList.toggle("active", dir === "TB");
     dirPill.textContent = dir === "TB" ? "Top → Bottom" : "Left → Right";
 
-    // ✅ remount graph
+    // remount graph
     const g = graphTransformDirection(state.manifest.dag.graph, dir);
-    state._graphCtl = mountGraph(state, graphHost, g, { miniHost });
+    state._graphCtl = mountGraph(state, graphHost, g, { miniHost, showMini: true });
   }
 
   lrBtn.onclick = () => setDir("LR");
@@ -315,7 +461,7 @@ function renderHome(state) {
 
   queueMicrotask(() => {
     const g0 = graphTransformDirection(graph, state.graphUI.dir);
-    state._graphCtl = mountGraph(state, graphHost, g0, { miniHost });
+    state._graphCtl = mountGraph(state, graphHost, g0, { miniHost, showMini: true });
 
     const r = parseRoute();
     if (r.route === "home" && r.focus) {
@@ -381,6 +527,68 @@ function renderModelPanel(state, m, tab, colFromRoute) {
     const sourcesUsed = (m.sources_used || []).map(s =>
       el("a", { href: `#/source/${escapeHashPart(s.source_name)}/${escapeHashPart(s.table_name)}` }, `${s.source_name}.${s.table_name}`)
     );
+    const modelId = m.name;
+
+    // --- Neighborhood mini-graph (MODEL PAGE) ---
+    state.modelMini = state.modelMini || { mode: "both", depth: 2 };
+
+    const miniGraphHost = el("div", { class: "miniGraphHost" });
+    let miniCtl = null;
+
+    const depthPill = el("span", { class: "pill" }, `Depth ${state.modelMini.depth}`);
+    const depthSlider = el("input", {
+      type: "range", min: "1", max: "6",
+      value: String(state.modelMini.depth),
+      oninput: (e) => {
+        state.modelMini.depth = Number(e.target.value || 2);
+        depthPill.textContent = `Depth ${state.modelMini.depth}`;
+        rerenderMini();
+      }
+    });
+
+    const miniModeTabs = el("div", { class: "tabs" },
+      el("button", { class: `tab ${state.modelMini.mode==="up"?"active":""}`,   onclick:()=>{ state.modelMini.mode="up";   syncMiniTabs(); rerenderMini(); } }, "Upstream"),
+      el("button", { class: `tab ${state.modelMini.mode==="down"?"active":""}`, onclick:()=>{ state.modelMini.mode="down"; syncMiniTabs(); rerenderMini(); } }, "Downstream"),
+      el("button", { class: `tab ${state.modelMini.mode==="both"?"active":""}`, onclick:()=>{ state.modelMini.mode="both"; syncMiniTabs(); rerenderMini(); } }, "Both"),
+    );
+
+    function syncMiniTabs() {
+      const btns = miniModeTabs.querySelectorAll(".tab");
+      btns.forEach(b => b.classList.remove("active"));
+      const idx = state.modelMini.mode === "up" ? 0 : state.modelMini.mode === "down" ? 1 : 2;
+      btns[idx]?.classList.add("active");
+    }
+
+    function rerenderMini() {
+      miniGraphHost.textContent = "";
+      const centerNode = (state.manifest.dag?.graph?.nodes || [])
+        .find(n => n.kind === "model" && n.name === m.name);
+
+      const centerId = centerNode?.id || `m:${m.name}`;
+
+      const g = buildNeighborhoodGraph(state.manifest.dag.graph, centerId, state.modelMini);
+      miniCtl = mountGraph(state, miniGraphHost, g, { showMini: false, nodeClick: "navigate" });
+      miniCtl?.fit?.();
+    }
+
+    const miniPanel = el("div", { class: "card" },
+      el("div", { class: "dagHeader" },
+        el("div", { class: "dagHeaderLeft" },
+          el("div", { class: "dagTitleRow" }, el("h3", {}, "Neighborhood")),
+          el("p", { class: "dagSubtle" }, "Drag to pan • wheel to zoom • click nodes to open")
+        ),
+        el("div", { class: "dagHeaderRight" },
+          el("div", { class: "dagToolsRow" },
+            miniModeTabs,
+            el("div", { class: "dagDepth" }, depthPill, depthSlider),
+            el("button", { class: "btnTiny", onclick: () => miniCtl?.fit?.() }, "Fit"),
+          )
+        )
+      ),
+      miniGraphHost
+    );
+
+    queueMicrotask(rerenderMini);
 
     return el("div", { class: "grid" },
       el("div", { class: "card" },
@@ -394,6 +602,7 @@ function renderModelPanel(state, m, tab, colFromRoute) {
           el("div", { class: "k" }, "Sources"), el("div", {}, sourcesUsed.length ? joinInline(sourcesUsed) : el("span", { class: "empty" }, "—")),
         )
       ),
+      miniPanel,
       m.description_html
         ? el("div", { class: "card" }, el("h3", {}, "Description"), el("div", { class: "desc", html: m.description_html }))
         : el("div", { class: "card" }, el("h3", {}, "Description"), el("p", { class: "empty" }, "No description."))
@@ -1043,7 +1252,7 @@ function pathForEdgeTB(a, b) {
 }
 
 function mountGraph(state, host, graph, opts = {}) {
-  const miniHost = opts.miniHost || null;
+  const { miniHost = null, showMini = true, nodeClick = "pin" } = opts;
 
   host.textContent = "";
   if (!graph || !graph.nodes || !graph.nodes.length) {
@@ -1249,18 +1458,9 @@ function mountGraph(state, host, graph, opts = {}) {
       }
     };
 
-    // g.addEventListener("click", (ev) => {
-    //   if (ev.shiftKey) {
-    //     ev.preventDefault();
-    //     ev.stopPropagation();
-    //     state.graphUI.pinned = n.id;
-    //     applyHighlight();
-    //     return;
-    //   }
-    //   go(ev); // existing navigate behavior
-    // });
-
     g.addEventListener("click", (ev) => {
+      if (nodeClick === "navigate") return go(ev);
+
       // Ctrl/Cmd click keeps the old "navigate" behavior
       if (ev.ctrlKey || ev.metaKey) return go(ev);
 
@@ -1384,7 +1584,7 @@ function mountGraph(state, host, graph, opts = {}) {
   host.appendChild(svg);
   queueMicrotask(() => fit());
 
-  if (miniHost) {
+  if (showMini && miniHost) {
     miniHost.textContent = "";
     miniSvg = svgEl("svg", { class: "miniSvg" });
     // miniSvg.setAttribute("preserveAspectRatio", "none");

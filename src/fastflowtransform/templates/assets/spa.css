@@ -481,3 +481,12 @@ tr.colHit{
   .dagHeaderRight{ align-items:flex-start; }
   .dagToolsRow{ justify-content:flex-start; }
 }
+
+.miniGraphHost{
+  height: 260px;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  overflow: hidden;
+  background: color-mix(in srgb, var(--card), transparent 55%);
+}
+.miniGraphHost svg{ width:100%; height:100%; display:block; }
