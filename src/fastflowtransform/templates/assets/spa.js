@@ -529,8 +529,8 @@ function modelDocsStatus(state, m) {
   return { described, withSchema: true, colDoc, colTotal, colMissing };
 }
 
-function computeDocsCoverage(state) {
-  const models = state.manifest.models || [];
+function computeDocsCoverage(state, modelsOverride) {
+  const models = modelsOverride || state.manifest.models || [];
   const withSchema = !!state.manifest.project?.with_schema;
 
   let modelsDescribed = 0;
@@ -764,6 +764,265 @@ function renderUndocumentedModelsCard(state, cov) {
 }
 
 
+// -------- Landing page (overview dashboard) helpers ---------------------
+
+function setModelFacetsAndGoHome(nextFacets, extra = {}) {
+  const { query } = parseHashWithQuery();
+  const q = new URLSearchParams(query.toString());
+  writeModelFacetsToQuery(q, nextFacets);
+
+  // Optional extra params (e.g. { home: "undoc" })
+  for (const [k, v] of Object.entries(extra || {})) {
+    if (v == null || String(v).trim() === "") q.delete(k);
+    else q.set(k, String(v));
+  }
+
+  const qs = q.toString();
+  location.hash = `#/${qs ? "?" + qs : ""}`;
+}
+
+function getModelChangeTs(m) {
+  const meta = (m && typeof m === "object") ? (m.meta || {}) : {};
+  const candidates = [
+    m.updated_at, m.modified_at, m.last_modified, m.changed_at, m.created_at,
+    meta.updated_at, meta.modified_at, meta.last_modified, meta.changed_at, meta.created_at,
+  ];
+
+  for (const v of candidates) {
+    if (v == null || v === "") continue;
+    if (typeof v === "number" && Number.isFinite(v)) {
+      // seconds vs ms
+      return v < 1e12 ? Math.floor(v * 1000) : Math.floor(v);
+    }
+    const d = new Date(v);
+    if (!Number.isNaN(d.getTime())) return d.getTime();
+  }
+  return null;
+}
+
+function fmtDateShort(ms) {
+  try {
+    return new Date(ms).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "2-digit" });
+  } catch {
+    return "";
+  }
+}
+
+function computeImpactOverview(state, models) {
+  const rows = (models || []).map(m => {
+    const deps = (m.deps || []).length;
+    const usedBy = (m.used_by || []).length;
+    const score = (usedBy + 1) * (deps + 1);
+    return {
+      name: m.name,
+      kind: m.kind,
+      materialized: m.materialized || "",
+      path: m.path || "",
+      deps,
+      usedBy,
+      score,
+    };
+  });
+
+  const topFanOut = rows
+    .slice()
+    .sort((a, b) => (b.usedBy - a.usedBy) || a.name.localeCompare(b.name))
+    .slice(0, 10);
+
+  const topCritical = rows
+    .slice()
+    .sort((a, b) => (b.score - a.score) || (b.usedBy - a.usedBy) || (b.deps - a.deps) || a.name.localeCompare(b.name))
+    .slice(0, 10);
+
+  const edges = rows.reduce((acc, r) => acc + (r.deps || 0), 0);
+
+  return { rows, topFanOut, topCritical, edges };
+}
+
+function computeRecentChangedOverview(models) {
+  const rows = (models || [])
+    .map(m => {
+      const ts = getModelChangeTs(m);
+      return ts ? { name: m.name, kind: m.kind, materialized: m.materialized || "", path: m.path || "", ts } : null;
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.ts - a.ts)
+    .slice(0, 10);
+
+  return { available: rows.length > 0, rows };
+}
+
+function renderRankList(state, rows, metricNode) {
+  const list = el("ul", { class: "docList" });
+
+  if (!rows.length) {
+    list.replaceChildren(el("li", { class: "empty" }, "—"));
+    return list;
+  }
+
+  list.replaceChildren(
+    ...rows.map(r =>
+      el("li", { class: "docRow" },
+        el("a", {
+          href: routeWithFacets(`#/model/${escapeHashPart(r.name)}`),
+          onclick: (e) => { e.preventDefault(); location.hash = routeWithFacets(`#/model/${escapeHashPart(r.name)}`); },
+          title: r.path || r.name,
+        },
+          el("div", { class: "docRowMain" },
+            el("div", { class: "docRowTitle" }, r.name),
+            r.path ? el("div", { class: "docRowSub" }, r.path) : null
+          ),
+          el("div", { class: "docRowPills" },
+            pillForKind(normalizeModelKind(r.kind)),
+            r.materialized ? el("span", { class: "pillSmall" }, r.materialized) : null,
+            metricNode(r)
+          )
+        )
+      )
+    )
+  );
+
+  return list;
+}
+
+function renderOverviewDashboardCard(state, facets, modelsSubset, cov, impact, changed) {
+  const allModels = state.manifest.models || [];
+  const totalModels = allModels.length;
+  const subsetN = (modelsSubset || []).length;
+
+  const pythonN = (modelsSubset || []).filter(m => normalizeModelKind(m.kind) === "python").length;
+
+  const filtN = facetsActiveCount(facets);
+  const filterPills = [];
+  if (filtN) {
+    const kinds = new Set((facets.kinds || []).map(k => (k || "").toLowerCase()));
+    if (!(kinds.has("sql") && kinds.has("python"))) {
+      filterPills.push(el("span", { class: "pillSmall" }, `kind:${(facets.kinds || []).join(",")}`));
+    }
+    if (facets.materialized) filterPills.push(el("span", { class: "pillSmall" }, `mat:${facets.materialized}`));
+    if (facets.pathPrefix) filterPills.push(el("span", { class: "pillSmall" }, `path:${facets.pathPrefix}`));
+  }
+
+  const links = el("div", { style: "display:flex; gap:10px; flex-wrap:wrap; margin-top:10px;" },
+    el("a", {
+      class: "btnTiny",
+      href: routeWithFacets("#/?home=undoc"),
+      onclick: (e) => { e.preventDefault(); location.hash = routeWithFacets("#/?home=undoc"); },
+    }, `Undocumented (${cov.undocumented.length})`),
+
+    el("a", {
+      class: "btnTiny",
+      href: routeWithFacets("#/?home=impact"),
+      onclick: (e) => { e.preventDefault(); location.hash = routeWithFacets("#/?home=impact"); },
+    }, "High impact"),
+
+    el("button", {
+      class: "btnTiny",
+      type: "button",
+      onclick: () => {
+        // Set facets to python-only, clearing other facet constraints.
+        setModelFacetsAndGoHome({ kinds: ["python"], materialized: "", pathPrefix: "" }, { home: "" });
+      },
+    }, `Python models (${(state.manifest.models || []).filter(m => normalizeModelKind(m.kind) === "python").length})`),
+
+    filtN
+      ? el("button", {
+          class: "btnTiny",
+          type: "button",
+          onclick: () => setModelFacetsAndGoHome({ kinds: ["sql", "python"], materialized: "", pathPrefix: "" }, { home: "" }),
+        }, "Clear filters")
+      : null
+  );
+
+  const newestLine = changed.available
+    ? (() => {
+        const r = changed.rows[0];
+        return el("div", {},
+          el("span", { class: "pillSmall" }, "Newest"),
+          " ",
+          el("span", {}, `${r.name} • ${fmtDateShort(r.ts)}`)
+        );
+      })()
+    : el("span", { class: "empty" }, "No change timestamps available in manifest.");
+
+  return el("div", { class: "card" },
+    el("div", { class: "grid2" },
+      el("div", {},
+        el("h2", {}, "Overview dashboard"),
+        el("p", { class: "empty" }, "Stats, impact hotspots, docs coverage, and quick links."),
+        filterPills.length
+          ? el("div", { class: "docPills docPillsCompact", style: "margin-top:8px;" }, ...filterPills)
+          : null,
+        links
+      ),
+      el("div", {},
+        el("h3", {}, "Stats"),
+        el("div", { class: "kv" },
+          el("div", { class: "k" }, "Models"),
+          el("div", {}, filtN ? `${subsetN}/${totalModels}` : `${subsetN}`),
+
+          el("div", { class: "k" }, "Python models"),
+          el("div", {}, String(pythonN)),
+
+          el("div", { class: "k" }, "Edges"),
+          el("div", {}, String(impact.edges)),
+
+          el("div", { class: "k" }, "Model described"),
+          el("div", {}, `${cov.modelsDescribed}/${cov.modelsTotal}`),
+
+          el("div", { class: "k" }, "Columns documented"),
+          el("div", {}, cov.withSchema ? `${cov.colsDoc}/${cov.colsTotal}` : "Schema off"),
+
+          el("div", { class: "k" }, "Undocumented"),
+          el("div", {}, `${cov.undocumented.length}/${cov.modelsTotal}`),
+
+          el("div", { class: "k" }, "Newest/changed"),
+          el("div", {}, newestLine),
+        )
+      )
+    )
+  );
+}
+
+function renderTopFanOutCard(state, modelsSubset, impact) {
+  const rows = (impact.topFanOut || []).filter(r => r.usedBy > 0);
+
+  return el("div", { class: "card", id: "fanoutModels" },
+    el("h2", {}, "Top fan-out nodes"),
+    el("p", { class: "empty" }, "Models with the most downstream consumers (direct)."),
+    renderRankList(state, rows, (r) => el("span", { class: "pillSmall" }, `used by ${r.usedBy}`))
+  );
+}
+
+function renderCriticalModelsCard(state, impact) {
+  const rows = (impact.topCritical || []).slice();
+
+  return el("div", { class: "card", id: "impactModels" },
+    el("h2", {}, "Most critical models"),
+    el("p", { class: "empty" }, "Heuristic score combining upstream deps and downstream usage."),
+    renderRankList(state, rows, (r) => el("span", { class: "pillSmall" }, `score ${r.score}`))
+  );
+}
+
+function renderRecentChangedCard(state, changed) {
+  if (!changed.available) {
+    return el("div", { class: "card", id: "changedModels" },
+      el("h2", {}, "Newest / changed"),
+      el("p", { class: "empty" }, "No per-model change timestamps were found in the manifest."),
+      el("p", { class: "empty" }, "If you add fields like updated_at / modified_at to model entries, this list will populate.")
+    );
+  }
+
+  const rows = changed.rows || [];
+  return el("div", { class: "card", id: "changedModels" },
+    el("h2", {}, "Newest / changed"),
+    el("p", { class: "empty" }, "Models sorted by last change timestamp (if provided)."),
+    renderRankList(state, rows, (r) => el("span", { class: "pillSmall" }, fmtDateShort(r.ts)))
+  );
+}
+
+
+
 function renderHome(state) {
   const { manifest } = state;
   const graph = manifest.dag?.graph;
@@ -866,13 +1125,50 @@ function renderHome(state) {
     }
   });
 
-  const cov = computeDocsCoverage(state);
+  // Dashboard data respects the current model facets (kind/materialized/path prefix).
+  const facets = currentModelFacets();
+  const allModels = manifest.models || [];
+  const modelsSubset = filterModelsWithFacets(allModels, facets);
 
+  // If the URL requests a section, set the default undoc tab.
+  const homeMode = parseHashWithQuery().query.get("home") || "";
+  if (homeMode === "undoc") {
+    state.coverageUI ||= { tab: "undoc", q: "" };
+    state.coverageUI.tab = "undoc";
+  }
+
+  const cov = computeDocsCoverage(state, modelsSubset);
+  const impact = computeImpactOverview(state, modelsSubset);
+  const changed = computeRecentChangedOverview(modelsSubset);
+
+  const dashCard = renderOverviewDashboardCard(state, facets, modelsSubset, cov, impact, changed);
   const coverageCard = renderDocsCoverageCard(state, cov);
+  const fanOutCard = renderTopFanOutCard(state, modelsSubset, impact);
+  const criticalCard = renderCriticalModelsCard(state, impact);
+  const changedCard = renderRecentChangedCard(state, changed);
   const undocCard = renderUndocumentedModelsCard(state, cov);
 
-  return el("div", { class: "grid" }, graphCard, coverageCard, undocCard);
+  const root = el("div", { class: "grid" },
+    dashCard,
+    graphCard,
+    coverageCard,
+    fanOutCard,
+    criticalCard,
+    changedCard,
+    undocCard
+  );
+
+  queueMicrotask(() => {
+    if (homeMode === "undoc") document.getElementById("undocModels")?.scrollIntoView?.({ behavior: "smooth", block: "start" });
+    if (homeMode === "impact") document.getElementById("impactModels")?.scrollIntoView?.({ behavior: "smooth", block: "start" });
+    if (homeMode === "changed") document.getElementById("changedModels")?.scrollIntoView?.({ behavior: "smooth", block: "start" });
+    if (homeMode === "fanout") document.getElementById("fanoutModels")?.scrollIntoView?.({ behavior: "smooth", block: "start" });
+  });
+
+  return root;
+
 }
+
 
 function renderModel(state, name, tabFromRoute, colFromRoute) {
   const m = state.byModel.get(name);
