@@ -500,6 +500,270 @@ function buildNeighborhoodGraph(fullGraph, centerId, opts) {
   return { ...fullGraph, nodes, edges, bounds, direction: "LR" };
 }
 
+
+function hasDocs(obj) {
+  const txt = (obj?.description_text || "").trim();
+  const html = (obj?.description_html || "").trim();
+  return !!(txt || html);
+}
+
+function isColumnDocumented(c) {
+  const txt = (c?.description_text || "").trim();
+  const html = (c?.description_html || "").trim();
+  return !!(txt || html);
+}
+
+function modelDocsStatus(state, m) {
+  const described = hasDocs(m);
+  const withSchema = !!state.manifest.project?.with_schema;
+
+  if (!withSchema) {
+    return { described, withSchema: false, colDoc: 0, colTotal: 0, colMissing: 0 };
+  }
+
+  const cols = m.columns || [];
+  const colTotal = cols.length;
+  const colDoc = cols.filter(isColumnDocumented).length;
+  const colMissing = colTotal - colDoc;
+
+  return { described, withSchema: true, colDoc, colTotal, colMissing };
+}
+
+function computeDocsCoverage(state) {
+  const models = state.manifest.models || [];
+  const withSchema = !!state.manifest.project?.with_schema;
+
+  let modelsDescribed = 0;
+  let colsTotal = 0;
+  let colsDoc = 0;
+
+  const perModel = models.map(m => {
+    const described = hasDocs(m);
+    if (described) modelsDescribed += 1;
+
+    let colTotal = 0, colDoc = 0, colMissing = 0;
+    if (withSchema) {
+      const cols = m.columns || [];
+      colTotal = cols.length;
+      colDoc = cols.filter(isColumnDocumented).length;
+      colMissing = colTotal - colDoc;
+      colsTotal += colTotal;
+      colsDoc += colDoc;
+    }
+
+    return {
+      name: m.name,
+      kind: m.kind,
+      path: m.path || "",
+      described,
+      colDoc, colTotal, colMissing,
+    };
+  });
+
+  const undocumented = perModel.filter(p => !p.described || (withSchema && p.colMissing > 0));
+  const missingModelDesc = perModel.filter(p => !p.described);
+  const missingColDocs = perModel.filter(p => withSchema && p.colMissing > 0);
+  const fullyDocumented = perModel.filter(p => p.described && (!withSchema || p.colMissing === 0));
+
+  return {
+    withSchema,
+    modelsTotal: perModel.length,
+    modelsDescribed,
+    colsTotal,
+    colsDoc,
+    perModel,
+    undocumented,
+    missingModelDesc,
+    missingColDocs,
+    fullyDocumented,
+  };
+}
+
+function renderDocsBadges(state, m, { compact = false } = {}) {
+  const st = modelDocsStatus(state, m);
+
+  const modelPill = st.described
+    ? el("span", { class: "pillSmall pillGood" }, compact ? "Model docs" : "Model described")
+    : el("span", { class: "pillSmall pillBad" }, compact ? "No model docs" : "No model docs");
+
+  let colPill = null;
+  if (!st.withSchema) {
+    colPill = el("span", { class: "pillSmall" }, compact ? "Schema off" : "Schema disabled");
+  } else if (!st.colTotal) {
+    colPill = el("span", { class: "pillSmall" }, compact ? "No cols" : "No columns found");
+  } else {
+    const ok = st.colMissing === 0;
+    colPill = el("span", { class: `pillSmall ${ok ? "pillGood" : "pillBad"}` },
+      compact ? `${st.colDoc}/${st.colTotal} cols` : `${st.colDoc}/${st.colTotal} columns documented`
+    );
+  }
+
+  const cls = compact ? "docPills docPillsCompact" : "docPills docPillsHeader";
+  return el("div", { class: cls }, modelPill, colPill);
+}
+
+function renderDocsCoverageCard(state, cov) {
+  const jumpBtn = el("button", {
+    class: "btn",
+    onclick: () => document.getElementById("undocModels")?.scrollIntoView({ behavior: "smooth", block: "start" })
+  }, "Undocumented models ↓");
+
+  const colsNode = cov.withSchema
+    ? el("span", {}, `${cov.colsDoc}/${cov.colsTotal}`)
+    : el("span", { class: "empty" }, "Schema disabled");
+
+  return el("div", { class: "card", id: "docsCoverage" },
+    el("div", { class: "grid2" },
+      el("div", {},
+        el("h2", {}, "Docs coverage"),
+        el("p", { class: "empty" }, "How complete your model + column descriptions are.")
+      ),
+      el("div", {}, jumpBtn)
+    ),
+    el("div", { class: "kv" },
+      el("div", { class: "k" }, "Models described"),
+      el("div", {}, `${cov.modelsDescribed}/${cov.modelsTotal}`),
+
+      el("div", { class: "k" }, "Columns documented"),
+      el("div", {}, colsNode),
+
+      el("div", { class: "k" }, "Undocumented models"),
+      el("div", {}, `${cov.undocumented.length}/${cov.modelsTotal}`)
+    )
+  );
+}
+
+function renderUndocumentedModelsCard(state, cov) {
+  state.coverageUI ||= { tab: "undoc", q: "" };
+  const uiState = state.coverageUI;
+
+  const countNode = el("span", { class: "colCount" }, "");
+
+  const qInput = el("input", {
+    class: "input",
+    type: "search",
+    placeholder: "Filter models… (name or path)",
+    value: uiState.q || "",
+    oninput: (e) => {
+      uiState.q = e.target.value || "";
+      renderList();
+    },
+  });
+
+  const tabs = [
+    ["undoc", "Undocumented"],
+    ["noDesc", "Missing model docs"],
+    ["missingCols", "Undocumented columns"],
+    ["fully", "Fully documented"],
+    ["all", "All models"],
+  ];
+
+  const tabBtns = new Map();
+
+  const tabRow = el("div", { class: "tabs" },
+    ...tabs.map(([id, label]) => {
+      const btn = el("button", {
+        class: `tab ${uiState.tab === id ? "active" : ""}`,
+        onclick: () => {
+          uiState.tab = id;
+          syncTabs();
+          renderList();
+          queueMicrotask(() => qInput.focus());
+        },
+      }, label);
+      tabBtns.set(id, btn);
+      return btn;
+    })
+  );
+
+  function syncTabs() {
+    for (const [id, btn] of tabBtns.entries()) {
+      btn.classList.toggle("active", uiState.tab === id);
+    }
+  }
+
+  const list = el("ul", { class: "docList" });
+
+  function baseRows() {
+    if (uiState.tab === "undoc") return cov.undocumented.slice();
+    if (uiState.tab === "noDesc") return cov.missingModelDesc.slice();
+    if (uiState.tab === "missingCols") return cov.missingColDocs.slice();
+    if (uiState.tab === "fully") return cov.fullyDocumented.slice();
+    return cov.perModel.slice();
+  }
+
+  function getRows() {
+    let rows = baseRows();
+
+    const q = (uiState.q || "").trim().toLowerCase();
+    if (q) {
+      rows = rows.filter(r =>
+        (r.name || "").toLowerCase().includes(q) ||
+        (r.path || "").toLowerCase().includes(q)
+      );
+    }
+
+    // Most "work" first: missing model docs, then missing cols, then name
+    rows.sort((a, b) => {
+      const aw = (a.described ? 0 : 100000) + (a.colMissing || 0);
+      const bw = (b.described ? 0 : 100000) + (b.colMissing || 0);
+      if (bw !== aw) return bw - aw;
+      return String(a.name).localeCompare(String(b.name));
+    });
+
+    return rows;
+  }
+
+  function rowNode(r) {
+    const pills = el("div", { class: "docRowPills" },
+      r.described
+        ? el("span", { class: "pillSmall pillGood" }, "Model described")
+        : el("span", { class: "pillSmall pillBad" }, "No model docs"),
+      cov.withSchema
+        ? (r.colTotal
+            ? el("span", { class: `pillSmall ${r.colMissing ? "pillBad" : "pillGood"}` }, `${r.colDoc}/${r.colTotal} cols`)
+            : el("span", { class: "pillSmall" }, "No cols")
+          )
+        : el("span", { class: "pillSmall" }, "Schema off"),
+    );
+
+    const main = el("div", { class: "docRowMain" },
+      el("div", { class: "docRowTitle" }, el("code", {}, r.name)),
+      r.path ? el("div", { class: "docRowSub" }, r.path) : null
+    );
+
+    return el("li", { class: "docRow" },
+      el("a", {
+        href: routeWithFacets(`#/model/${escapeHashPart(r.name)}`),
+        onclick: (e) => { e.preventDefault(); location.hash = routeWithFacets(`#/model/${escapeHashPart(r.name)}`); },
+        title: r.path || r.name,
+      }, main, pills)
+    );
+  }
+
+  function renderList() {
+    const rows = getRows();
+    countNode.textContent = `${rows.length} model${rows.length === 1 ? "" : "s"}`;
+
+    if (!rows.length) {
+      list.replaceChildren(el("li", { class: "empty" }, "No matches."));
+      return;
+    }
+    list.replaceChildren(...rows.map(rowNode));
+  }
+
+  renderList();
+
+  return el("div", { class: "card", id: "undocModels" },
+    el("h2", {}, "Undocumented models"),
+    el("p", { class: "empty" }, "Jump straight to models that need documentation."),
+    el("div", { class: "colTools" }, qInput, countNode),
+    tabRow,
+    list
+  );
+}
+
+
 function renderHome(state) {
   const { manifest } = state;
   const graph = manifest.dag?.graph;
@@ -602,7 +866,12 @@ function renderHome(state) {
     }
   });
 
-  return graphCard;
+  const cov = computeDocsCoverage(state);
+
+  const coverageCard = renderDocsCoverageCard(state, cov);
+  const undocCard = renderUndocumentedModelsCard(state, cov);
+
+  return el("div", { class: "grid" }, graphCard, coverageCard, undocCard);
 }
 
 function renderModel(state, name, tabFromRoute, colFromRoute) {
@@ -622,7 +891,8 @@ function renderModel(state, name, tabFromRoute, colFromRoute) {
     el("div", { class: "grid2" },
       el("div", {},
         el("h2", {}, m.name),
-        el("p", { class: "empty" }, m.relation ? `Relation: ${m.relation}` : "")
+        el("p", { class: "empty" }, m.relation ? `Relation: ${m.relation}` : ""),
+        renderDocsBadges(state, m)
       ),
       el("div", {},
         el("button", {
@@ -656,7 +926,7 @@ function renderModel(state, name, tabFromRoute, colFromRoute) {
 function renderModelPanel(state, m, tab, colFromRoute) {
   if (tab === "overview") {
     const deps = (m.deps || []).map(d => el("a", { href: routeWithFacets(`#/model/${escapeHashPart(d)}`) }, d));
-    const usedBy = (m.used_by || []).map(u => el("a", { href: `#/model/${escapeHashPart(u)}` }, u));
+    const usedBy = (m.used_by || []).map(u => el("a", { href: routeWithFacets(`#/model/${escapeHashPart(u)}`) }, u));
     const sourcesUsed = (m.sources_used || []).map(s =>
       el("a", { href: routeWithFacets(`#/source/${escapeHashPart(s.source_name)}/${escapeHashPart(s.table_name)}`) }, `${s.source_name}.${s.table_name}`)
     );
@@ -730,6 +1000,8 @@ function renderModelPanel(state, m, tab, colFromRoute) {
           el("div", { class: "k" }, "Kind"), el("div", {}, m.kind),
           el("div", { class: "k" }, "Materialized"), el("div", {}, m.materialized || "—"),
           el("div", { class: "k" }, "Path"), el("div", {}, el("code", {}, m.path || "—")),
+          el("div", { class: "k" }, "Model docs"), el("div", {}, modelDocsStatus(state, m).described ? el("span", { class: "pillSmall pillGood" }, "Model described") : el("span", { class: "pillSmall pillBad" }, "No model docs")),
+          el("div", { class: "k" }, "Columns docs"), el("div", {}, (() => { const st = modelDocsStatus(state, m); if (!st.withSchema) return el("span", { class: "empty" }, "Schema disabled"); if (!st.colTotal) return el("span", { class: "empty" }, "No columns found"); return el("span", { class: `pillSmall ${st.colMissing ? "pillBad" : "pillGood"}` }, `${st.colDoc}/${st.colTotal} columns documented`); })()),
           el("div", { class: "k" }, "Deps"), el("div", {}, deps.length ? joinInline(deps) : el("span", { class: "empty" }, "—")),
           el("div", { class: "k" }, "Used by"), el("div", {}, usedBy.length ? joinInline(usedBy) : el("span", { class: "empty" }, "—")),
           el("div", { class: "k" }, "Sources"), el("div", {}, sourcesUsed.length ? joinInline(sourcesUsed) : el("span", { class: "empty" }, "—")),
@@ -823,7 +1095,7 @@ function renderSource(state, sourceName, tableName) {
       el("div", { class: "grid2" },
         el("div", {}, el("h2", {}, key)),
         el("div", {},
-          el("button", { class: "btn", onclick: () => { location.hash = "#/"; } }, "← Overview")
+          el("button", { class: "btn", onclick: () => { location.hash = routeWithFacets("#/"); } }, "← Overview")
         )
       ),
       el("div", { class: "kv" },
@@ -1958,8 +2230,10 @@ async function main() {
   STORE.modelTab = `fft_docs:${projKey}:model_tab_default`;
   state.modelTabDefault = safeGet(STORE.modelTab) || "overview";
   state.STORE = STORE;
+
   // Allow replaceHashQuery() (global) to keep lastHash in sync even when we use history.replaceState.
   window.__fftLastHashKey = STORE.lastHash;
+
 
   // Persisted UI state
   state.filter = safeGet(STORE.filter) ?? "";
@@ -1977,6 +2251,7 @@ async function main() {
 
   // Initialize model facets from URL (shareable filters)
   state.modelFacets = currentModelFacets();
+
 
   toastOnce({
     key: `fft_docs_search_toast_seen:${projKey}`,
@@ -2102,33 +2377,7 @@ async function main() {
     const sel = Math.max(0, Math.min(state.search.selected || 0, results.length - 1));
 
     const q = (state.search.query || "").trim();
-    // const sub = (() => {
-    //   if (r.kind === "column") {
-    //     const parts = [
-    //       "COLUMN",
-    //       r.model || "",
-    //       r.relation ? `• ${r.relation}` : "",
-    //       r.dtype ? `• ${r.dtype}` : "",
-    //     ].filter(Boolean).join(" ");
-    //     const snip = makeSnippet(r.descText || "", q, 90);
-    //     return snip ? `${parts} • ${snip}` : parts;
-    //   }
-    //   if (r.kind === "model") {
-    //     const snip = makeSnippet((r.descText || ""), q, 90);
-    //     return snip ? `MODEL • ${r.subtitle || ""} • ${snip}` : `MODEL • ${r.subtitle || ""}`;
-    //   }
-    //   if (r.kind === "source") {
-    //     const snip = makeSnippet((r.descText || ""), q, 90);
-    //     return snip ? `SOURCE • ${r.subtitle || ""} • ${snip}` : `SOURCE • ${r.subtitle || ""}`;
-    //   }
-    //   return `${(r.kind || "").toUpperCase()} • ${r.subtitle || ""}`;
-    // })();
-
-    // const right = r.kind === "column" && r.dtype
-    //   ? el("span", { class: "pill" }, r.dtype)
-    //   : el("div", { class: "kbd" }, "↵");
-
-    const subFor = (r) => {
+    const sub = (() => {
       if (r.kind === "column") {
         const parts = [
           "COLUMN",
@@ -2148,12 +2397,11 @@ async function main() {
         return snip ? `SOURCE • ${r.subtitle || ""} • ${snip}` : `SOURCE • ${r.subtitle || ""}`;
       }
       return `${(r.kind || "").toUpperCase()} • ${r.subtitle || ""}`;
-    };
+    })();
 
-    const rightFor = (r) =>
-      (r.kind === "column" && r.dtype)
-        ? el("span", { class: "pill" }, r.dtype)
-        : el("div", { class: "kbd" }, "↵");
+    const right = r.kind === "column" && r.dtype
+      ? el("span", { class: "pill" }, r.dtype)
+      : el("div", { class: "kbd" }, "↵");
 
     state.ui.paletteList.replaceChildren(
       ...(results.length
@@ -2167,9 +2415,9 @@ async function main() {
             },
               el("div", { class: "resultMain" },
                 el("div", { class: "resultTitle" }, r.title),
-                el("div", { class: "resultSub" }, subFor(r))
+                el("div", { class: "resultSub" }, sub)
               ),
-              rightFor(r)
+              right
             )
           )
         : [el("div", { class: "result" },
@@ -2357,211 +2605,211 @@ async function main() {
   }
 
   function buildSidebar() {
-    if (ui.sidebar.root) return;
+  if (ui.sidebar.root) return;
 
-    ui.sidebar.input = el("input", {
-      class: "search",
-      type: "search",
-      placeholder: "Filter sidebar… (press /)",
-      value: state.filter || "",
-      oninput: (e) => {
-        state.filter = e.target.value || "";
-        safeSet(STORE.filter, state.filter);
-        updateSidebarLists();
-      },
-      onkeydown: (e) => {
-        if (e.key !== "Enter") return;
+  ui.sidebar.input = el("input", {
+    class: "search",
+    type: "search",
+    placeholder: "Filter sidebar… (press /)",
+    value: state.filter || "",
+    oninput: (e) => {
+      state.filter = e.target.value || "";
+      safeSet(STORE.filter, state.filter);
+      updateSidebarLists();
+    },
+    onkeydown: (e) => {
+      if (e.key !== "Enter") return;
 
-        const q = (state.filter || "").trim();
-        const total = (state.sidebarMatches.models || 0) + (state.sidebarMatches.sources || 0);
+      const q = (state.filter || "").trim();
+      const total = (state.sidebarMatches.models || 0) + (state.sidebarMatches.sources || 0);
 
-        if (!q) {
-          e.preventDefault();
-          openPalette("");
-          return;
-        }
+      if (!q) {
+        e.preventDefault();
+        openPalette("");
+        return;
+      }
 
-        if (total === 0) {
-          e.preventDefault();
-          openPalette(q);
-          return;
-        }
-      },
-    });
+      if (total === 0) {
+        e.preventDefault();
+        openPalette(q);
+        return;
+      }
+    },
+  });
 
-    // --- Facets live next to the sidebar search (not under Models) ---
-    const applyFacetsToUrl = () => {
-      replaceHashQuery((q) => writeModelFacetsToQuery(q, state.modelFacets));
-      // keep state in sync (routeWithFacets reads from URL)
-      state.modelFacets = currentModelFacets();
-    };
+  // --- Facets live next to the sidebar search (not under Models) ---
+  const applyFacetsToUrl = () => {
+    replaceHashQuery((q) => writeModelFacetsToQuery(q, state.modelFacets));
+    // keep state in sync (routeWithFacets reads from URL)
+    state.modelFacets = currentModelFacets();
+  };
 
-    const debouncedPath = debounce((val) => {
-      state.modelFacets.pathPrefix = (val || "").trim();
+  const debouncedPath = debounce((val) => {
+    state.modelFacets.pathPrefix = (val || "").trim();
+    applyFacetsToUrl();
+    updateSidebarLists();
+  }, 180);
+
+  ui.sidebar.kindSqlBtn = el("button", {
+    class: "facetChip",
+    type: "button",
+    onclick: () => {
+      const kinds = new Set(state.modelFacets.kinds || ["sql", "python"]);
+      if (kinds.has("sql")) kinds.delete("sql"); else kinds.add("sql");
+      if (kinds.size === 0) { kinds.add("sql"); kinds.add("python"); } // avoid empty selection
+      state.modelFacets.kinds = Array.from(kinds);
+
       applyFacetsToUrl();
       updateSidebarLists();
-    }, 180);
+    }
+  }, "SQL");
 
-    ui.sidebar.kindSqlBtn = el("button", {
-      class: "facetChip",
-      type: "button",
-      onclick: () => {
-        const kinds = new Set(state.modelFacets.kinds || ["sql", "python"]);
-        if (kinds.has("sql")) kinds.delete("sql"); else kinds.add("sql");
-        if (kinds.size === 0) { kinds.add("sql"); kinds.add("python"); } // avoid empty selection
-        state.modelFacets.kinds = Array.from(kinds);
+  ui.sidebar.kindPyBtn = el("button", {
+    class: "facetChip",
+    type: "button",
+    onclick: () => {
+      const kinds = new Set(state.modelFacets.kinds || ["sql", "python"]);
+      if (kinds.has("python")) kinds.delete("python"); else kinds.add("python");
+      if (kinds.size === 0) { kinds.add("sql"); kinds.add("python"); }
+      state.modelFacets.kinds = Array.from(kinds);
 
-        applyFacetsToUrl();
-        updateSidebarLists();
-      }
-    }, "SQL");
+      applyFacetsToUrl();
+      updateSidebarLists();
+    }
+  }, "Python");
 
-    ui.sidebar.kindPyBtn = el("button", {
-      class: "facetChip",
-      type: "button",
-      onclick: () => {
-        const kinds = new Set(state.modelFacets.kinds || ["sql", "python"]);
-        if (kinds.has("python")) kinds.delete("python"); else kinds.add("python");
-        if (kinds.size === 0) { kinds.add("sql"); kinds.add("python"); }
-        state.modelFacets.kinds = Array.from(kinds);
+  ui.sidebar.matSelect = el("select", {
+    class: "facetSelect",
+    onchange: (e) => {
+      state.modelFacets.materialized = normalizeMaterialized(e.target.value || "");
+      applyFacetsToUrl();
+      updateSidebarLists();
+    }
+  });
 
-        applyFacetsToUrl();
-        updateSidebarLists();
-      }
-    }, "Python");
+  ui.sidebar.pathDatalist = el("datalist", { id: "modelPathPrefixes" });
+  ui.sidebar.pathInput = el("input", {
+    class: "facetInput",
+    type: "search",
+    placeholder: "Path prefix…",
+    list: "modelPathPrefixes",
+    value: state.modelFacets.pathPrefix || "",
+    oninput: (e) => debouncedPath(e.target.value || ""),
+    onkeydown: (e) => {
+      if (e.key !== "Enter") return;
+      debouncedPath.cancel();
+      state.modelFacets.pathPrefix = (e.target.value || "").trim();
+      applyFacetsToUrl();
+      updateSidebarLists();
+    }
+  });
 
-    ui.sidebar.matSelect = el("select", {
-      class: "facetSelect",
-      onchange: (e) => {
-        state.modelFacets.materialized = normalizeMaterialized(e.target.value || "");
-        applyFacetsToUrl();
-        updateSidebarLists();
-      }
-    });
+  ui.sidebar.clearFacetsBtn = el("button", {
+    class: "facetClear",
+    type: "button",
+    onclick: () => {
+      debouncedPath.cancel();
+      state.modelFacets = { kinds: ["sql", "python"], materialized: "", pathPrefix: "" };
+      ui.sidebar.pathInput.value = "";
+      applyFacetsToUrl();
+      updateSidebarLists();
+    }
+  }, "Clear");
 
-    ui.sidebar.pathDatalist = el("datalist", { id: "modelPathPrefixes" });
-    ui.sidebar.pathInput = el("input", {
-      class: "facetInput",
-      type: "search",
-      placeholder: "Path prefix…",
-      list: "modelPathPrefixes",
-      value: state.modelFacets.pathPrefix || "",
-      oninput: (e) => debouncedPath(e.target.value || ""),
-      onkeydown: (e) => {
-        if (e.key !== "Enter") return;
-        debouncedPath.cancel();
-        state.modelFacets.pathPrefix = (e.target.value || "").trim();
-        applyFacetsToUrl();
-        updateSidebarLists();
-      }
-    });
+  ui.sidebar.facetBox = el("div", { class: "facetBox" },
+    el("div", { class: "facetRow" },
+      el("div", { class: "facetChips" }, ui.sidebar.kindSqlBtn, ui.sidebar.kindPyBtn),
+      ui.sidebar.matSelect
+    ),
+    el("div", { class: "facetRow" },
+      ui.sidebar.pathInput,
+      ui.sidebar.clearFacetsBtn
+    ),
+    ui.sidebar.pathDatalist
+  );
 
-    ui.sidebar.clearFacetsBtn = el("button", {
-      class: "facetClear",
-      type: "button",
-      onclick: () => {
-        debouncedPath.cancel();
-        state.modelFacets = { kinds: ["sql", "python"], materialized: "", pathPrefix: "" };
-        ui.sidebar.pathInput.value = "";
-        applyFacetsToUrl();
-        updateSidebarLists();
-      }
-    }, "Clear");
+  const overviewSection = el("div", { class: "section" },
+    el("div", {},
+      (ui.sidebar.overviewLink = el("a", {
+        href: routeWithFacets("#/"),
+        onclick: (e) => { e.preventDefault(); location.hash = routeWithFacets("#/"); },
+        class: "itemLink",
+        style: "display:flex; align-items:center; justify-content:space-between; padding:8px 10px; border:1px solid var(--border); border-radius:12px; text-decoration:none; color:inherit;"
+      },
+        el("span", {}, "Overview (DAG)"),
+        el("span", { class: "pill" }, "Home")
+      ))
+    )
+  );
 
-    ui.sidebar.facetBox = el("div", { class: "facetBox" },
-      el("div", { class: "facetRow" },
-        el("div", { class: "facetChips" }, ui.sidebar.kindSqlBtn, ui.sidebar.kindPyBtn),
-        ui.sidebar.matSelect
-      ),
-      el("div", { class: "facetRow" },
-        ui.sidebar.pathInput,
-        ui.sidebar.clearFacetsBtn
-      ),
-      ui.sidebar.pathDatalist
+  ui.sidebar.modelsTitle = el("div");
+  ui.sidebar.sourcesTitle = el("div");
+  ui.sidebar.macrosTitle = el("div");
+
+  ui.sidebar.modelsList = el("ul", { class: "list" });
+  ui.sidebar.sourcesList = el("ul", { class: "list" });
+  ui.sidebar.macrosList = el("ul", { class: "list" });
+
+  ui.sidebar.modelsSection = el("div", { class: "section" }, ui.sidebar.modelsTitle, ui.sidebar.modelsList);
+  ui.sidebar.sourcesSection = el("div", { class: "section" }, ui.sidebar.sourcesTitle, ui.sidebar.sourcesList);
+  ui.sidebar.macrosSection = el("div", { class: "section" }, ui.sidebar.macrosTitle, ui.sidebar.macrosList);
+
+  ui.sidebar.projectTitle = el("div");
+  const statRow = (k, v) =>
+    el("div", { class: "kvRow" },
+      el("span", { class: "k" }, k),
+      el("span", { class: "v" }, v)
     );
 
-    const overviewSection = el("div", { class: "section" },
-      el("div", {},
-        (ui.sidebar.overviewLink = el("a", {
-          href: routeWithFacets("#/"),
-          onclick: (e) => { e.preventDefault(); location.hash = routeWithFacets("#/"); },
-          class: "itemLink",
-          style: "display:flex; align-items:center; justify-content:space-between; padding:8px 10px; border:1px solid var(--border); border-radius:12px; text-decoration:none; color:inherit;"
-        },
-          el("span", {}, "Overview (DAG)"),
-          el("span", { class: "pill" }, "Home")
-        ))
-      )
-    );
+  ui.sidebar.projectBody = el("div", { class: "kvRows" },
+    statRow("Models", String((state.manifest.models || []).length)),
+    statRow("Sources", String((state.manifest.sources || []).length)),
+    statRow("Macros", String((state.manifest.macros || []).length)),
+    statRow("Schema", state.manifest.project?.with_schema ? "enabled" : "disabled"),
+    statRow("Generated", state.manifest.project?.generated_at || "—"),
+  );
 
-    ui.sidebar.modelsTitle = el("div");
-    ui.sidebar.sourcesTitle = el("div");
-    ui.sidebar.macrosTitle = el("div");
+  ui.sidebar.projectSection = el("div", { class: "section" },
+    ui.sidebar.projectTitle,
+    ui.sidebar.projectBody
+  );
 
-    ui.sidebar.modelsList = el("ul", { class: "list" });
-    ui.sidebar.sourcesList = el("ul", { class: "list" });
-    ui.sidebar.macrosList = el("ul", { class: "list" });
-
-    ui.sidebar.modelsSection = el("div", { class: "section" }, ui.sidebar.modelsTitle, ui.sidebar.modelsList);
-    ui.sidebar.sourcesSection = el("div", { class: "section" }, ui.sidebar.sourcesTitle, ui.sidebar.sourcesList);
-    ui.sidebar.macrosSection = el("div", { class: "section" }, ui.sidebar.macrosTitle, ui.sidebar.macrosList);
-
-    ui.sidebar.projectTitle = el("div");
-    const statRow = (k, v) =>
-      el("div", { class: "kvRow" },
-        el("span", { class: "k" }, k),
-        el("span", { class: "v" }, v)
-      );
-
-    ui.sidebar.projectBody = el("div", { class: "kvRows" },
-      statRow("Models", String((state.manifest.models || []).length)),
-      statRow("Sources", String((state.manifest.sources || []).length)),
-      statRow("Macros", String((state.manifest.macros || []).length)),
-      statRow("Schema", state.manifest.project?.with_schema ? "enabled" : "disabled"),
-      statRow("Generated", state.manifest.project?.generated_at || "—"),
-    );
-
-    ui.sidebar.projectSection = el("div", { class: "section" },
-      ui.sidebar.projectTitle,
-      ui.sidebar.projectBody
-    );
-
-    ui.sidebar.root = el(
+  ui.sidebar.root = el(
+    "div",
+    { class: "sidebar" },
+    el(
       "div",
-      { class: "sidebar" },
-      el(
-        "div",
-        { class: "brand" },
-        (ui.sidebar.brandLink = el("a", {
-          href: routeWithFacets("#/"),
-          style: "color:inherit; text-decoration:none;",
-          onclick: (e) => { e.preventDefault(); location.hash = routeWithFacets("#/"); }
-        }, el("h1", {}, state.manifest.project?.name || "Docs"))),
-        el("span", { class: "badge", title: `Generated: ${state.manifest.project?.generated_at || ""}` }, "SPA")
-      ),
-      el(
-        "div",
-        { class: "searchWrap" },
-        ui.sidebar.input,
-        el("span", { class: "searchKbd kbd" }, "/")
-      ),
-      ui.sidebar.facetBox,
-      el("div", { class: "searchTip" }, "Tip: Press / (or Ctrl+K) to search everything (models, sources, columns)."),
-      overviewSection,
-      ui.sidebar.projectSection,
-      ui.sidebar.modelsSection,
-      ui.sidebar.sourcesSection,
-      ui.sidebar.macrosSection,
-    );
+      { class: "brand" },
+      (ui.sidebar.brandLink = el("a", {
+        href: routeWithFacets("#/"),
+        style: "color:inherit; text-decoration:none;",
+        onclick: (e) => { e.preventDefault(); location.hash = routeWithFacets("#/"); }
+      }, el("h1", {}, state.manifest.project?.name || "Docs"))),
+      el("span", { class: "badge", title: `Generated: ${state.manifest.project?.generated_at || ""}` }, "SPA")
+    ),
+    el(
+      "div",
+      { class: "searchWrap" },
+      ui.sidebar.input,
+      el("span", { class: "searchKbd kbd" }, "/")
+    ),
+    ui.sidebar.facetBox,
+    el("div", { class: "searchTip" }, "Tip: Press / (or Ctrl+K) to search everything (models, sources, columns)."),
+    overviewSection,
+    ui.sidebar.projectSection,
+    ui.sidebar.modelsSection,
+    ui.sidebar.sourcesSection,
+    ui.sidebar.macrosSection,
+  );
 
-    ui.sidebarHost.replaceChildren(ui.sidebar.root);
+  ui.sidebarHost.replaceChildren(ui.sidebar.root);
 
-    // Turn titles into toggle headers
-    sectionHeader(ui.sidebar.modelsTitle, "models", "Models");
-    sectionHeader(ui.sidebar.sourcesTitle, "sources", "Sources");
-    sectionHeader(ui.sidebar.macrosTitle, "macros", "Macros");
-    sectionHeader(ui.sidebar.projectTitle, "project", "Project");
-  }
+  // Turn titles into toggle headers
+  sectionHeader(ui.sidebar.modelsTitle, "models", "Models");
+  sectionHeader(ui.sidebar.sourcesTitle, "sources", "Sources");
+  sectionHeader(ui.sidebar.macrosTitle, "macros", "Macros");
+  sectionHeader(ui.sidebar.projectTitle, "project", "Project");
+}
 
   function applySidebarCollapse() {
     const c = state.sidebarCollapsed || {};
@@ -2572,173 +2820,173 @@ async function main() {
   }
 
   function updateSidebarLists() {
-    // Keep facets in sync with URL in case of back/forward or manual edits
-    state.modelFacets = currentModelFacets();
+  // Keep facets in sync with URL in case of back/forward or manual edits
+  state.modelFacets = currentModelFacets();
 
-    const q = (state.filter || "").trim().toLowerCase();
-    const models = state.manifest.models || [];
-    const sources = state.manifest.sources || [];
+  const q = (state.filter || "").trim().toLowerCase();
+  const models = state.manifest.models || [];
+  const sources = state.manifest.sources || [];
 
-    const modelsAfterText = q
-      ? models.filter(m =>
-          (m.name || "").toLowerCase().includes(q) ||
-          (m.relation || "").toLowerCase().includes(q) ||
-          (m.description_short || "").toLowerCase().includes(q)
-        )
-      : models;
-
-    const sourcesAfterText = q
-      ? sources.filter(s =>
-          (`${s.source_name}.${s.table_name}`).toLowerCase().includes(q) ||
-          (s.relation || "").toLowerCase().includes(q)
-        )
-      : sources;
-
-    // Apply model facets (kinds/materialized/pathPrefix) on top of text filtering
-    const filteredModels = filterModelsWithFacets(modelsAfterText, state.modelFacets);
-    const filteredSources = sourcesAfterText;
-
-    state.sidebarMatches.models = filteredModels.length;
-    state.sidebarMatches.sources = filteredSources.length;
-
-    // ---- Facet UI: counts + selected state ----
-    const facets = state.modelFacets || { kinds: ["sql", "python"], materialized: "", pathPrefix: "" };
-
-    // counts for kind based on other facets (materialized + pathPrefix)
-    const forKindCounts = filterModelsWithFacets(modelsAfterText, { ...facets, kinds: ["sql", "python"] });
-    let sqlCount = 0, pyCount = 0;
-    for (const m of forKindCounts) {
-      if (normalizeModelKind(m.kind) === "python") pyCount++; else sqlCount++;
-    }
-
-    // counts for materialized based on other facets (kind + pathPrefix)
-    const forMatCounts = filterModelsWithFacets(modelsAfterText, { ...facets, materialized: "" });
-    const matCounts = new Map();
-    let unknownCount = 0;
-    for (const m of forMatCounts) {
-      const mm = normalizeMaterialized(m.materialized || "");
-      if (!mm) unknownCount++;
-      else matCounts.set(mm, (matCounts.get(mm) || 0) + 1);
-    }
-    const matsSorted = Array.from(matCounts.entries()).sort((a, b) => (b[1] - a[1]) || a[0].localeCompare(b[0]));
-
-    // path prefix suggestions based on other facets (kind + materialized)
-    const forPathCounts = filterModelsWithFacets(modelsAfterText, { ...facets, pathPrefix: "" });
-    const prefixCounts = new Map();
-    for (const m of forPathCounts) {
-      const p = stripModelsPrefix(m.path || "");
-      if (!p) continue;
-      const parts = p.split("/").filter(Boolean);
-
-      // suggest first segment and first two segments
-      for (const depth of [1, 2]) {
-        if (parts.length >= depth) {
-          const pref = parts.slice(0, depth).join("/") + "/";
-          prefixCounts.set(pref, (prefixCounts.get(pref) || 0) + 1);
-        }
-      }
-
-      // also include full directory if available (without file name)
-      if (parts.length > 1) {
-        const fullDir = parts.slice(0, parts.length - 1).join("/") + "/";
-        prefixCounts.set(fullDir, (prefixCounts.get(fullDir) || 0) + 1);
-      }
-    }
-    const prefixesSorted = Array.from(prefixCounts.entries())
-      .sort((a, b) => (b[1] - a[1]) || a[0].localeCompare(b[0]))
-      .slice(0, 40);
-
-    const kindsSet = new Set((facets.kinds || ["sql", "python"]).map(k => (k || "").toLowerCase()));
-    ui.sidebar.kindSqlBtn.textContent = `SQL (${sqlCount})`;
-    ui.sidebar.kindPyBtn.textContent = `Python (${pyCount})`;
-    ui.sidebar.kindSqlBtn.classList.toggle("active", kindsSet.has("sql"));
-    ui.sidebar.kindPyBtn.classList.toggle("active", kindsSet.has("python"));
-
-    // Update materialized select options (keep selection)
-    const currentMat = normalizeMaterialized(facets.materialized || "");
-    ui.sidebar.matSelect.replaceChildren(
-      el("option", { value: "" }, `Any materialization (${forMatCounts.length})`),
-      ...(unknownCount ? [el("option", { value: MAT_UNKNOWN }, `(unknown) (${unknownCount})`)] : []),
-      ...matsSorted.map(([mm, n]) => el("option", { value: mm }, `${mm} (${n})`))
-    );
-    ui.sidebar.matSelect.value = currentMat;
-
-    // Update datalist suggestions and keep input in sync if URL changed
-    ui.sidebar.pathDatalist.replaceChildren(
-      ...prefixesSorted.map(([p, n]) => el("option", { value: p }, `${p} (${n})`))
-    );
-    if ((ui.sidebar.pathInput.value || "") !== (facets.pathPrefix || "")) {
-      ui.sidebar.pathInput.value = facets.pathPrefix || "";
-    }
-
-    const activeN = facetsActiveCount(facets);
-    ui.sidebar.clearFacetsBtn.textContent = activeN ? `Clear (${activeN})` : "Clear";
-    ui.sidebar.clearFacetsBtn.disabled = activeN === 0;
-
-    // Keep "home" hrefs up-to-date for copy/open-in-new-tab
-    if (ui.sidebar.brandLink) ui.sidebar.brandLink.href = routeWithFacets("#/");
-    if (ui.sidebar.overviewLink) ui.sidebar.overviewLink.href = routeWithFacets("#/");
-
-    // ---- Sidebar lists ----
-    ui.sidebar.modelsTitle.textContent = `Models (${filteredModels.length})`;
-    ui.sidebar.sourcesTitle.textContent = `Sources (${filteredSources.length})`;
-
-    ui.sidebar.modelsList.replaceChildren(
-      ...filteredModels.map(m =>
-        el("li", { class: "item" },
-          el("a", {
-            href: routeWithFacets(`#/model/${escapeHashPart(m.name)}`),
-            onclick: (e) => { e.preventDefault(); location.hash = routeWithFacets(`#/model/${escapeHashPart(m.name)}`); },
-            title: [m.description_short || "", m.path ? `(${m.path})` : ""].filter(Boolean).join(" ") || m.name,
-          },
-            el("span", {}, m.name),
-            pillForKind(m.kind === "python" ? "python" : "sql")
-          )
-        )
+  const modelsAfterText = q
+    ? models.filter(m =>
+        (m.name || "").toLowerCase().includes(q) ||
+        (m.relation || "").toLowerCase().includes(q) ||
+        (m.description_short || "").toLowerCase().includes(q)
       )
-    );
+    : models;
 
-    ui.sidebar.sourcesList.replaceChildren(
-      ...filteredSources.map(s => {
-        const key = `${s.source_name}.${s.table_name}`;
-        const href = routeWithFacets(`#/source/${escapeHashPart(s.source_name)}/${escapeHashPart(s.table_name)}`);
-        return el("li", { class: "item" },
-          el("a", {
-            href,
-            onclick: (e) => { e.preventDefault(); location.hash = href; },
-            title: s.relation || key,
-          },
-            el("span", {}, key),
-            el("span", { class: "pill" }, (s.consumers || []).length ? `${s.consumers.length}` : "–")
-          )
-        );
-      })
-    );
-
-    const macros = state.manifest.macros || [];
-    ui.sidebar.macrosTitle.textContent = `Macros (${macros.length})`;
-    ui.sidebar.macrosList.replaceChildren(
-      ...macros.map(m =>
-        el("li", { class: "item" },
-          el("a", {
-            href: routeWithFacets("#/macros"),
-            onclick: (e) => { e.preventDefault(); location.hash = routeWithFacets("#/macros"); },
-            title: m.path || m.name,
-          },
-            el("span", {}, m.name),
-            el("span", { class: "pill" }, m.kind)
-          )
-        )
+  const sourcesAfterText = q
+    ? sources.filter(s =>
+        (`${s.source_name}.${s.table_name}`).toLowerCase().includes(q) ||
+        (s.relation || "").toLowerCase().includes(q)
       )
-    );
+    : sources;
 
-    // re-attach section headers with live counts
-    sectionHeader(ui.sidebar.modelsTitle, "models", `Models (${filteredModels.length})`);
-    sectionHeader(ui.sidebar.sourcesTitle, "sources", `Sources (${filteredSources.length})`);
-    sectionHeader(ui.sidebar.macrosTitle, "macros", `Macros (${macros.length})`);
+  // Apply model facets (kinds/materialized/pathPrefix) on top of text filtering
+  const filteredModels = filterModelsWithFacets(modelsAfterText, state.modelFacets);
+  const filteredSources = sourcesAfterText;
 
-    applySidebarCollapse();
+  state.sidebarMatches.models = filteredModels.length;
+  state.sidebarMatches.sources = filteredSources.length;
+
+  // ---- Facet UI: counts + selected state ----
+  const facets = state.modelFacets || { kinds: ["sql", "python"], materialized: "", pathPrefix: "" };
+
+  // counts for kind based on other facets (materialized + pathPrefix)
+  const forKindCounts = filterModelsWithFacets(modelsAfterText, { ...facets, kinds: ["sql", "python"] });
+  let sqlCount = 0, pyCount = 0;
+  for (const m of forKindCounts) {
+    if (normalizeModelKind(m.kind) === "python") pyCount++; else sqlCount++;
   }
+
+  // counts for materialized based on other facets (kind + pathPrefix)
+  const forMatCounts = filterModelsWithFacets(modelsAfterText, { ...facets, materialized: "" });
+  const matCounts = new Map();
+  let unknownCount = 0;
+  for (const m of forMatCounts) {
+    const mm = normalizeMaterialized(m.materialized || "");
+    if (!mm) unknownCount++;
+    else matCounts.set(mm, (matCounts.get(mm) || 0) + 1);
+  }
+  const matsSorted = Array.from(matCounts.entries()).sort((a, b) => (b[1] - a[1]) || a[0].localeCompare(b[0]));
+
+  // path prefix suggestions based on other facets (kind + materialized)
+  const forPathCounts = filterModelsWithFacets(modelsAfterText, { ...facets, pathPrefix: "" });
+  const prefixCounts = new Map();
+  for (const m of forPathCounts) {
+    const p = stripModelsPrefix(m.path || "");
+    if (!p) continue;
+    const parts = p.split("/").filter(Boolean);
+
+    // suggest first segment and first two segments
+    for (const depth of [1, 2]) {
+      if (parts.length >= depth) {
+        const pref = parts.slice(0, depth).join("/") + "/";
+        prefixCounts.set(pref, (prefixCounts.get(pref) || 0) + 1);
+      }
+    }
+
+    // also include full directory if available (without file name)
+    if (parts.length > 1) {
+      const fullDir = parts.slice(0, parts.length - 1).join("/") + "/";
+      prefixCounts.set(fullDir, (prefixCounts.get(fullDir) || 0) + 1);
+    }
+  }
+  const prefixesSorted = Array.from(prefixCounts.entries())
+    .sort((a, b) => (b[1] - a[1]) || a[0].localeCompare(b[0]))
+    .slice(0, 40);
+
+  const kindsSet = new Set((facets.kinds || ["sql", "python"]).map(k => (k || "").toLowerCase()));
+  ui.sidebar.kindSqlBtn.textContent = `SQL (${sqlCount})`;
+  ui.sidebar.kindPyBtn.textContent = `Python (${pyCount})`;
+  ui.sidebar.kindSqlBtn.classList.toggle("active", kindsSet.has("sql"));
+  ui.sidebar.kindPyBtn.classList.toggle("active", kindsSet.has("python"));
+
+  // Update materialized select options (keep selection)
+  const currentMat = normalizeMaterialized(facets.materialized || "");
+  ui.sidebar.matSelect.replaceChildren(
+    el("option", { value: "" }, `Any materialization (${forMatCounts.length})`),
+    ...(unknownCount ? [el("option", { value: MAT_UNKNOWN }, `(unknown) (${unknownCount})`)] : []),
+    ...matsSorted.map(([mm, n]) => el("option", { value: mm }, `${mm} (${n})`))
+  );
+  ui.sidebar.matSelect.value = currentMat;
+
+  // Update datalist suggestions and keep input in sync if URL changed
+  ui.sidebar.pathDatalist.replaceChildren(
+    ...prefixesSorted.map(([p, n]) => el("option", { value: p }, `${p} (${n})`))
+  );
+  if ((ui.sidebar.pathInput.value || "") !== (facets.pathPrefix || "")) {
+    ui.sidebar.pathInput.value = facets.pathPrefix || "";
+  }
+
+  const activeN = facetsActiveCount(facets);
+  ui.sidebar.clearFacetsBtn.textContent = activeN ? `Clear (${activeN})` : "Clear";
+  ui.sidebar.clearFacetsBtn.disabled = activeN === 0;
+
+  // Keep "home" hrefs up-to-date for copy/open-in-new-tab
+  if (ui.sidebar.brandLink) ui.sidebar.brandLink.href = routeWithFacets("#/");
+  if (ui.sidebar.overviewLink) ui.sidebar.overviewLink.href = routeWithFacets("#/");
+
+  // ---- Sidebar lists ----
+  ui.sidebar.modelsTitle.textContent = `Models (${filteredModels.length})`;
+  ui.sidebar.sourcesTitle.textContent = `Sources (${filteredSources.length})`;
+
+  ui.sidebar.modelsList.replaceChildren(
+    ...filteredModels.map(m =>
+      el("li", { class: "item" },
+        el("a", {
+          href: routeWithFacets(`#/model/${escapeHashPart(m.name)}`),
+          onclick: (e) => { e.preventDefault(); location.hash = routeWithFacets(`#/model/${escapeHashPart(m.name)}`); },
+          title: [m.description_short || "", m.path ? `(${m.path})` : ""].filter(Boolean).join(" ") || m.name,
+        },
+          el("span", {}, m.name),
+          pillForKind(m.kind === "python" ? "python" : "sql")
+        )
+      )
+    )
+  );
+
+  ui.sidebar.sourcesList.replaceChildren(
+    ...filteredSources.map(s => {
+      const key = `${s.source_name}.${s.table_name}`;
+      const href = routeWithFacets(`#/source/${escapeHashPart(s.source_name)}/${escapeHashPart(s.table_name)}`);
+      return el("li", { class: "item" },
+        el("a", {
+          href,
+          onclick: (e) => { e.preventDefault(); location.hash = href; },
+          title: s.relation || key,
+        },
+          el("span", {}, key),
+          el("span", { class: "pill" }, (s.consumers || []).length ? `${s.consumers.length}` : "–")
+        )
+      );
+    })
+  );
+
+  const macros = state.manifest.macros || [];
+  ui.sidebar.macrosTitle.textContent = `Macros (${macros.length})`;
+  ui.sidebar.macrosList.replaceChildren(
+    ...macros.map(m =>
+      el("li", { class: "item" },
+        el("a", {
+          href: routeWithFacets("#/macros"),
+          onclick: (e) => { e.preventDefault(); location.hash = routeWithFacets("#/macros"); },
+          title: m.path || m.name,
+        },
+          el("span", {}, m.name),
+          el("span", { class: "pill" }, m.kind)
+        )
+      )
+    )
+  );
+
+  // re-attach section headers with live counts
+  sectionHeader(ui.sidebar.modelsTitle, "models", `Models (${filteredModels.length})`);
+  sectionHeader(ui.sidebar.sourcesTitle, "sources", `Sources (${filteredSources.length})`);
+  sectionHeader(ui.sidebar.macrosTitle, "macros", `Macros (${macros.length})`);
+
+  applySidebarCollapse();
+}
 
   function updateMain() {
     const route = parseRoute();
@@ -2783,8 +3031,8 @@ async function main() {
 
   window.addEventListener("hashchange", () => {
     safeSet(STORE.lastHash, location.hash || "#/");
-    closePalette();
-    updateSidebarLists(); // facets live in URL query params
+    closePalette();   // optional: close palette on navigation
+    updateSidebarLists();
     updateMain();
   });
 
