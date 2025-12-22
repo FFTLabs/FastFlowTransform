@@ -14,7 +14,7 @@ from jinja2 import Environment, FileSystemLoader, TemplateNotFound, select_autoe
 from markupsafe import Markup
 
 from fastflowtransform.core import REGISTRY, Node, relation_for
-from fastflowtransform.dag import mermaid as dag_mermaid
+from fastflowtransform.dag import mermaid as dag_mermaid, spa_graph as dag_spa_graph
 from fastflowtransform.executors.base import ColumnInfo
 from fastflowtransform.lineage import (
     infer_py_lineage,
@@ -206,6 +206,7 @@ def _build_spa_manifest(
     env_name: str | None,
     with_schema: bool,
     mermaid_src: str,
+    graph: dict[str, Any],
     models: list[ModelDoc],
     sources: list[SourceDoc],
     macros: list[dict[str, str]],
@@ -293,7 +294,7 @@ def _build_spa_manifest(
             "env": env_name,
             "with_schema": bool(with_schema),
         },
-        "dag": {"mermaid": mermaid_src},
+        "dag": {"graph": graph, "mermaid": mermaid_src},
         "models": out_models,
         "sources": out_sources,
         "macros": macros,
@@ -673,6 +674,12 @@ def render_site(
     mermaid_src = dag_mermaid(
         nodes, source_links=source_link_meta, model_source_refs=model_source_refs
     )
+    graph = dag_spa_graph(
+        nodes,
+        sources_by_key=sources_by_key,
+        model_source_refs=model_source_refs,
+        direction="LR",
+    )
     proj_dir = _get_project_dir()
     docs_meta = read_docs_metadata(proj_dir) if proj_dir else {"models": {}, "columns": {}}
     models = _collect_models(nodes)
@@ -694,6 +701,7 @@ def render_site(
             env_name=env_name,
             with_schema=with_schema,
             mermaid_src=str(mermaid_src),
+            graph=graph,
             models=models,
             sources=sources,
             macros=macro_list,

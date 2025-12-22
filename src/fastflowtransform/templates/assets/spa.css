@@ -26,6 +26,7 @@ hr{ border:0; border-top:1px solid var(--border); margin:16px 0; }
 @media (max-width: 1000px){
   .sidebar{ position:relative; height:auto; border-right:0; border-bottom:1px solid var(--border); }
 }
+.sidebar .kv { grid-template-columns: 90px 1fr; }
 
 .brand{ display:flex; align-items:baseline; justify-content:space-between; gap:8px; margin-bottom:12px; }
 .brand h1{ font-size:14px; margin:0; }
@@ -68,6 +69,26 @@ hr{ border:0; border-top:1px solid var(--border); margin:16px 0; }
 .desc p{ margin: 0 0 10px 0; }
 .desc p:last-child{ margin-bottom:0; }
 .mermaidWrap{ overflow:auto; }
+/* Clickable Mermaid nodes */
+.mermaidWrap svg g.node.ffMermaidLink { cursor: pointer; }
+
+.mermaidWrap svg g.node.ffMermaidLink:hover rect,
+.mermaidWrap svg g.node.ffMermaidLink:hover polygon,
+.mermaidWrap svg g.node.ffMermaidLink:hover ellipse,
+.mermaidWrap svg g.node.ffMermaidLink:hover circle,
+.mermaidWrap svg g.node.ffMermaidLink:hover path {
+  stroke: var(--accent);
+  stroke-width: 2px;
+}
+
+.mermaidWrap svg g.node.ffMermaidLink:focus rect,
+.mermaidWrap svg g.node.ffMermaidLink:focus polygon,
+.mermaidWrap svg g.node.ffMermaidLink:focus ellipse,
+.mermaidWrap svg g.node.ffMermaidLink:focus circle,
+.mermaidWrap svg g.node.ffMermaidLink:focus path {
+  stroke: var(--accent);
+  stroke-width: 2px;
+}
 
 /* Global search palette */
 .overlay{
@@ -282,4 +303,181 @@ tr.colHit{
   flex-wrap:wrap;
   align-items:center;
   margin-top:10px;
+}
+
+.graphWrap{
+  border:1px solid var(--border);
+  border-radius: 16px;
+  overflow:hidden;
+  background: rgba(127,127,127,.04);
+  min-height: 62vh;
+}
+
+.graphHost{ width:100%; height:62vh; }
+.dagSvg{ width:100%; height:100%; display:block; outline:none; cursor: grab; }
+.dagSvg:active{ cursor: grabbing; }
+
+.dagEdges .dagEdge{
+  fill:none;
+  stroke: color-mix(in srgb, var(--fg), transparent 55%);
+  stroke-width: 2.2px;
+  opacity: 1;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  vector-effect: non-scaling-stroke;
+}
+
+.dagEdges .dagEdge.source{
+  stroke-dasharray: 6 5;
+  opacity: .95;
+}
+
+.dagEdges .dagEdge.hover{
+  stroke: var(--accent);
+  stroke-width: 3px;
+  opacity: 1;
+}
+
+.dagArrow{ fill: var(--border); }
+.dagEdge.hover + defs .dagArrow { fill: var(--accent); } /* harmless if not applied */
+
+.dagNode .dagRect{
+  fill: var(--card);
+  stroke: var(--border);
+  stroke-width: 1.2px;
+}
+.dagNode.model.sql .dagRect{ stroke: rgba(96,165,250,.55); }
+.dagNode.model.python .dagRect{ stroke: rgba(134,239,172,.55); }
+.dagNode.source .dagRect{ stroke: rgba(245,158,11,.55); stroke-dasharray: 5 4; }
+
+.dagNode.hover .dagRect{
+  stroke: var(--accent);
+  stroke-width: 2px;
+}
+
+.dagTitle{
+  font: 600 13px ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial;
+  fill: var(--fg);
+}
+.dagSub{
+  font: 12px ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial;
+  fill: var(--muted);
+}
+
+.dagBadge{
+  font: 600 11px ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial;
+  fill: var(--muted);
+}
+.dagBadge2{
+  font: 11px ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial;
+  fill: var(--muted);
+}
+
+.graphWrap{ position:relative; }
+.minimapHost{
+  position:absolute;
+  right:12px;
+  bottom:12px;
+  width: 220px;
+  height: 140px;
+  border:1px solid var(--border);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--card), transparent 5%);
+  overflow:hidden;
+  box-shadow: 0 12px 30px rgba(0,0,0,.25);
+}
+.miniSvg{ width:100%; height:100%; display:block; }
+.miniNode{ fill: color-mix(in srgb, var(--muted), transparent 75%); }
+.miniEdge{ stroke: color-mix(in srgb, var(--muted), transparent 70%); stroke-width: 1; fill:none; }
+.miniView{
+  fill: color-mix(in srgb, var(--accent), transparent 88%);
+  stroke: var(--accent);
+  stroke-width: 1.2;
+}
+.dagNode.dim{ opacity: .18; }
+.dagEdge.dim{ opacity: .12; }
+.dagNode.hl{ opacity: 1; }
+.dagEdge.hl{ opacity: 1; stroke: var(--accent); stroke-width: 2.2px; }
+.dagNode.selected .dagRect{ stroke: var(--accent); stroke-width: 2.6px; }
+
+.kvRows{
+  display:flex;
+  flex-direction:column;
+  gap:8px;
+}
+
+.kvRow{
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  gap:12px;
+
+  padding:8px 10px;
+  /* border:1px solid var(--border); */
+  border-radius:12px;
+  background: color-mix(in srgb, var(--card), transparent 70%);
+}
+
+.kvRow .k{
+  color:var(--muted);
+  font-size:11px;
+  letter-spacing:.06em;
+  text-transform:uppercase;
+}
+
+.kvRow .v{
+  font-weight:600;
+  font-variant-numeric: tabular-nums;
+  text-align:right;
+  max-width: 60%;
+  overflow-wrap:anywhere;
+}
+
+.dagHeader{
+  display:flex;
+  align-items:flex-start;
+  justify-content:space-between;
+  gap:16px;
+}
+
+.dagTitleRow{
+  display:flex;
+  align-items:baseline;
+  gap:10px;
+  margin-bottom:4px;
+}
+.dagHeaderLeft h2{ margin:0; }
+
+.dagSubtle{
+  margin:0;
+  color:var(--muted);
+  font-size:12px;
+}
+
+.dagHeaderRight{
+  display:flex;
+  flex-direction:column;
+  gap:10px;
+  align-items:flex-end;
+}
+
+.dagToolsRow{
+  display:flex;
+  gap:10px;
+  flex-wrap:wrap;
+  justify-content:flex-end;
+  align-items:center;
+}
+
+.dagDepth{
+  display:flex;
+  gap:8px;
+  align-items:center;
+}
+.dagDepth input[type="range"]{ width:160px; }
+
+@media (max-width: 900px){
+  .dagHeader{ flex-direction:column; align-items:stretch; }
+  .dagHeaderRight{ align-items:flex-start; }
+  .dagToolsRow{ justify-content:flex-start; }
 }
