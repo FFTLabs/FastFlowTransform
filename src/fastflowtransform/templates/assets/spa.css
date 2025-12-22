@@ -490,3 +490,43 @@ tr.colHit{
   background: color-mix(in srgb, var(--card), transparent 55%);
 }
 .miniGraphHost svg{ width:100%; height:100%; display:block; }
+
+.facetBox { display:flex; flex-direction:column; gap:8px; margin:8px 0 2px; }
+.facetRow { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+.facetChips { display:flex; gap:6px; }
+
+.facetChip {
+  border: 1px solid var(--border);
+  background: transparent;
+  color: inherit;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.facetChip.active {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent), transparent 88%);
+}
+
+.facetSelect, .facetInput {
+  flex: 1;
+  min-width: 140px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: inherit;
+  padding: 6px 10px;
+  border-radius: 12px;
+  font-size: 12px;
+}
+
+.facetClear {
+  border: 1px solid var(--border);
+  background: transparent;
+  color: inherit;
+  padding: 6px 10px;
+  border-radius: 12px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.facetClear:disabled { opacity: 0.5; cursor: not-allowed; }

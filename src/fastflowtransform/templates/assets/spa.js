@@ -89,6 +89,139 @@ function parseHashWithQuery() {
   return { parts, query };
 }
 
+// -------- Model facet filters (shareable via hash query params) --------
+const FACET_Q = {
+  kind: "mk",         // "sql" | "python" (omit => both)
+  materialized: "mm", // normalized materialization, or "__unknown__"
+  path: "mp",         // path prefix
+};
+const MAT_UNKNOWN = "__unknown__";
+
+function normalizeModelKind(k) {
+  return (k || "").toLowerCase() === "python" ? "python" : "sql";
+}
+function normalizeMaterialized(v) {
+  return (v || "").toString().trim().toLowerCase();
+}
+function normalizePath(p) {
+  return (p || "").toString().replace(/\\/g, "/").replace(/^\/+/, "");
+}
+function stripModelsPrefix(p) {
+  const n = normalizePath(p);
+  return n.toLowerCase().startsWith("models/") ? n.slice("models/".length) : n;
+}
+function modelMatchesPathPrefix(modelPath, prefix) {
+  if (!prefix) return true;
+  const p = normalizePath(modelPath).toLowerCase();
+  const pref = normalizePath(prefix).toLowerCase();
+  if (p.startsWith(pref)) return true;
+  // also allow prefix relative to "models/"
+  return stripModelsPrefix(p).startsWith(stripModelsPrefix(pref));
+}
+
+function readModelFacetsFromQuery(query) {
+  const mk = (query.get(FACET_Q.kind) || "").trim().toLowerCase();
+  const kinds = mk
+    ? mk.split(",").map(s => s.trim()).filter(Boolean)
+    : ["sql", "python"];
+
+  const validKinds = new Set(kinds.filter(k => k === "sql" || k === "python"));
+  if (validKinds.size === 0) { validKinds.add("sql"); validKinds.add("python"); }
+
+  return {
+    kinds: Array.from(validKinds),
+    materialized: normalizeMaterialized(query.get(FACET_Q.materialized) || ""),
+    pathPrefix: query.get(FACET_Q.path) || "",
+  };
+}
+
+function writeModelFacetsToQuery(query, facets) {
+  const kinds = Array.from(new Set(facets.kinds || []));
+  const hasSql = kinds.includes("sql");
+  const hasPy = kinds.includes("python");
+
+  // Default => omit
+  if (hasSql && hasPy) query.delete(FACET_Q.kind);
+  else query.set(FACET_Q.kind, kinds.join(","));
+
+  if (facets.materialized) query.set(FACET_Q.materialized, facets.materialized);
+  else query.delete(FACET_Q.materialized);
+
+  if (facets.pathPrefix) query.set(FACET_Q.path, facets.pathPrefix);
+  else query.delete(FACET_Q.path);
+}
+
+function currentModelFacets() {
+  return readModelFacetsFromQuery(parseHashWithQuery().query);
+}
+
+function facetsActiveCount(f) {
+  const kinds = new Set(f.kinds || []);
+  const kindActive = !(kinds.has("sql") && kinds.has("python"));
+  return (kindActive ? 1 : 0) + (f.materialized ? 1 : 0) + (f.pathPrefix ? 1 : 0);
+}
+
+function filterModelsWithFacets(models, facets) {
+  const kinds = new Set((facets.kinds || []).map(k => (k || "").toLowerCase()));
+  const mat = normalizeMaterialized(facets.materialized || "");
+  const pref = facets.pathPrefix || "";
+
+  return (models || []).filter(m => {
+    const kind = normalizeModelKind(m.kind);
+    if (kinds.size && !kinds.has(kind)) return false;
+
+    if (mat) {
+      const mm = normalizeMaterialized(m.materialized || "");
+      if (mat === MAT_UNKNOWN) {
+        if (mm) return false;
+      } else {
+        if (mm !== mat) return false;
+      }
+    }
+
+    if (pref && !modelMatchesPathPrefix(m.path || "", pref)) return false;
+
+    return true;
+  });
+}
+
+// Merge current facet params into an arbitrary hash route (e.g. "#/model/x?tab=columns")
+function routeWithFacets(route) {
+  const facets = currentModelFacets();
+  const r = (route || "#/").startsWith("#") ? (route || "#/").slice(1) : (route || "/");
+  const [pathPart, queryPart] = r.split("?", 2);
+  const q = new URLSearchParams(queryPart || "");
+  writeModelFacetsToQuery(q, facets);
+
+  const next = q.toString() ? `${pathPart}?${q.toString()}` : `${pathPart}`;
+  return `#${next.startsWith("/") ? "" : "/"}${next}`;
+}
+
+// Replace just the hash query string without triggering hashchange (good UX for filters)
+function replaceHashQuery(mutator) {
+  const full = (location.hash || "#/").slice(1);
+  const [pathPart, queryPart] = full.split("?", 2);
+  const q = new URLSearchParams(queryPart || "");
+  mutator(q, pathPart);
+
+  const next = q.toString() ? `${pathPart}?${q.toString()}` : `${pathPart}`;
+  const nextHash = `#${next.startsWith("/") ? "" : "/"}${next}`;
+
+  history.replaceState(null, "", nextHash);
+  if (window.__fftLastHashKey) safeSet(window.__fftLastHashKey, nextHash);
+}
+
+// Debounce helper (with cancel)
+function debounce(fn, ms = 180) {
+  let t = null;
+  const wrapped = (...args) => {
+    clearTimeout(t);
+    t = setTimeout(() => fn(...args), ms);
+  };
+  wrapped.cancel = () => { clearTimeout(t); t = null; };
+  return wrapped;
+}
+
 function setTabInHash(tab) {
   const full = (location.hash || "#/").slice(1);
   const [pathPart, queryPart] = full.split("?", 2);
@@ -494,7 +627,7 @@ function renderModel(state, name, tabFromRoute, colFromRoute) {
       el("div", {},
         el("button", {
           class: "btn",
-          onclick: () => { location.hash = "#/"; }
+          onclick: () => { location.hash = routeWithFacets("#/"); }
         }, "← Overview"),
         el("button", {
           class: "btn",
@@ -522,10 +655,10 @@ function renderModel(state, name, tabFromRoute, colFromRoute) {
 
 function renderModelPanel(state, m, tab, colFromRoute) {
   if (tab === "overview") {
-    const deps = (m.deps || []).map(d => el("a", { href: `#/model/${escapeHashPart(d)}` }, d));
+    const deps = (m.deps || []).map(d => el("a", { href: routeWithFacets(`#/model/${escapeHashPart(d)}`) }, d));
     const usedBy = (m.used_by || []).map(u => el("a", { href: `#/model/${escapeHashPart(u)}` }, u));
     const sourcesUsed = (m.sources_used || []).map(s =>
-      el("a", { href: `#/source/${escapeHashPart(s.source_name)}/${escapeHashPart(s.table_name)}` }, `${s.source_name}.${s.table_name}`)
+      el("a", { href: routeWithFacets(`#/source/${escapeHashPart(s.source_name)}/${escapeHashPart(s.table_name)}`) }, `${s.source_name}.${s.table_name}`)
     );
     const modelId = m.name;
 
@@ -676,7 +809,7 @@ function renderSource(state, sourceName, tableName) {
     return el("div", { class: "card" }, el("h2", {}, "Source not found"), el("p", { class: "empty" }, key));
   }
 
-  const consumers = (s.consumers || []).map(m => el("a", { href: `#/model/${escapeHashPart(m)}` }, m));
+  const consumers = (s.consumers || []).map(m => el("a", { href: routeWithFacets(`#/model/${escapeHashPart(m)}`) }, m));
 
   const freshness = (() => {
     const warn = s.warn_after_minutes != null ? `${s.warn_after_minutes}m warn` : null;
@@ -1447,14 +1580,14 @@ function mountGraph(state, host, graph, opts = {}) {
       // route contains raw parts; encode at the last moment
       if (route.startsWith("#/model/")) {
         const nm = route.slice("#/model/".length);
-        location.hash = `#/model/${escapeHashPart(nm)}`;
+        location.hash = routeWithFacets(`#/model/${escapeHashPart(nm)}`);
       } else if (route.startsWith("#/source/")) {
         const rest = route.slice("#/source/".length).split("/");
         const s = rest[0] || "";
         const t = rest[1] || "";
-        location.hash = `#/source/${escapeHashPart(s)}/${escapeHashPart(t)}`;
+        location.hash = routeWithFacets(`#/source/${escapeHashPart(s)}/${escapeHashPart(t)}`);
       } else {
-        location.hash = route;
+        location.hash = routeWithFacets(route);
       }
     };
 
@@ -1641,65 +1774,6 @@ function mountGraph(state, host, graph, opts = {}) {
     let miniDrag = null;
     let miniSuppressClick = false;
 
-    // miniView.addEventListener("pointerdown", (ev) => {
-    //   ev.preventDefault();
-    //   ev.stopPropagation();
-
-    //   miniView.setPointerCapture(ev.pointerId);
-    //   miniView.style.cursor = "grabbing";
-
-    //   const p0 = miniClientToGraph(ev);
-    //   miniDrag = {
-    //     id: ev.pointerId,
-    //     p0,
-    //     // current top-left of visible area in graph coords:
-    //     vx0: (-tx) / scale,
-    //     vy0: (-ty) / scale,
-    //     moved: false,
-    //   };
-    // });
-
-    // miniView.addEventListener("pointermove", (ev) => {
-    //   if (!miniDrag || ev.pointerId !== miniDrag.id) return;
-    //   ev.preventDefault();
-
-    //   const p = miniClientToGraph(ev);
-    //   const dx = p.x - miniDrag.p0.x;
-    //   const dy = p.y - miniDrag.p0.y;
-
-    //   // visible size (graph coords)
-    //   const sr = svg.getBoundingClientRect();
-    //   const vw = sr.width / scale;
-    //   const vh = sr.height / scale;
-
-    //   const vb = miniSvg.viewBox.baseVal;
-    //   const maxVx = vb.x + vb.width - vw;
-    //   const maxVy = vb.y + vb.height - vh;
-
-    //   const vx = clamp(miniDrag.vx0 + dx, vb.x, maxVx);
-    //   const vy = clamp(miniDrag.vy0 + dy, vb.y, maxVy);
-
-    //   tx = -vx * scale;
-    //   ty = -vy * scale;
-
-    //   if (Math.abs(dx) + Math.abs(dy) > 0.5) miniDrag.moved = true;
-    //   apply();
-    // });
-
-    // function endMiniDrag(ev) {
-    //   if (!miniDrag || ev.pointerId !== miniDrag.id) return;
-    //   ev.preventDefault();
-
-    //   miniSuppressClick = miniDrag.moved; // prevents click-to-center after drag
-    //   miniDrag = null;
-
-    //   try { miniView.releasePointerCapture(ev.pointerId); } catch {}
-    //   miniView.style.cursor = "grab";
-    // }
-
-    // miniView.addEventListener("pointerup", endMiniDrag);
-    // miniView.addEventListener("pointercancel", endMiniDrag);
-
     function miniGetViewRect() {
       const x = parseFloat(miniView.getAttribute("x")) || 0;
       const y = parseFloat(miniView.getAttribute("y")) || 0;
@@ -1884,6 +1958,8 @@ async function main() {
   STORE.modelTab = `fft_docs:${projKey}:model_tab_default`;
   state.modelTabDefault = safeGet(STORE.modelTab) || "overview";
   state.STORE = STORE;
+  // Allow replaceHashQuery() (global) to keep lastHash in sync even when we use history.replaceState.
+  window.__fftLastHashKey = STORE.lastHash;
 
   // Persisted UI state
   state.filter = safeGet(STORE.filter) ?? "";
@@ -1898,6 +1974,9 @@ async function main() {
   if ((!location.hash || location.hash === "#/" || location.hash === "#") && last) {
     location.hash = last;
   }
+
+  // Initialize model facets from URL (shareable filters)
+  state.modelFacets = currentModelFacets();
 
   toastOnce({
     key: `fft_docs_search_toast_seen:${projKey}`,
@@ -2023,7 +2102,33 @@ async function main() {
     const sel = Math.max(0, Math.min(state.search.selected || 0, results.length - 1));
 
     const q = (state.search.query || "").trim();
-    const sub = (() => {
+    // const sub = (() => {
+    //   if (r.kind === "column") {
+    //     const parts = [
+    //       "COLUMN",
+    //       r.model || "",
+    //       r.relation ? `• ${r.relation}` : "",
+    //       r.dtype ? `• ${r.dtype}` : "",
+    //     ].filter(Boolean).join(" ");
+    //     const snip = makeSnippet(r.descText || "", q, 90);
+    //     return snip ? `${parts} • ${snip}` : parts;
+    //   }
+    //   if (r.kind === "model") {
+    //     const snip = makeSnippet((r.descText || ""), q, 90);
+    //     return snip ? `MODEL • ${r.subtitle || ""} • ${snip}` : `MODEL • ${r.subtitle || ""}`;
+    //   }
+    //   if (r.kind === "source") {
+    //     const snip = makeSnippet((r.descText || ""), q, 90);
+    //     return snip ? `SOURCE • ${r.subtitle || ""} • ${snip}` : `SOURCE • ${r.subtitle || ""}`;
+    //   }
+    //   return `${(r.kind || "").toUpperCase()} • ${r.subtitle || ""}`;
+    // })();
+
+    // const right = r.kind === "column" && r.dtype
+    //   ? el("span", { class: "pill" }, r.dtype)
+    //   : el("div", { class: "kbd" }, "↵");
+
+    const subFor = (r) => {
       if (r.kind === "column") {
         const parts = [
           "COLUMN",
@@ -2043,11 +2148,12 @@ async function main() {
         return snip ? `SOURCE • ${r.subtitle || ""} • ${snip}` : `SOURCE • ${r.subtitle || ""}`;
       }
       return `${(r.kind || "").toUpperCase()} • ${r.subtitle || ""}`;
-    })();
+    };
 
-    const right = r.kind === "column" && r.dtype
-      ? el("span", { class: "pill" }, r.dtype)
-      : el("div", { class: "kbd" }, "↵");
+    const rightFor = (r) =>
+      (r.kind === "column" && r.dtype)
+        ? el("span", { class: "pill" }, r.dtype)
+        : el("div", { class: "kbd" }, "↵");
 
     state.ui.paletteList.replaceChildren(
       ...(results.length
@@ -2056,14 +2162,14 @@ async function main() {
               class: `result ${idx === sel ? "sel" : ""}`,
               onclick: () => {
                 closePalette();
-                location.hash = r.route;
+                location.hash = routeWithFacets(r.route);
               },
             },
               el("div", { class: "resultMain" },
                 el("div", { class: "resultTitle" }, r.title),
-                el("div", { class: "resultSub" }, sub)
+                el("div", { class: "resultSub" }, subFor(r))
               ),
-              right
+              rightFor(r)
             )
           )
         : [el("div", { class: "result" },
@@ -2137,7 +2243,7 @@ async function main() {
             // If not on home, go home with focus param
             const r = parseRoute();
             if (r.route !== "home") {
-              location.hash = `#/?focus=${encodeURIComponent(gid)}`;
+              location.hash = routeWithFacets(`#/?focus=${encodeURIComponent(gid)}`);
               return;
             }
 
@@ -2148,7 +2254,7 @@ async function main() {
 
           // Normal Enter => navigate
           closePalette();
-          location.hash = hit.route;
+          location.hash = routeWithFacets(hit.route);
         }
       }
     });
@@ -2210,6 +2316,18 @@ async function main() {
   ui.sidebar = {
     root: null,
     input: null,
+
+    // facet UI (near sidebar search)
+    facetBox: null,
+    kindSqlBtn: null,
+    kindPyBtn: null,
+    matSelect: null,
+    pathInput: null,
+    pathDatalist: null,
+    clearFacetsBtn: null,
+    brandLink: null,
+    overviewLink: null,
+
     modelsTitle: null,
     sourcesTitle: null,
     modelsList: null,
@@ -2257,35 +2375,122 @@ async function main() {
         const q = (state.filter || "").trim();
         const total = (state.sidebarMatches.models || 0) + (state.sidebarMatches.sources || 0);
 
-        // Empty input => Enter opens global palette
         if (!q) {
           e.preventDefault();
           openPalette("");
           return;
         }
 
-        // No sidebar matches => Enter escalates to global palette (prefilled)
         if (total === 0) {
           e.preventDefault();
           openPalette(q);
           return;
         }
-
-        // Otherwise: normal behavior (do nothing special)
       },
     });
 
+    // --- Facets live next to the sidebar search (not under Models) ---
+    const applyFacetsToUrl = () => {
+      replaceHashQuery((q) => writeModelFacetsToQuery(q, state.modelFacets));
+      // keep state in sync (routeWithFacets reads from URL)
+      state.modelFacets = currentModelFacets();
+    };
+
+    const debouncedPath = debounce((val) => {
+      state.modelFacets.pathPrefix = (val || "").trim();
+      applyFacetsToUrl();
+      updateSidebarLists();
+    }, 180);
+
+    ui.sidebar.kindSqlBtn = el("button", {
+      class: "facetChip",
+      type: "button",
+      onclick: () => {
+        const kinds = new Set(state.modelFacets.kinds || ["sql", "python"]);
+        if (kinds.has("sql")) kinds.delete("sql"); else kinds.add("sql");
+        if (kinds.size === 0) { kinds.add("sql"); kinds.add("python"); } // avoid empty selection
+        state.modelFacets.kinds = Array.from(kinds);
+
+        applyFacetsToUrl();
+        updateSidebarLists();
+      }
+    }, "SQL");
+
+    ui.sidebar.kindPyBtn = el("button", {
+      class: "facetChip",
+      type: "button",
+      onclick: () => {
+        const kinds = new Set(state.modelFacets.kinds || ["sql", "python"]);
+        if (kinds.has("python")) kinds.delete("python"); else kinds.add("python");
+        if (kinds.size === 0) { kinds.add("sql"); kinds.add("python"); }
+        state.modelFacets.kinds = Array.from(kinds);
+
+        applyFacetsToUrl();
+        updateSidebarLists();
+      }
+    }, "Python");
+
+    ui.sidebar.matSelect = el("select", {
+      class: "facetSelect",
+      onchange: (e) => {
+        state.modelFacets.materialized = normalizeMaterialized(e.target.value || "");
+        applyFacetsToUrl();
+        updateSidebarLists();
+      }
+    });
+
+    ui.sidebar.pathDatalist = el("datalist", { id: "modelPathPrefixes" });
+    ui.sidebar.pathInput = el("input", {
+      class: "facetInput",
+      type: "search",
+      placeholder: "Path prefix…",
+      list: "modelPathPrefixes",
+      value: state.modelFacets.pathPrefix || "",
+      oninput: (e) => debouncedPath(e.target.value || ""),
+      onkeydown: (e) => {
+        if (e.key !== "Enter") return;
+        debouncedPath.cancel();
+        state.modelFacets.pathPrefix = (e.target.value || "").trim();
+        applyFacetsToUrl();
+        updateSidebarLists();
+      }
+    });
+
+    ui.sidebar.clearFacetsBtn = el("button", {
+      class: "facetClear",
+      type: "button",
+      onclick: () => {
+        debouncedPath.cancel();
+        state.modelFacets = { kinds: ["sql", "python"], materialized: "", pathPrefix: "" };
+        ui.sidebar.pathInput.value = "";
+        applyFacetsToUrl();
+        updateSidebarLists();
+      }
+    }, "Clear");
+
+    ui.sidebar.facetBox = el("div", { class: "facetBox" },
+      el("div", { class: "facetRow" },
+        el("div", { class: "facetChips" }, ui.sidebar.kindSqlBtn, ui.sidebar.kindPyBtn),
+        ui.sidebar.matSelect
+      ),
+      el("div", { class: "facetRow" },
+        ui.sidebar.pathInput,
+        ui.sidebar.clearFacetsBtn
+      ),
+      ui.sidebar.pathDatalist
+    );
+
     const overviewSection = el("div", { class: "section" },
       el("div", {},
-        el("a", {
-          href: "#/",
-          onclick: (e) => { e.preventDefault(); location.hash = "#/"; },
-          class: "itemLink", // optional, if you have it; otherwise omit
+        (ui.sidebar.overviewLink = el("a", {
+          href: routeWithFacets("#/"),
+          onclick: (e) => { e.preventDefault(); location.hash = routeWithFacets("#/"); },
+          class: "itemLink",
           style: "display:flex; align-items:center; justify-content:space-between; padding:8px 10px; border:1px solid var(--border); border-radius:12px; text-decoration:none; color:inherit;"
         },
           el("span", {}, "Overview (DAG)"),
           el("span", { class: "pill" }, "Home")
-        )
+        ))
       )
     );
 
@@ -2327,11 +2532,11 @@ async function main() {
       el(
         "div",
         { class: "brand" },
-        el("a", {
-          href: "#/",
+        (ui.sidebar.brandLink = el("a", {
+          href: routeWithFacets("#/"),
           style: "color:inherit; text-decoration:none;",
-          onclick: (e) => { e.preventDefault(); location.hash = "#/"; }
-        }, el("h1", {}, state.manifest.project?.name || "Docs")),
+          onclick: (e) => { e.preventDefault(); location.hash = routeWithFacets("#/"); }
+        }, el("h1", {}, state.manifest.project?.name || "Docs"))),
         el("span", { class: "badge", title: `Generated: ${state.manifest.project?.generated_at || ""}` }, "SPA")
       ),
       el(
@@ -2340,6 +2545,7 @@ async function main() {
         ui.sidebar.input,
         el("span", { class: "searchKbd kbd" }, "/")
       ),
+      ui.sidebar.facetBox,
       el("div", { class: "searchTip" }, "Tip: Press / (or Ctrl+K) to search everything (models, sources, columns)."),
       overviewSection,
       ui.sidebar.projectSection,
@@ -2366,11 +2572,14 @@ async function main() {
   }
 
   function updateSidebarLists() {
+    // Keep facets in sync with URL in case of back/forward or manual edits
+    state.modelFacets = currentModelFacets();
+
     const q = (state.filter || "").trim().toLowerCase();
     const models = state.manifest.models || [];
     const sources = state.manifest.sources || [];
 
-    const filteredModels = q
+    const modelsAfterText = q
       ? models.filter(m =>
           (m.name || "").toLowerCase().includes(q) ||
           (m.relation || "").toLowerCase().includes(q) ||
@@ -2378,16 +2587,99 @@ async function main() {
         )
       : models;
 
-    const filteredSources = q
+    const sourcesAfterText = q
       ? sources.filter(s =>
           (`${s.source_name}.${s.table_name}`).toLowerCase().includes(q) ||
           (s.relation || "").toLowerCase().includes(q)
         )
       : sources;
 
+    // Apply model facets (kinds/materialized/pathPrefix) on top of text filtering
+    const filteredModels = filterModelsWithFacets(modelsAfterText, state.modelFacets);
+    const filteredSources = sourcesAfterText;
+
     state.sidebarMatches.models = filteredModels.length;
     state.sidebarMatches.sources = filteredSources.length;
 
+    // ---- Facet UI: counts + selected state ----
+    const facets = state.modelFacets || { kinds: ["sql", "python"], materialized: "", pathPrefix: "" };
+
+    // counts for kind based on other facets (materialized + pathPrefix)
+    const forKindCounts = filterModelsWithFacets(modelsAfterText, { ...facets, kinds: ["sql", "python"] });
+    let sqlCount = 0, pyCount = 0;
+    for (const m of forKindCounts) {
+      if (normalizeModelKind(m.kind) === "python") pyCount++; else sqlCount++;
+    }
+
+    // counts for materialized based on other facets (kind + pathPrefix)
+    const forMatCounts = filterModelsWithFacets(modelsAfterText, { ...facets, materialized: "" });
+    const matCounts = new Map();
+    let unknownCount = 0;
+    for (const m of forMatCounts) {
+      const mm = normalizeMaterialized(m.materialized || "");
+      if (!mm) unknownCount++;
+      else matCounts.set(mm, (matCounts.get(mm) || 0) + 1);
+    }
+    const matsSorted = Array.from(matCounts.entries()).sort((a, b) => (b[1] - a[1]) || a[0].localeCompare(b[0]));
+
+    // path prefix suggestions based on other facets (kind + materialized)
+    const forPathCounts = filterModelsWithFacets(modelsAfterText, { ...facets, pathPrefix: "" });
+    const prefixCounts = new Map();
+    for (const m of forPathCounts) {
+      const p = stripModelsPrefix(m.path || "");
+      if (!p) continue;
+      const parts = p.split("/").filter(Boolean);
+
+      // suggest first segment and first two segments
+      for (const depth of [1, 2]) {
+        if (parts.length >= depth) {
+          const pref = parts.slice(0, depth).join("/") + "/";
+          prefixCounts.set(pref, (prefixCounts.get(pref) || 0) + 1);
+        }
+      }
+
+      // also include full directory if available (without file name)
+      if (parts.length > 1) {
+        const fullDir = parts.slice(0, parts.length - 1).join("/") + "/";
+        prefixCounts.set(fullDir, (prefixCounts.get(fullDir) || 0) + 1);
+      }
+    }
+    const prefixesSorted = Array.from(prefixCounts.entries())
+      .sort((a, b) => (b[1] - a[1]) || a[0].localeCompare(b[0]))
+      .slice(0, 40);
+
+    const kindsSet = new Set((facets.kinds || ["sql", "python"]).map(k => (k || "").toLowerCase()));
+    ui.sidebar.kindSqlBtn.textContent = `SQL (${sqlCount})`;
+    ui.sidebar.kindPyBtn.textContent = `Python (${pyCount})`;
+    ui.sidebar.kindSqlBtn.classList.toggle("active", kindsSet.has("sql"));
+    ui.sidebar.kindPyBtn.classList.toggle("active", kindsSet.has("python"));
+
+    // Update materialized select options (keep selection)
+    const currentMat = normalizeMaterialized(facets.materialized || "");
+    ui.sidebar.matSelect.replaceChildren(
+      el("option", { value: "" }, `Any materialization (${forMatCounts.length})`),
+      ...(unknownCount ? [el("option", { value: MAT_UNKNOWN }, `(unknown) (${unknownCount})`)] : []),
+      ...matsSorted.map(([mm, n]) => el("option", { value: mm }, `${mm} (${n})`))
+    );
+    ui.sidebar.matSelect.value = currentMat;
+
+    // Update datalist suggestions and keep input in sync if URL changed
+    ui.sidebar.pathDatalist.replaceChildren(
+      ...prefixesSorted.map(([p, n]) => el("option", { value: p }, `${p} (${n})`))
+    );
+    if ((ui.sidebar.pathInput.value || "") !== (facets.pathPrefix || "")) {
+      ui.sidebar.pathInput.value = facets.pathPrefix || "";
+    }
+
+    const activeN = facetsActiveCount(facets);
+    ui.sidebar.clearFacetsBtn.textContent = activeN ? `Clear (${activeN})` : "Clear";
+    ui.sidebar.clearFacetsBtn.disabled = activeN === 0;
+
+    // Keep "home" hrefs up-to-date for copy/open-in-new-tab
+    if (ui.sidebar.brandLink) ui.sidebar.brandLink.href = routeWithFacets("#/");
+    if (ui.sidebar.overviewLink) ui.sidebar.overviewLink.href = routeWithFacets("#/");
+
+    // ---- Sidebar lists ----
     ui.sidebar.modelsTitle.textContent = `Models (${filteredModels.length})`;
     ui.sidebar.sourcesTitle.textContent = `Sources (${filteredSources.length})`;
 
@@ -2395,9 +2687,9 @@ async function main() {
       ...filteredModels.map(m =>
         el("li", { class: "item" },
           el("a", {
-            href: `#/model/${escapeHashPart(m.name)}`,
-            onclick: (e) => { e.preventDefault(); location.hash = `#/model/${escapeHashPart(m.name)}`; },
-            title: m.description_short || m.name,
+            href: routeWithFacets(`#/model/${escapeHashPart(m.name)}`),
+            onclick: (e) => { e.preventDefault(); location.hash = routeWithFacets(`#/model/${escapeHashPart(m.name)}`); },
+            title: [m.description_short || "", m.path ? `(${m.path})` : ""].filter(Boolean).join(" ") || m.name,
           },
             el("span", {}, m.name),
             pillForKind(m.kind === "python" ? "python" : "sql")
@@ -2409,10 +2701,11 @@ async function main() {
     ui.sidebar.sourcesList.replaceChildren(
       ...filteredSources.map(s => {
         const key = `${s.source_name}.${s.table_name}`;
+        const href = routeWithFacets(`#/source/${escapeHashPart(s.source_name)}/${escapeHashPart(s.table_name)}`);
         return el("li", { class: "item" },
           el("a", {
-            href: `#/source/${escapeHashPart(s.source_name)}/${escapeHashPart(s.table_name)}`,
-            onclick: (e) => { e.preventDefault(); location.hash = `#/source/${escapeHashPart(s.source_name)}/${escapeHashPart(s.table_name)}`; },
+            href,
+            onclick: (e) => { e.preventDefault(); location.hash = href; },
             title: s.relation || key,
           },
             el("span", {}, key),
@@ -2423,17 +2716,13 @@ async function main() {
     );
 
     const macros = state.manifest.macros || [];
-    
-    sectionHeader(ui.sidebar.modelsTitle, "models", `Models (${filteredModels.length})`);
-    sectionHeader(ui.sidebar.sourcesTitle, "sources", `Sources (${filteredSources.length})`);
-    sectionHeader(ui.sidebar.macrosTitle, "macros", `Macros (${macros.length})`);
-
+    ui.sidebar.macrosTitle.textContent = `Macros (${macros.length})`;
     ui.sidebar.macrosList.replaceChildren(
       ...macros.map(m =>
         el("li", { class: "item" },
           el("a", {
-            href: "#/macros",
-            onclick: (e) => { e.preventDefault(); location.hash = "#/macros"; },
+            href: routeWithFacets("#/macros"),
+            onclick: (e) => { e.preventDefault(); location.hash = routeWithFacets("#/macros"); },
             title: m.path || m.name,
           },
             el("span", {}, m.name),
@@ -2442,9 +2731,13 @@ async function main() {
         )
       )
     );
-    
-    applySidebarCollapse();
 
+    // re-attach section headers with live counts
+    sectionHeader(ui.sidebar.modelsTitle, "models", `Models (${filteredModels.length})`);
+    sectionHeader(ui.sidebar.sourcesTitle, "sources", `Sources (${filteredSources.length})`);
+    sectionHeader(ui.sidebar.macrosTitle, "macros", `Macros (${macros.length})`);
+
+    applySidebarCollapse();
   }
 
   function updateMain() {
@@ -2490,7 +2783,8 @@ async function main() {
 
   window.addEventListener("hashchange", () => {
     safeSet(STORE.lastHash, location.hash || "#/");
-    closePalette();   // optional: close palette on navigation
+    closePalette();
+    updateSidebarLists(); // facets live in URL query params
     updateMain();
   });
 
