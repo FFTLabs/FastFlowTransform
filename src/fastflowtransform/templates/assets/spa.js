@@ -839,7 +839,7 @@ function renderUndocumentedModelsCard(state, cov) {
   );
 }
 
-
+// ----------- Contracts --------------------
 function hasContract(m) {
   const c = m && m.contract;
   if (!c) return false;
@@ -914,6 +914,94 @@ function renderConstraintsList(items) {
     }
   }
   return wrap;
+}
+
+function canonicalType(t) {
+  const s = String(t || "").trim().toLowerCase();
+  if (!s) return "";
+  // normalize whitespace + strip trailing params like varchar(255), numeric(10,2)
+  return s.replace(/\s+/g, " ").replace(/\(.*\)\s*$/, "").trim();
+}
+
+function computeContractDrift(m, withSchema) {
+  const contracted = hasContract(m);
+  if (!contracted) {
+    return { status: "none", missing: [], extra: [], mismatches: [], byName: new Map(), schemaAvailable: false, constraintsComparable: false };
+  }
+
+  const schemaAvailable = !!withSchema && Array.isArray(m.columns) && m.columns.length > 0;
+  if (!schemaAvailable) {
+    return { status: "unavailable", missing: [], extra: [], mismatches: [], byName: new Map(), schemaAvailable: false, constraintsComparable: false };
+  }
+
+  const contractCols = contractColumnsFrom(m).map(normalizeContractCol).filter(Boolean);
+  const actualCols = (m.columns || []).map(c => ({
+    name: String(c.name || ""),
+    dtype: c.dtype != null ? String(c.dtype) : "",
+    nullable: !!c.nullable,
+    constraints: c.constraints ?? null, // only comparable if your schema collector starts emitting it
+  }));
+
+  const cMap = new Map(); // lowerName -> contract col
+  for (const c of contractCols) cMap.set(c.name.toLowerCase(), c);
+
+  const aMap = new Map(); // lowerName -> actual col
+  for (const a of actualCols) aMap.set(a.name.toLowerCase(), a);
+
+  const constraintsComparable = actualCols.some(a => Array.isArray(a.constraints));
+
+  const missing = [];
+  const mismatches = [];
+  const byName = new Map(); // lowerName -> { missing?:true, extra?:true, issues:[], expected, actual }
+
+  for (const c of contractCols) {
+    const key = c.name.toLowerCase();
+    const a = aMap.get(key);
+
+    if (!a) {
+      missing.push(c.name);
+      byName.set(key, { missing: true, issues: ["missing"], expected: c, actual: null });
+      continue;
+    }
+
+    const issues = [];
+
+    // type mismatch (if contract specifies dtype)
+    if (c.dtype) {
+      const expT = canonicalType(c.dtype);
+      const actT = canonicalType(a.dtype);
+      if (expT && actT && expT !== actT) issues.push("type");
+    }
+
+    // nullability mismatch (if contract specifies nullable)
+    if (c.nullable != null) {
+      if (!!c.nullable !== !!a.nullable) issues.push("nullability");
+    }
+
+    // constraints mismatch (only if warehouse schema exposes constraints)
+    if (constraintsComparable && (c.constraints || []).length) {
+      const exp = JSON.stringify(c.constraints || []);
+      const act = JSON.stringify(a.constraints || []);
+      if (exp !== act) issues.push("constraints");
+    }
+
+    if (issues.length) {
+      mismatches.push({ name: c.name, issues });
+      byName.set(key, { issues, expected: c, actual: a });
+    }
+  }
+
+  const extra = [];
+  for (const a of actualCols) {
+    const key = a.name.toLowerCase();
+    if (!cMap.has(key)) {
+      extra.push(a.name);
+      byName.set(key, { extra: true, issues: ["extra"], expected: null, actual: a });
+    }
+  }
+
+  const status = (missing.length || extra.length || mismatches.length) ? "drift" : "verified";
+  return { status, missing, extra, mismatches, byName, schemaAvailable: true, constraintsComparable };
 }
 
 
@@ -1977,7 +2065,7 @@ function buildColumnsCard(state, m, colFromRoute) {
   const tools = el("div", { class: "colTools" });
 
   const qInput = el("input", {
-    class: "input",
+    class: "search",
     type: "search",
     placeholder: "Filter columns…",
     value: uiState.q || "",
@@ -2341,6 +2429,7 @@ function buildColumnsCard(state, m, colFromRoute) {
 
 function buildContractCard(state, m) {
   const withSchema = !!state.manifest.project?.with_schema;
+  const drift = computeContractDrift(m, withSchema);
 
   const rawCols = contractColumnsFrom(m).map(normalizeContractCol).filter(Boolean);
   const tblConstraints = contractTableConstraintsFrom(m);
@@ -2365,6 +2454,11 @@ function buildContractCard(state, m) {
     hasContract(m)
       ? el("div", { class:"pillRow" },
           el("span", { class:"pillSmall pillGood" }, "Contracted"),
+          drift.status === "verified"
+         ? el("span", { class:"pillSmall pillGood", title:"Contract matches warehouse schema" }, "Verified")
+         : drift.status === "drift"
+           ? el("span", { class:"pillSmall pillBad", title:"Contract differs from warehouse schema" }, "Drift detected")
+           : el("span", { class:"pillSmall pillWarn", title:"Warehouse schema not available (run with schema collection enabled)" }, "Schema unavailable"),
           (m.contract && typeof m.contract === "object" && m.contract.enforced != null)
             ? el("span", { class:"pillSmall" }, m.contract.enforced ? "enforced" : "not enforced")
             : null
@@ -2394,16 +2488,24 @@ function buildContractCard(state, m) {
       .map(c => {
         // Optional: show “missing/mismatch” if schema is available
         let statusNode = null;
-        if (withSchema) {
-          const actual = (m.columns || []).find(x => (x.name || "").toLowerCase() === c.name.toLowerCase());
-          if (!actual) {
+        if (drift.schemaAvailable) {
+          const key = c.name.toLowerCase();
+          const rec = drift.byName.get(key);
+          if (!rec || rec.missing) {
             statusNode = el("span", { class:"pillSmall pillBad" }, "missing");
+          } else if (rec.issues && rec.issues.length) {
+            const title = (() => {
+              const exp = rec.expected ? `${rec.expected.dtype || "—"} / ${rec.expected.nullable == null ? "—" : (rec.expected.nullable ? "nullable" : "not null")}` : "";
+              const act = rec.actual ? `${rec.actual.dtype || "—"} / ${(rec.actual.nullable ? "nullable" : "not null")}` : "";
+              return (exp && act) ? `expected: ${exp}\nactual: ${act}` : "";
+            })();
+            statusNode = el("span", { class:"pillSmall pillWarn", title }, `mismatch: ${rec.issues.join(", ")}`);
           } else {
-            const mism = [];
-            if (c.dtype && actual.dtype && String(actual.dtype).toLowerCase() !== String(c.dtype).toLowerCase()) mism.push("type");
-            if (c.nullable != null && !!actual.nullable !== !!c.nullable) mism.push("nullability");
-            if (mism.length) statusNode = el("span", { class:"pillSmall pillWarn" }, `mismatch: ${mism.join(", ")}`);
+            statusNode = el("span", { class:"pillSmall pillGood" }, "ok");
           }
+        } else if (withSchema) {
+          // with_schema enabled but no columns returned for this model
+          statusNode = el("span", { class:"pillSmall pillWarn" }, "unavailable");
         }
 
         const colLink = routeWithFacets(
@@ -2437,10 +2539,43 @@ function buildContractCard(state, m) {
             "No contract defined for this model."
           )
         : el("div", {},
+            drift.status !== "none"
+            ? el("div", { style:"margin:10px 0 14px 0;" },
+                el("div", { class:"k", style:"margin-bottom:6px;" }, "Drift summary"),
+                drift.status === "unavailable"
+                  ? el("p", { class:"empty", style:"margin:0;" }, "Schema unavailable for diff. Enable schema collection to verify the contract.")
+                  : el("div", { class:"pillRow" },
+                      el("span", { class:"pillSmall" }, `missing: ${drift.missing.length}`),
+                      el("span", { class:"pillSmall" }, `extra: ${drift.extra.length}`),
+                      el("span", { class:"pillSmall" }, `mismatched: ${drift.mismatches.length}`),
+                      (!drift.constraintsComparable && rawCols.some(c => (c.constraints || []).length))
+                        ? el("span", { class:"pillSmall pillWarn", title:"Warehouse schema does not include constraints yet" }, "constraints: not verifiable")
+                        : null
+                    )
+              )
+            : null,
+
             (tblConstraints && tblConstraints.length)
               ? el("div", { style:"margin:10px 0 14px 0;" },
                   el("div", { class:"k", style:"margin-bottom:6px;" }, "Table constraints"),
                   el("div", {}, renderConstraintsList(tblConstraints))
+                )
+              : null,
+
+            (drift.status !== "unavailable" && drift.extra.length)
+              ? el("div", { style:"margin:10px 0 14px 0;" },
+                  el("div", { class:"k", style:"margin-bottom:6px;" }, "Extra columns in warehouse (not in contract)"),
+                  el("div", {},
+                    joinInline(
+                      drift.extra
+                        .slice(0, 60)
+                        .map(nm => {
+                          const href = routeWithFacets(`#/model/${escapeHashPart(m.name)}?tab=columns&col=${encodeURIComponent(nm)}`);
+                          return el("a", { href, onclick:(e)=>{ e.preventDefault(); location.hash = href; } }, nm);
+                        })
+                    ),
+                    drift.extra.length > 60 ? el("span", { class:"empty" }, ` … +${drift.extra.length - 60} more`) : null
+                  )
                 )
               : null,
 
