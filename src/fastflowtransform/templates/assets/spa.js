@@ -669,8 +669,13 @@ function renderDocsBadges(state, m, { compact = false } = {}) {
     );
   }
 
+  const contracted = hasContract(m);
+  const contractPill = contracted
+    ? el("span", { class:"pillSmall pillGood", title:"Model contract defined" }, "Contracted")
+    : null;
+
   const cls = compact ? "docPills docPillsCompact" : "docPills docPillsHeader";
-  return el("div", { class: cls }, modelPill, colPill);
+  return el("div", { class: cls }, modelPill, colPill, contractPill);
 }
 
 function renderDocsCoverageCard(state, cov) {
@@ -711,7 +716,7 @@ function renderUndocumentedModelsCard(state, cov) {
   const countNode = el("span", { class: "colCount" }, "");
 
   const qInput = el("input", {
-    class: "input",
+    class: "search",
     type: "search",
     placeholder: "Filter models… (name or path)",
     value: uiState.q || "",
@@ -832,6 +837,83 @@ function renderUndocumentedModelsCard(state, cov) {
     tabRow,
     list
   );
+}
+
+
+function hasContract(m) {
+  const c = m && m.contract;
+  if (!c) return false;
+  if (c === true) return true;
+  const cols = contractColumnsFrom(m);
+  const tbl = contractTableConstraintsFrom(m);
+  return (cols && cols.length) || (tbl && tbl.length) || (c.enforced != null);
+}
+
+function contractColumnsFrom(m) {
+  const c = m && m.contract;
+  if (!c) return [];
+  if (Array.isArray(c)) return c;
+
+  const colsSpec = c.columns ?? c.schema ?? c.fields;
+  if (!colsSpec) return [];
+
+  if (Array.isArray(colsSpec)) return colsSpec.filter(x => x && typeof x === "object");
+
+  if (colsSpec && typeof colsSpec === "object") {
+    return Object.entries(colsSpec).map(([name, spec]) => {
+      if (spec && typeof spec === "object" && !Array.isArray(spec)) return { name, ...spec };
+      if (typeof spec === "string") return { name, dtype: spec };
+      return { name };
+    });
+  }
+  return [];
+}
+
+function contractTableConstraintsFrom(m) {
+  const c = m && m.contract;
+  if (!c || typeof c !== "object") return [];
+  const v = c.constraints ?? c.table_constraints;
+  if (!v) return [];
+  return Array.isArray(v) ? v : [v];
+}
+
+function normalizeContractCol(col) {
+  const name = String(col?.name || "").trim();
+  if (!name) return null;
+
+  const dtype = col?.dtype ?? col?.type ?? col?.data_type;
+  let nullable = col?.nullable;
+  if (nullable == null && col?.not_null != null) nullable = !col.not_null;
+
+  let constraints = col?.constraints ?? col?.tests ?? [];
+  if (constraints && !Array.isArray(constraints)) constraints = [constraints];
+
+  return {
+    name,
+    dtype: dtype != null ? String(dtype) : "",
+    nullable: (nullable === true || nullable === false) ? nullable : null,
+    constraints: constraints || [],
+  };
+}
+
+function renderConstraintsList(items) {
+  const arr = Array.isArray(items) ? items : (items ? [items] : []);
+  if (!arr.length) return el("span", { class:"empty" }, "—");
+
+  const wrap = el("span", { class:"pillRow" });
+  for (const it of arr) {
+    if (typeof it === "string") {
+      wrap.appendChild(el("span", { class:"pillSmall" }, it));
+    } else if (it && typeof it === "object") {
+      wrap.appendChild(
+        el("details", { style:"display:inline-block;" },
+          el("summary", { class:"codeSummary" }, "constraint"),
+          el("pre", { class:"mono", style:"white-space:pre-wrap; margin:8px 0 0 0;" }, jsonPreview(it))
+        )
+      );
+    }
+  }
+  return wrap;
 }
 
 
@@ -1250,7 +1332,7 @@ function renderModel(state, name, tabFromRoute, colFromRoute) {
   const active = (tabFromRoute || state.modelTabDefault || "overview").toLowerCase();
   const hasCol = !!(colFromRoute && String(colFromRoute).trim());
 
-  let tab = ["overview","columns","lineage","code","meta"].includes(active) ? active : "overview";
+  let tab = ["overview","columns","contract","lineage","code","meta"].includes(active) ? active : "overview";
   // Only force columns if col is present AND the URL didn't explicitly set a tab
   if (hasCol && !tabFromRoute) tab = "columns";
 
@@ -1420,6 +1502,10 @@ function renderModelPanel(state, m, tab, colFromRoute) {
     return el("div", {},
       renderModelConfigMetaCard(m, { includeRaw: true })
     );
+  }
+
+  if (tab === "contract") {
+    return buildContractCard(state, m);
   }
 
   return el("div", { class: "card" }, el("p", { class: "empty" }, "Unknown tab."));
@@ -1832,6 +1918,7 @@ function renderTabs(active, onPick) {
   const tabs = [
     ["overview", "Overview"],
     ["columns", "Columns"],
+    ["contract", "Contract"], 
     ["lineage", "Lineage"],
     ["code", "Code"],
     ["meta", "Meta"],
@@ -2248,6 +2335,155 @@ function buildColumnsCard(state, m, colFromRoute) {
   card.append(el("h3", {}, `Columns (${cols.length})`), tools, table);
   renderHead();
   renderBody();
+
+  return card;
+}
+
+function buildContractCard(state, m) {
+  const withSchema = !!state.manifest.project?.with_schema;
+
+  const rawCols = contractColumnsFrom(m).map(normalizeContractCol).filter(Boolean);
+  const tblConstraints = contractTableConstraintsFrom(m);
+
+  // UI state per model
+  state.contractUI ||= {};
+  const uiState = (state.contractUI[m.name] ||= { q: "" });
+
+  const card = el("div", { class:"card" });
+
+  const tools = el("div", { class:"colTools" });
+  const qInput = el("input", {
+    class:"search",
+    type:"search",
+    placeholder:"Filter contract columns…",
+    value: uiState.q || "",
+    oninput: (e) => { uiState.q = e.target.value || ""; renderBody(); }
+  });
+
+  const headRow = el("div", { class:"row", style:"align-items:center; justify-content:space-between;" },
+    el("h3", { style:"margin:0;" }, "Contract"),
+    hasContract(m)
+      ? el("div", { class:"pillRow" },
+          el("span", { class:"pillSmall pillGood" }, "Contracted"),
+          (m.contract && typeof m.contract === "object" && m.contract.enforced != null)
+            ? el("span", { class:"pillSmall" }, m.contract.enforced ? "enforced" : "not enforced")
+            : null
+        )
+      : null
+  );
+
+  tools.appendChild(qInput);
+
+  const body = el("div", {});
+
+  function renderBody() {
+    const q = (uiState.q || "").trim().toLowerCase();
+
+    const rows = rawCols
+      .filter(c => {
+        if (!q) return true;
+        const cstr = [
+          c.name,
+          c.dtype || "",
+          (c.nullable === true ? "nullable" : c.nullable === false ? "not null" : ""),
+          JSON.stringify(c.constraints || []),
+        ].join(" ").toLowerCase();
+        return cstr.includes(q);
+      })
+      .sort((a,b) => a.name.localeCompare(b.name))
+      .map(c => {
+        // Optional: show “missing/mismatch” if schema is available
+        let statusNode = null;
+        if (withSchema) {
+          const actual = (m.columns || []).find(x => (x.name || "").toLowerCase() === c.name.toLowerCase());
+          if (!actual) {
+            statusNode = el("span", { class:"pillSmall pillBad" }, "missing");
+          } else {
+            const mism = [];
+            if (c.dtype && actual.dtype && String(actual.dtype).toLowerCase() !== String(c.dtype).toLowerCase()) mism.push("type");
+            if (c.nullable != null && !!actual.nullable !== !!c.nullable) mism.push("nullability");
+            if (mism.length) statusNode = el("span", { class:"pillSmall pillWarn" }, `mismatch: ${mism.join(", ")}`);
+          }
+        }
+
+        const colLink = routeWithFacets(
+          `#/model/${escapeHashPart(m.name)}?tab=columns&col=${encodeURIComponent(c.name)}`
+        );
+
+        return el("tr", {},
+          el("td", {},
+            el("a", {
+              href: colLink,
+              onclick: (e) => { e.preventDefault(); location.hash = colLink; },
+              style:"text-decoration:none;"
+            }, el("code", {}, c.name))
+          ),
+          el("td", {}, c.dtype ? el("code", {}, c.dtype) : el("span", { class:"empty" }, "—")),
+          el("td", {},
+            c.nullable === true ? el("span", { class:"pillSmall" }, "nullable") :
+            c.nullable === false ? el("span", { class:"pillSmall pillBad" }, "not null") :
+            el("span", { class:"empty" }, "—")
+          ),
+          el("td", {}, renderConstraintsList(c.constraints)),
+          el("td", {}, statusNode || el("span", { class:"empty" }, "—"))
+        );
+      });
+
+    const hasAnything = rawCols.length || (tblConstraints && tblConstraints.length);
+
+    body.replaceChildren(
+      !hasAnything
+        ? el("p", { class:"empty", style:"margin:10px 0 0 0;" },
+            "No contract defined for this model."
+          )
+        : el("div", {},
+            (tblConstraints && tblConstraints.length)
+              ? el("div", { style:"margin:10px 0 14px 0;" },
+                  el("div", { class:"k", style:"margin-bottom:6px;" }, "Table constraints"),
+                  el("div", {}, renderConstraintsList(tblConstraints))
+                )
+              : null,
+
+            rawCols.length
+              ? el("table", { class:"table" },
+                  el("thead", {}, el("tr", {},
+                    el("th", {}, "Column"),
+                    el("th", {}, "Type"),
+                    el("th", {}, "Nullability"),
+                    el("th", {}, "Constraints"),
+                    el("th", {}, withSchema ? "Status vs actual" : "Status"),
+                  )),
+                  el("tbody", {}, ...rows)
+                )
+              : el("p", { class:"empty" }, "No contract columns specified.")
+          )
+    );
+  }
+
+  renderBody();
+  card.appendChild(headRow);
+  card.appendChild(tools);
+  card.appendChild(body);
+
+  // Small “how to define” hint (kept lightweight + collapsible)
+  card.appendChild(
+    el("details", { class:"codeDetails", style:"margin-top:12px;" },
+      el("summary", { class:"codeSummary" }, "How to define a contract"),
+      el("pre", { class:"mono", style:"white-space:pre-wrap; margin:8px 0 0 0;" },
+`# project.yml
+docs:
+  models:
+    ${m.name}:
+      contract:
+        enforced: true
+        columns:
+          some_col:
+            dtype: text
+            nullable: false
+            constraints: ["unique"]`
+      )
+    )
+  );
 
   return card;
 }

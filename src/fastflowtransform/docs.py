@@ -37,6 +37,7 @@ class ModelDoc:
     domain: str | None = None
     description_html: str | None = None
     description_short: str | None = None
+    contract: dict[str, Any] | None = None
 
 
 @dataclass
@@ -295,6 +296,7 @@ def _build_spa_manifest(
                 "description_short": m.description_short,
                 "sources_used": src_used,
                 "columns": cols,
+                "contract": m.contract,
             }
         )
 
@@ -543,6 +545,11 @@ def _apply_descriptions_to_models(
             m.description_short = (short[:char_limit] + "…") if len(short) > char_limit else short
         else:
             m.description_short = None
+        m.contract = (
+            _normalize_contract(model_meta.get("contract"))
+            if isinstance(model_meta, dict)
+            else None
+        )
 
         if not with_schema or m.relation not in cols_by_table:
             continue
@@ -809,6 +816,89 @@ def render_site(
         _render_source_pages(env, out_dir, sources)
 
 
+def _normalize_contract(obj: Any) -> dict[str, Any] | None:
+    """
+    Normalize contract specs from YAML/front-matter into a manifest-friendly shape:
+      {
+        "enforced": bool | None,
+        "columns": [
+          {"name": str, "dtype": str|None, "nullable": bool|None, "constraints": list[Any]}
+        ],
+        "constraints": list[Any],
+      }
+    """
+    if obj is None or obj is False:
+        return None
+
+    # Allow "contract: true" as a lightweight marker
+    if obj is True:
+        return {"enforced": None, "columns": [], "constraints": []}
+
+    if not isinstance(obj, dict):
+        return None
+
+    enforced = obj.get("enforced", None)
+    if enforced is None:
+        enforced = obj.get("enabled", None)
+    if enforced is not None:
+        enforced = bool(enforced)
+
+    # Accept aliases: columns/schema/fields
+    cols_spec = obj.get("columns", None)
+    if cols_spec is None:
+        cols_spec = obj.get("schema", None)
+    if cols_spec is None:
+        cols_spec = obj.get("fields", None)
+
+    cols_out: list[dict[str, Any]] = []
+
+    def _constraints(v: Any) -> list[Any]:
+        if v is None or v == "":
+            return []
+        if isinstance(v, list):
+            return v
+        return [v]
+
+    if isinstance(cols_spec, dict):
+        for name, spec in cols_spec.items():
+            row: dict[str, Any] = {"name": str(name)}
+            if isinstance(spec, str):
+                row["dtype"] = spec
+            elif isinstance(spec, dict):
+                row["dtype"] = spec.get("dtype") or spec.get("type") or spec.get("data_type")
+                if "nullable" in spec:
+                    row["nullable"] = bool(spec.get("nullable"))
+                elif "not_null" in spec:
+                    row["nullable"] = not bool(spec.get("not_null"))
+                row["constraints"] = _constraints(spec.get("constraints") or spec.get("tests"))
+            cols_out.append(row)
+    elif isinstance(cols_spec, list):
+        for it in cols_spec:
+            if not isinstance(it, dict):
+                continue
+            nm = it.get("name")
+            if not nm:
+                continue
+            row = {"name": str(nm)}
+            row["dtype"] = it.get("dtype") or it.get("type") or it.get("data_type")
+            if "nullable" in it:
+                row["nullable"] = bool(it.get("nullable"))
+            elif "not_null" in it:
+                row["nullable"] = not bool(it.get("not_null"))
+            row["constraints"] = _constraints(it.get("constraints") or it.get("tests"))
+            cols_out.append(row)
+
+    tbl_constraints = obj.get("constraints") or obj.get("table_constraints") or []
+    if tbl_constraints and not isinstance(tbl_constraints, list):
+        tbl_constraints = [tbl_constraints]
+
+    return {
+        "enforced": enforced,
+        "columns": cols_out,
+        "constraints": tbl_constraints or [],
+    }
+
+
 def read_docs_metadata(project_dir: Path) -> dict[str, Any]:
     """
     Merge YAML + Markdown descriptions with priority: Markdown > YAML.
@@ -830,6 +920,8 @@ def read_docs_metadata(project_dir: Path) -> dict[str, Any]:
         desc = (meta or {}).get("description")
         cols = (meta or {}).get("columns") or {}
         lineage_yaml = (meta or {}).get("lineage")
+        contract_yaml = (meta or {}).get("contract")
+        contract_norm = _normalize_contract(contract_yaml)
 
         out_models[model] = {
             "description_html": _render_minimarkdown(desc) if desc else None,
@@ -840,16 +932,25 @@ def read_docs_metadata(project_dir: Path) -> dict[str, Any]:
         }
         if isinstance(lineage_yaml, dict):
             out_models[model]["lineage"] = lineage_yaml
+        if contract_norm is not None:
+            out_models[model]["contract"] = contract_norm
 
     # 2) Markdown model overrides: docs/models/<model>.md
     md_models_dir = project_dir / "docs" / "models"
     if md_models_dir.exists():
         for p in md_models_dir.glob("*.md"):
             model_name = p.stem
-            _, body = _read_markdown_file(p)
+            fm, body = _read_markdown_file(p)
             if body.strip():
                 out_models.setdefault(model_name, {"description_html": None, "columns": {}})
                 out_models[model_name]["description_html"] = _render_minimarkdown(body)
+
+            # contract in front matter overrides YAML
+            if isinstance(fm, dict) and "contract" in fm:
+                c = _normalize_contract(fm.get("contract"))
+                if c is not None:
+                    out_models.setdefault(model_name, {"description_html": None, "columns": {}})
+                    out_models[model_name]["contract"] = c
 
     # 3) Markdown column overrides: docs/columns/<relation>/<column>.md
     out_columns: dict[str, dict[str, str]] = {}
