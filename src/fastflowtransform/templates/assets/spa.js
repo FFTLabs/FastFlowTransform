@@ -2730,7 +2730,7 @@ async function main() {
     const sel = Math.max(0, Math.min(state.search.selected || 0, results.length - 1));
 
     const q = (state.search.query || "").trim();
-    const sub = (() => {
+    const subFor = (r) => {
       if (r.kind === "column") {
         const parts = [
           "COLUMN",
@@ -2750,9 +2750,10 @@ async function main() {
         return snip ? `SOURCE • ${r.subtitle || ""} • ${snip}` : `SOURCE • ${r.subtitle || ""}`;
       }
       return `${(r.kind || "").toUpperCase()} • ${r.subtitle || ""}`;
-    })();
+    };
 
-    const right = r.kind === "column" && r.dtype
+    const rightFor = (r) =>
+      (r.kind === "column" && r.dtype)
       ? el("span", { class: "pill" }, r.dtype)
       : el("div", { class: "kbd" }, "↵");
 
@@ -2768,9 +2769,9 @@ async function main() {
             },
               el("div", { class: "resultMain" },
                 el("div", { class: "resultTitle" }, r.title),
-                el("div", { class: "resultSub" }, sub)
+                el("div", { class: "resultSub" }, subFor(r))
               ),
-              right
+              rightFor(r)
             )
           )
         : [el("div", { class: "result" },
