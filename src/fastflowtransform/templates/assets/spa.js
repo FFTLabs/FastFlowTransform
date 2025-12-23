@@ -302,7 +302,12 @@ function parseRoute() {
   if (parts[0] === "source" && parts[1] && parts[2]) {
     return { route: "source", source: decodeURIComponent(parts[1]), table: decodeURIComponent(parts[2]) };
   }
-  if (parts[0] === "macros") return { route: "macros" };
+
+  if (parts[0] === "macro" && parts[1]) {
+    return { route: "macro", name: decodeURIComponent(parts.slice(1).join("/")) };
+  }
+
+  if (parts[0] === "macros") return { route: "macros", q: query.get("mq") || "" };
 
   return { route: "home" };
 }
@@ -1464,26 +1469,169 @@ function renderSource(state, sourceName, tableName) {
   );
 }
 
-function renderMacros(state) {
+function macroSourceText(m) {
+  if (!m) return "";
+  return (
+    m.source ||
+    m.raw_sql ||
+    m.sql ||
+    m.definition ||
+    m.code ||
+    (m.meta && (m.meta.source || m.meta.raw_sql || m.meta.sql || m.meta.code)) ||
+    ""
+  );
+}
+
+function renderMacros(state, qFromRoute) {
   const ms = state.manifest.macros || [];
-  return el("div", { class: "card" },
-    el("h2", {}, "Macros"),
-    ms.length
-      ? el("table", { class: "table" },
-          el("thead", {}, el("tr", {},
-            el("th", {}, "Name"),
-            el("th", {}, "Kind"),
-            el("th", {}, "Path"),
-          )),
-          el("tbody", {},
-            ...ms.map(m => el("tr", {},
-              el("td", {}, el("code", {}, m.name)),
-              el("td", {}, m.kind),
-              el("td", {}, el("code", {}, m.path)),
-            ))
+  const wrap = el("div", { class: "card" }, el("h2", {}, "Macros"));
+
+  if (!ms.length) {
+    wrap.appendChild(el("p", { class: "empty" }, "No macros discovered."));
+    return wrap;
+  }
+
+  const q0 = (qFromRoute || "").trim();
+  state.macroQuery = q0;
+
+  const countEl = el("div", { class: "muted", style: "margin-top:6px;" }, "");
+  const list = el("ul", { class: "docList" });
+
+  const input = el("input", {
+    class: "search",
+    type: "search",
+    placeholder: "Search macros…",
+    value: q0,
+  });
+
+  const apply = () => {
+    const q = (input.value || "").trim().toLowerCase();
+
+    const filtered = q
+      ? ms.filter(m => {
+          const name = (m.name || "").toLowerCase();
+          const kind = (m.kind || "").toLowerCase();
+          const path = (m.path || "").toLowerCase();
+          const src = macroSourceText(m).toLowerCase();
+          return name.includes(q) || kind.includes(q) || path.includes(q) || src.includes(q);
+        })
+      : ms.slice();
+
+    filtered.sort((a, b) => (a.name || "").localeCompare(b.name || ""));
+
+    countEl.textContent = q
+      ? `${filtered.length} of ${ms.length} macros`
+      : `${ms.length} macros`;
+
+    list.replaceChildren(
+      ...filtered.map(m => {
+        const src = macroSourceText(m);
+        const snip = q ? makeSnippet(src, q, 90) : "";
+        const subParts = [
+          (m.kind || "macro").toUpperCase(),
+          m.path ? `• ${m.path}` : "",
+          snip ? `• ${snip}` : "",
+        ].filter(Boolean).join(" ");
+
+        const href = routeWithFacets(`#/macro/${escapeHashPart(m.name)}`);
+
+        return el("li", { class: "docRow" },
+          el("a", {
+            href,
+            onclick: (e) => { e.preventDefault(); location.hash = href; },
+            title: m.path || m.name,
+          },
+            el("div", { class: "docRowMain" },
+              el("div", { class: "docRowTitle" }, m.name),
+              el("div", { class: "docRowSub" }, subParts)
+            ),
+            el("div", { class: "docRowPills" },
+              el("span", { class: "pillSmall" }, m.kind || "macro")
+            )
           )
+        );
+      })
+    );
+  };
+
+  const syncUrl = debounce(() => {
+    const v = (input.value || "").trim();
+    replaceHashQuery((q) => {
+      if (v) q.set("mq", v);
+      else q.delete("mq");
+    });
+  }, 200);
+
+  input.oninput = () => {
+    syncUrl();
+    apply();
+  };
+
+  input.onkeydown = (e) => {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      input.value = "";
+      syncUrl();
+      apply();
+    }
+  };
+
+  wrap.appendChild(input);
+  wrap.appendChild(countEl);
+  wrap.appendChild(list);
+
+  apply();
+  return wrap;
+}
+
+function renderMacro(state, name) {
+  const ms = state.manifest.macros || [];
+  const m =
+    ms.find(x => x.name === name) ||
+    ms.find(x => (x.name || "").toLowerCase() === (name || "").toLowerCase());
+
+  const back = state.macroQuery
+    ? `#/macros?mq=${encodeURIComponent(state.macroQuery)}`
+    : "#/macros";
+
+  if (!m) {
+    return el("div", { class: "card" },
+      el("div", { class: "row" },
+        el("a", {
+          class: "btn",
+          href: routeWithFacets(back),
+          onclick: (e) => { e.preventDefault(); location.hash = routeWithFacets(back); }
+        }, "← Macros")
+      ),
+      el("h2", {}, "Macro not found"),
+      el("p", { class: "empty" }, name)
+    );
+  }
+
+  const src = macroSourceText(m);
+  const maxChars = 16000;
+  const clipped = src && src.length > maxChars ? (src.slice(0, maxChars) + "\n\n… (truncated)") : src;
+
+  return el("div", { class: "card" },
+    el("div", { class: "row" },
+      el("a", {
+        class: "btn",
+        href: routeWithFacets(back),
+        onclick: (e) => { e.preventDefault(); location.hash = routeWithFacets(back); }
+      }, "← Macros"),
+      el("span", { class: "pill" }, m.kind || "macro")
+    ),
+    el("h2", {}, m.name),
+    el("div", { class: "kvRows" },
+      el("div", { class: "kvRow" }, el("span", { class: "k" }, "Kind"), el("span", { class: "v" }, m.kind || "macro")),
+      el("div", { class: "kvRow" }, el("span", { class: "k" }, "Path"), el("span", { class: "v" }, m.path ? el("code", {}, m.path) : "—"))
+    ),
+    clipped
+      ? el("details", { class: "codeDetails" },
+          el("summary", { class: "codeSummary" }, "Show macro source"),
+          el("pre", { class: "codeBlock" }, clipped)
         )
-      : el("p", { class: "empty" }, "No macros discovered.")
+      : el("p", { class: "empty" }, "No macro source available in manifest.")
   );
 }
 
@@ -3323,8 +3471,8 @@ async function main() {
     ...macros.map(m =>
       el("li", { class: "item" },
         el("a", {
-          href: routeWithFacets("#/macros"),
-          onclick: (e) => { e.preventDefault(); location.hash = routeWithFacets("#/macros"); },
+          href: routeWithFacets(`#/macro/${escapeHashPart(m.name)}`),
+          onclick: (e) => { e.preventDefault(); location.hash = routeWithFacets(`#/macro/${escapeHashPart(m.name)}`); },
           title: m.path || m.name,
         },
           el("span", {}, m.name),
@@ -3347,7 +3495,8 @@ async function main() {
     let view;
     if (route.route === "model") view = renderModel(state, route.name, route.tab, route.col);
     else if (route.route === "source") view = renderSource(state, route.source, route.table);
-    else if (route.route === "macros") view = renderMacros(state);
+    else if (route.route === "macro") view = renderMacro(state, route.name);
+    else if (route.route === "macros") { state.macroQuery = route.q || ""; view = renderMacros(state, state.macroQuery); }
     else view = renderHome(state);
 
     state.ui.mainHost.replaceChildren(view);
