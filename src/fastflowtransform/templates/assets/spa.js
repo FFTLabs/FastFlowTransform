@@ -1349,6 +1349,7 @@ function renderModelPanel(state, m, tab, colFromRoute) {
           el("div", { class: "k" }, "Sources"), el("div", {}, sourcesUsed.length ? joinInline(sourcesUsed) : el("span", { class: "empty" }, "—")),
         )
       ),
+      renderModelConfigMetaCard(m),
       miniPanel,
       m.description_html
         ? el("div", { class: "card" }, el("h3", {}, "Description"), el("div", { class: "desc", html: m.description_html }))
@@ -1391,20 +1392,8 @@ function renderModelPanel(state, m, tab, colFromRoute) {
   }
 
   if (tab === "meta") {
-    // Show a structured dump of whatever we have
-    const meta = {
-      name: m.name,
-      kind: m.kind,
-      relation: m.relation,
-      materialized: m.materialized,
-      path: m.path,
-      deps: m.deps || [],
-      used_by: m.used_by || [],
-      sources_used: m.sources_used || [],
-    };
-    return el("div", { class: "card" },
-      el("h3", {}, "Meta"),
-      el("pre", { class: "mono", style: "white-space:pre-wrap; margin:0;" }, JSON.stringify(meta, null, 2))
+    return el("div", {},
+      renderModelConfigMetaCard(m, { includeRaw: true })
     );
   }
 
@@ -1414,7 +1403,6 @@ function renderModelPanel(state, m, tab, colFromRoute) {
 function cssSafeId(s) {
   return String(s || "").replace(/[^a-zA-Z0-9_-]+/g, "_");
 }
-
 
 function renderSource(state, sourceName, tableName) {
   const key = `${sourceName}.${tableName}`;
@@ -1642,6 +1630,144 @@ function joinInline(nodes) {
     wrap.appendChild(n);
   });
   return wrap;
+}
+
+// -------- Structured meta/config panel ---------------------------------
+
+function tryParseRelationParts(rel) {
+  const s = String(rel || "").trim();
+  if (!s) return {};
+  // Avoid guessing when relation contains quoting or brackets
+  if (/[`"\[\]]/.test(s)) return {};
+  const parts = s.split(".").map(p => p.trim()).filter(Boolean);
+  if (parts.length === 3) return { database: parts[0], schema: parts[1], identifier: parts[2] };
+  if (parts.length === 2) return { schema: parts[0], identifier: parts[1] };
+  return {};
+}
+
+function asStringArray(v) {
+  if (!v) return [];
+  if (Array.isArray(v)) return v.map(x => String(x)).filter(Boolean);
+  if (typeof v === "string") {
+    // allow comma-separated
+    return v.split(",").map(s => s.trim()).filter(Boolean);
+  }
+  return [String(v)];
+}
+
+function renderPillList(values) {
+  const vs = asStringArray(values);
+  if (!vs.length) return el("span", { class: "empty" }, "—");
+  return joinInline(vs.map(x => el("span", { class: "pillSmall" }, x)));
+}
+
+function jsonPreview(obj, maxChars = 6000) {
+  let s;
+  try { s = JSON.stringify(obj, null, 2); }
+  catch { s = String(obj); }
+  if (s.length > maxChars) s = s.slice(0, maxChars) + "\n… (truncated)";
+  return s;
+}
+
+function renderMetaValue(v) {
+  if (v == null || v === "") return el("span", { class: "empty" }, "—");
+  if (typeof v === "boolean") return el("span", { class: "pillSmall" }, v ? "true" : "false");
+  if (typeof v === "number") return el("code", {}, String(v));
+  if (Array.isArray(v)) return renderPillList(v);
+  if (typeof v === "object") {
+    return el("details", {},
+      el("summary", { class: "codeSummary" }, "View"),
+      el("pre", { class: "mono", style: "white-space:pre-wrap; margin:8px 0 0 0;" }, jsonPreview(v))
+    );
+  }
+  const s = String(v);
+  // prefer code styling for short config-y strings
+  return s.length <= 80 && !/\s/.test(s) ? el("code", {}, s) : el("span", {}, s);
+}
+
+function pick(obj, keys) {
+  for (const k of keys) {
+    const v = obj && obj[k];
+    if (v != null && String(v).trim() !== "") return v;
+  }
+  return "";
+}
+
+function renderModelConfigMetaCard(m, { includeRaw = false } = {}) {
+  const relParts = tryParseRelationParts(m.relation);
+
+  const database = pick(m, ["database"]) || relParts.database || "";
+  const schema = pick(m, ["schema"]) || relParts.schema || "";
+  const alias = pick(m, ["alias", "identifier", "name"]) || relParts.identifier || "";
+
+  const tags = pick(m, ["tags"]) || (m.meta && (m.meta.tags || m.meta.tag)) || "";
+  const owners = pick(m, ["owners", "owner"]) || (m.meta && (m.meta.owners || m.meta.owner)) || "";
+
+  const reserved = new Set([
+    "name","kind","relation","materialized","path",
+    "database","schema","alias","identifier",
+    "tags","tag","owners","owner",
+  ]);
+
+  // Custom meta/config: show whatever else is present without duplicating known fields.
+  const custom = {};
+  const metaObj = (m.meta && typeof m.meta === "object" && !Array.isArray(m.meta)) ? m.meta : null;
+  const cfgObj = (m.config && typeof m.config === "object" && !Array.isArray(m.config)) ? m.config : null;
+
+  function addCustomFrom(obj) {
+    if (!obj) return;
+    for (const [k, v] of Object.entries(obj)) {
+      if (reserved.has(k)) continue;
+      if (v == null || v === "" || (Array.isArray(v) && !v.length)) continue;
+      if (custom[k] == null) custom[k] = v;
+    }
+  }
+  addCustomFrom(cfgObj);
+  addCustomFrom(metaObj);
+
+  const customKeys = Object.keys(custom).sort((a, b) => a.localeCompare(b));
+
+  const customDetails = customKeys.length
+    ? el("details", {},
+        el("summary", { class: "codeSummary" }, `Custom meta (${customKeys.length})`),
+        el("table", { class: "table", style: "margin-top:10px;" },
+          el("thead", {}, el("tr", {}, el("th", {}, "Key"), el("th", {}, "Value"))),
+          el("tbody", {},
+            ...customKeys.map(k =>
+              el("tr", {},
+                el("td", {}, el("code", {}, k)),
+                el("td", {}, renderMetaValue(custom[k]))
+              )
+            )
+          )
+        )
+      )
+    : el("p", { class: "empty", style: "margin:10px 0 0 0;" }, "No custom meta.");
+
+  const rawBlock = includeRaw
+    ? el("details", { class: "codeDetails", style: "margin-top:10px;" },
+        el("summary", { class: "codeSummary" }, "Raw meta/config JSON"),
+        el("pre", { class: "mono", style: "white-space:pre-wrap; margin:8px 0 0 0;" },
+          jsonPreview({ config: cfgObj || null, meta: metaObj || null })
+        )
+      )
+    : null;
+
+  return el("div", { class: "card" },
+    el("h3", {}, "Config & meta"),
+    el("div", { class: "kv" },
+      el("div", { class: "k" }, "Materialized"), el("div", {}, renderMetaValue(m.materialized || "")),
+      el("div", { class: "k" }, "Database"), el("div", {}, renderMetaValue(database)),
+      el("div", { class: "k" }, "Schema"), el("div", {}, renderMetaValue(schema)),
+      el("div", { class: "k" }, "Alias"), el("div", {}, renderMetaValue(alias)),
+      el("div", { class: "k" }, "Relation"), el("div", {}, m.relation ? el("code", {}, m.relation) : el("span", { class: "empty" }, "—")),
+      el("div", { class: "k" }, "Path"), el("div", {}, el("code", {}, m.path || "—")),
+      el("div", { class: "k" }, "Tags"), el("div", {}, renderPillList(tags)),
+      el("div", { class: "k" }, "Owners"), el("div", {}, renderPillList(owners)),
+    ),
+    customDetails,
+    rawBlock
+  );
 }
 
 function renderLineage(items) {

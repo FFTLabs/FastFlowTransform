@@ -600,3 +600,6 @@ tr.colHit{
   overflow: auto;
   background: color-mix(in srgb, var(--card), transparent 10%);
 }
+
+.codeSummary { cursor: pointer; }
+.codeDetails { margin-top: 8px; }
