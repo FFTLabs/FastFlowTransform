@@ -603,3 +603,18 @@ tr.colHit{
 
 .codeSummary { cursor: pointer; }
 .codeDetails { margin-top: 8px; }
+
+.facetChipsWrap { flex-wrap: wrap; }
+
+.groupHeader { margin-top: 10px; list-style:none; }
+.groupHeaderRow{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:10px;
+  color: var(--muted);
+  font-size: 11px;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  padding: 6px 2px;
+}

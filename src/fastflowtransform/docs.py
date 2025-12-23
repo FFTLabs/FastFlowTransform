@@ -32,6 +32,9 @@ class ModelDoc:
     relation: str
     deps: list[str]
     materialized: str
+    owners: list[str] = field(default_factory=list)
+    tags: list[str] = field(default_factory=list)
+    domain: str | None = None
     description_html: str | None = None
     description_short: str | None = None
 
@@ -53,6 +56,30 @@ def _safe_filename(name: str) -> str:
     """Filename sanitized while keeping dots/slashes meaningful."""
     s = re.sub(r"[^A-Za-z0-9_.-]", "_", name)
     return s or "_model"
+
+
+def _as_list(v: Any) -> list[str]:
+    if v is None:
+        return []
+    if isinstance(v, list):
+        return [str(x).strip() for x in v if str(x).strip()]
+    if isinstance(v, str):
+        # allow comma-separated
+        return [s.strip() for s in v.split(",") if s.strip()]
+    s = str(v).strip()
+    return [s] if s else []
+
+
+def _domain_from_path(path: str) -> str:
+    p = (path or "").replace("\\", "/").lstrip("/")
+    # try to make domain stable even if absolute paths leak in
+    # common case: ".../models/<domain>/..."
+    if "/models/" in p.lower():
+        p = p.lower().split("/models/", 1)[1]
+    elif p.lower().startswith("models/"):
+        p = p[7:]
+    parts = [x for x in p.split("/") if x]
+    return parts[0] if parts else ""
 
 
 def _collect_columns(executor: Any) -> dict[str, list[ColumnInfo]]:
@@ -260,6 +287,9 @@ def _build_spa_manifest(
                 "deps": list(m.deps or []),
                 "used_by": list(used_by.get(m.name, []) or []),
                 "materialized": m.materialized,
+                "owners": list(m.owners or []),
+                "tags": list(m.tags or []),
+                "domain": m.domain,
                 "description_html": m.description_html,
                 "description_text": _html_to_text(model_desc_html_s),
                 "description_short": m.description_short,
@@ -340,17 +370,33 @@ def _build_macro_list(proj_dir: Path | None) -> list[dict[str, str]]:
 
 
 def _collect_models(nodes: dict[str, Node]) -> list[ModelDoc]:
-    models = [
-        ModelDoc(
-            name=n.name,
-            kind=n.kind,
-            path=str(n.path),
-            relation=relation_for(n.name),
-            deps=list(n.deps or []),
-            materialized=(getattr(n, "meta", {}) or {}).get("materialized", "table"),
+    models: list[ModelDoc] = []
+    for n in nodes.values():
+        meta = getattr(n, "meta", {}) or {}
+        if not isinstance(meta, dict):
+            meta = {}
+
+        # Prefer explicit meta; fall back to deriving domain from path
+        owners = _as_list(meta.get("owners") or meta.get("owner"))
+        tags = _as_list(meta.get("tags") or meta.get("tag"))
+        domain = meta.get("domain") or meta.get("group")
+        domain_s = str(domain).strip() if domain is not None else ""
+        if not domain_s:
+            domain_s = _domain_from_path(str(n.path))
+
+        models.append(
+            ModelDoc(
+                name=n.name,
+                kind=n.kind,
+                path=str(n.path),
+                relation=relation_for(n.name),
+                deps=list(n.deps or []),
+                materialized=(meta or {}).get("materialized", "table"),
+                owners=owners,
+                tags=tags,
+                domain=domain_s or None,
+            )
         )
-        for n in nodes.values()
-    ]
     models.sort(key=lambda m: m.name)
     return models
 

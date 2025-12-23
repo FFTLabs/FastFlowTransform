@@ -94,6 +94,8 @@ const FACET_Q = {
   kind: "mk",         // "sql" | "python" (omit => both)
   materialized: "mm", // normalized materialization, or "__unknown__"
   path: "mp",         // path prefix
+  tags:"mt", 
+  group:"mg"
 };
 const MAT_UNKNOWN = "__unknown__";
 
@@ -121,6 +123,12 @@ function modelMatchesPathPrefix(modelPath, prefix) {
 
 function readModelFacetsFromQuery(query) {
   const mk = (query.get(FACET_Q.kind) || "").trim().toLowerCase();
+  const mt = (query.get(FACET_Q.tags) || "").trim();
+  const tags = mt ? mt.split(",").map(s => s.trim()).filter(Boolean) : [];
+
+  const mg = (query.get(FACET_Q.group) || "").trim().toLowerCase();
+  const groupBy = (mg === "owner" || mg === "domain") ? mg : "";
+
   const kinds = mk
     ? mk.split(",").map(s => s.trim()).filter(Boolean)
     : ["sql", "python"];
@@ -132,6 +140,8 @@ function readModelFacetsFromQuery(query) {
     kinds: Array.from(validKinds),
     materialized: normalizeMaterialized(query.get(FACET_Q.materialized) || ""),
     pathPrefix: query.get(FACET_Q.path) || "",
+    tags,
+    groupBy
   };
 }
 
@@ -149,6 +159,12 @@ function writeModelFacetsToQuery(query, facets) {
 
   if (facets.pathPrefix) query.set(FACET_Q.path, facets.pathPrefix);
   else query.delete(FACET_Q.path);
+
+  if (facets.tags && facets.tags.length) query.set(FACET_Q.tags, facets.tags.join(","));
+  else query.delete(FACET_Q.tags);
+
+  if (facets.groupBy) query.set(FACET_Q.group, facets.groupBy);
+  else query.delete(FACET_Q.group);
 }
 
 function currentModelFacets() {
@@ -158,13 +174,16 @@ function currentModelFacets() {
 function facetsActiveCount(f) {
   const kinds = new Set(f.kinds || []);
   const kindActive = !(kinds.has("sql") && kinds.has("python"));
-  return (kindActive ? 1 : 0) + (f.materialized ? 1 : 0) + (f.pathPrefix ? 1 : 0);
+  const tagsN = (f.tags || []).length;
+  const groupActive = f.groupBy ? 1 : 0;
+  return (kindActive ? 1 : 0) + (f.materialized ? 1 : 0) + (f.pathPrefix ? 1 : 0) + tagsN + groupActive;
 }
 
 function filterModelsWithFacets(models, facets) {
   const kinds = new Set((facets.kinds || []).map(k => (k || "").toLowerCase()));
   const mat = normalizeMaterialized(facets.materialized || "");
   const pref = facets.pathPrefix || "";
+  const tagSet = new Set((facets.tags || []).map(t => t.toLowerCase()));
 
   return (models || []).filter(m => {
     const kind = normalizeModelKind(m.kind);
@@ -180,6 +199,12 @@ function filterModelsWithFacets(models, facets) {
     }
 
     if (pref && !modelMatchesPathPrefix(m.path || "", pref)) return false;
+    
+    if (tagSet.size) {
+      const mtags = Array.isArray(m.tags) ? m.tags : [];
+      const ok = mtags.some(t => tagSet.has(String(t).toLowerCase()));
+      if (!ok) return false;
+    }
 
     return true;
   });
@@ -2879,7 +2904,6 @@ async function main() {
   // Initialize model facets from URL (shareable filters)
   state.modelFacets = currentModelFacets();
 
-
   toastOnce({
     key: `fft_docs_search_toast_seen:${projKey}`,
     title: "Quick search",
@@ -3337,22 +3361,61 @@ async function main() {
     type: "button",
     onclick: () => {
       debouncedPath.cancel();
-      state.modelFacets = { kinds: ["sql", "python"], materialized: "", pathPrefix: "" };
+      state.modelFacets = { kinds: ["sql", "python"], materialized: "", pathPrefix: "", tags: [], groupBy: "" };
       ui.sidebar.pathInput.value = "";
       applyFacetsToUrl();
       updateSidebarLists();
     }
   }, "Clear");
 
-  ui.sidebar.facetBox = el("div", { class: "facetBox" },
-    el("div", { class: "facetRow" },
-      el("div", { class: "facetChips" }, ui.sidebar.kindSqlBtn, ui.sidebar.kindPyBtn),
-      ui.sidebar.matSelect
+  ui.sidebar.groupSelect = el("select", { class:"facetSelect", onchange:(e)=>{
+    state.modelFacets.groupBy = (e.target.value === "owner" || e.target.value === "domain") ? e.target.value : "";
+    replaceHashQuery((q)=> writeModelFacetsToQuery(q, state.modelFacets));
+    state.modelFacets = currentModelFacets();
+    updateSidebarLists();
+  }});
+  ui.sidebar.tagBox = el("div", { class:"facetChips facetChipsWrap" });
+  ui.sidebar.tagInput = el("input", { class:"facetInput", placeholder:"Add tag…", list:"modelTags" });
+  ui.sidebar.tagDatalist = el("datalist", { id:"modelTags" });
+  ui.sidebar.groupSelect.replaceChildren(
+    el("option", { value:"" }, "No grouping"),
+    el("option", { value:"owner" }, "Group: owner"),
+    el("option", { value:"domain" }, "Group: domain"),
+  );
+  ui.sidebar.tagInput.onkeydown = (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      const t = (ui.sidebar.tagInput.value || "").trim();
+      if (!t) return;
+      const tags = new Set(state.modelFacets.tags || []);
+      tags.add(t);
+      state.modelFacets.tags = Array.from(tags);
+      ui.sidebar.tagInput.value = "";
+      replaceHashQuery((q)=> writeModelFacetsToQuery(q, state.modelFacets));
+      state.modelFacets = currentModelFacets();
+      updateSidebarLists();
+    }
+    if (e.key === "Escape") {
+      e.preventDefault();
+      ui.sidebar.tagInput.value = "";
+    }
+  };
+  ui.sidebar.facetBox = el("div", { class:"facetBox" },
+    el("div", { class:"facetRow" },
+      el("div", { class:"facetChips" }, ui.sidebar.kindSqlBtn, ui.sidebar.kindPyBtn),
+      ui.sidebar.matSelect,
+      ui.sidebar.groupSelect
     ),
-    el("div", { class: "facetRow" },
+    el("div", { class:"facetRow" },
       ui.sidebar.pathInput,
       ui.sidebar.clearFacetsBtn
     ),
+    el("div", { class:"facetRow" },
+      el("div", { class:"facetLabel" }, "Tags"),
+      ui.sidebar.tagInput
+    ),
+    ui.sidebar.tagBox,
+    ui.sidebar.tagDatalist,
     ui.sidebar.pathDatalist
   );
 
@@ -3448,173 +3511,254 @@ async function main() {
   }
 
   function updateSidebarLists() {
-  // Keep facets in sync with URL in case of back/forward or manual edits
-  state.modelFacets = currentModelFacets();
+    // Keep facets in sync with URL in case of back/forward or manual edits
+    state.modelFacets = currentModelFacets();
+    ui.sidebar.groupSelect.value = state.modelFacets.groupBy || "";
 
-  const q = (state.filter || "").trim().toLowerCase();
-  const models = state.manifest.models || [];
-  const sources = state.manifest.sources || [];
+    const q = (state.filter || "").trim().toLowerCase();
+    const models = state.manifest.models || [];
+    const sources = state.manifest.sources || [];
 
-  const modelsAfterText = q
-    ? models.filter(m =>
-        (m.name || "").toLowerCase().includes(q) ||
-        (m.relation || "").toLowerCase().includes(q) ||
-        (m.description_short || "").toLowerCase().includes(q)
-      )
-    : models;
+    const modelsAfterText = q
+      ? models.filter(m =>
+          (m.name || "").toLowerCase().includes(q) ||
+          (m.relation || "").toLowerCase().includes(q) ||
+          (m.description_short || "").toLowerCase().includes(q)
+        )
+      : models;
 
-  const sourcesAfterText = q
-    ? sources.filter(s =>
-        (`${s.source_name}.${s.table_name}`).toLowerCase().includes(q) ||
-        (s.relation || "").toLowerCase().includes(q)
-      )
-    : sources;
+    const sourcesAfterText = q
+      ? sources.filter(s =>
+          (`${s.source_name}.${s.table_name}`).toLowerCase().includes(q) ||
+          (s.relation || "").toLowerCase().includes(q)
+        )
+      : sources;
 
-  // Apply model facets (kinds/materialized/pathPrefix) on top of text filtering
-  const filteredModels = filterModelsWithFacets(modelsAfterText, state.modelFacets);
-  const filteredSources = sourcesAfterText;
+    // Apply model facets (kinds/materialized/pathPrefix) on top of text filtering
+    const filteredModels = filterModelsWithFacets(modelsAfterText, state.modelFacets);
+    const filteredSources = sourcesAfterText;
 
-  state.sidebarMatches.models = filteredModels.length;
-  state.sidebarMatches.sources = filteredSources.length;
+    state.sidebarMatches.models = filteredModels.length;
+    state.sidebarMatches.sources = filteredSources.length;
 
-  // ---- Facet UI: counts + selected state ----
-  const facets = state.modelFacets || { kinds: ["sql", "python"], materialized: "", pathPrefix: "" };
+    // ---- Facet UI: counts + selected state ----
+    const facets = state.modelFacets || { kinds: ["sql", "python"], materialized: "", pathPrefix: "" };
 
-  // counts for kind based on other facets (materialized + pathPrefix)
-  const forKindCounts = filterModelsWithFacets(modelsAfterText, { ...facets, kinds: ["sql", "python"] });
-  let sqlCount = 0, pyCount = 0;
-  for (const m of forKindCounts) {
-    if (normalizeModelKind(m.kind) === "python") pyCount++; else sqlCount++;
-  }
+    // counts for kind based on other facets (materialized + pathPrefix)
+    const forKindCounts = filterModelsWithFacets(modelsAfterText, { ...facets, kinds: ["sql", "python"] });
+    let sqlCount = 0, pyCount = 0;
+    for (const m of forKindCounts) {
+      if (normalizeModelKind(m.kind) === "python") pyCount++; else sqlCount++;
+    }
 
-  // counts for materialized based on other facets (kind + pathPrefix)
-  const forMatCounts = filterModelsWithFacets(modelsAfterText, { ...facets, materialized: "" });
-  const matCounts = new Map();
-  let unknownCount = 0;
-  for (const m of forMatCounts) {
-    const mm = normalizeMaterialized(m.materialized || "");
-    if (!mm) unknownCount++;
-    else matCounts.set(mm, (matCounts.get(mm) || 0) + 1);
-  }
-  const matsSorted = Array.from(matCounts.entries()).sort((a, b) => (b[1] - a[1]) || a[0].localeCompare(b[0]));
+    // counts for materialized based on other facets (kind + pathPrefix)
+    const forMatCounts = filterModelsWithFacets(modelsAfterText, { ...facets, materialized: "" });
+    const matCounts = new Map();
+    let unknownCount = 0;
+    for (const m of forMatCounts) {
+      const mm = normalizeMaterialized(m.materialized || "");
+      if (!mm) unknownCount++;
+      else matCounts.set(mm, (matCounts.get(mm) || 0) + 1);
+    }
+    const matsSorted = Array.from(matCounts.entries()).sort((a, b) => (b[1] - a[1]) || a[0].localeCompare(b[0]));
 
-  // path prefix suggestions based on other facets (kind + materialized)
-  const forPathCounts = filterModelsWithFacets(modelsAfterText, { ...facets, pathPrefix: "" });
-  const prefixCounts = new Map();
-  for (const m of forPathCounts) {
-    const p = stripModelsPrefix(m.path || "");
-    if (!p) continue;
-    const parts = p.split("/").filter(Boolean);
+    // path prefix suggestions based on other facets (kind + materialized)
+    const forPathCounts = filterModelsWithFacets(modelsAfterText, { ...facets, pathPrefix: "" });
+    const prefixCounts = new Map();
+    for (const m of forPathCounts) {
+      const p = stripModelsPrefix(m.path || "");
+      if (!p) continue;
+      const parts = p.split("/").filter(Boolean);
 
-    // suggest first segment and first two segments
-    for (const depth of [1, 2]) {
-      if (parts.length >= depth) {
-        const pref = parts.slice(0, depth).join("/") + "/";
-        prefixCounts.set(pref, (prefixCounts.get(pref) || 0) + 1);
+      // suggest first segment and first two segments
+      for (const depth of [1, 2]) {
+        if (parts.length >= depth) {
+          const pref = parts.slice(0, depth).join("/") + "/";
+          prefixCounts.set(pref, (prefixCounts.get(pref) || 0) + 1);
+        }
+      }
+
+      // also include full directory if available (without file name)
+      if (parts.length > 1) {
+        const fullDir = parts.slice(0, parts.length - 1).join("/") + "/";
+        prefixCounts.set(fullDir, (prefixCounts.get(fullDir) || 0) + 1);
       }
     }
+    const prefixesSorted = Array.from(prefixCounts.entries())
+      .sort((a, b) => (b[1] - a[1]) || a[0].localeCompare(b[0]))
+      .slice(0, 40);
 
-    // also include full directory if available (without file name)
-    if (parts.length > 1) {
-      const fullDir = parts.slice(0, parts.length - 1).join("/") + "/";
-      prefixCounts.set(fullDir, (prefixCounts.get(fullDir) || 0) + 1);
+    const kindsSet = new Set((facets.kinds || ["sql", "python"]).map(k => (k || "").toLowerCase()));
+    ui.sidebar.kindSqlBtn.textContent = `SQL (${sqlCount})`;
+    ui.sidebar.kindPyBtn.textContent = `Python (${pyCount})`;
+    ui.sidebar.kindSqlBtn.classList.toggle("active", kindsSet.has("sql"));
+    ui.sidebar.kindPyBtn.classList.toggle("active", kindsSet.has("python"));
+
+    // Update materialized select options (keep selection)
+    const currentMat = normalizeMaterialized(facets.materialized || "");
+    ui.sidebar.matSelect.replaceChildren(
+      el("option", { value: "" }, `Any materialization (${forMatCounts.length})`),
+      ...(unknownCount ? [el("option", { value: MAT_UNKNOWN }, `(unknown) (${unknownCount})`)] : []),
+      ...matsSorted.map(([mm, n]) => el("option", { value: mm }, `${mm} (${n})`))
+    );
+    ui.sidebar.matSelect.value = currentMat;
+
+    // Update datalist suggestions and keep input in sync if URL changed
+    ui.sidebar.pathDatalist.replaceChildren(
+      ...prefixesSorted.map(([p, n]) => el("option", { value: p }, `${p} (${n})`))
+    );
+    if ((ui.sidebar.pathInput.value || "") !== (facets.pathPrefix || "")) {
+      ui.sidebar.pathInput.value = facets.pathPrefix || "";
     }
-  }
-  const prefixesSorted = Array.from(prefixCounts.entries())
-    .sort((a, b) => (b[1] - a[1]) || a[0].localeCompare(b[0]))
-    .slice(0, 40);
 
-  const kindsSet = new Set((facets.kinds || ["sql", "python"]).map(k => (k || "").toLowerCase()));
-  ui.sidebar.kindSqlBtn.textContent = `SQL (${sqlCount})`;
-  ui.sidebar.kindPyBtn.textContent = `Python (${pyCount})`;
-  ui.sidebar.kindSqlBtn.classList.toggle("active", kindsSet.has("sql"));
-  ui.sidebar.kindPyBtn.classList.toggle("active", kindsSet.has("python"));
+    const activeN = facetsActiveCount(facets);
+    ui.sidebar.clearFacetsBtn.textContent = activeN ? `Clear (${activeN})` : "Clear";
+    ui.sidebar.clearFacetsBtn.disabled = activeN === 0;
 
-  // Update materialized select options (keep selection)
-  const currentMat = normalizeMaterialized(facets.materialized || "");
-  ui.sidebar.matSelect.replaceChildren(
-    el("option", { value: "" }, `Any materialization (${forMatCounts.length})`),
-    ...(unknownCount ? [el("option", { value: MAT_UNKNOWN }, `(unknown) (${unknownCount})`)] : []),
-    ...matsSorted.map(([mm, n]) => el("option", { value: mm }, `${mm} (${n})`))
-  );
-  ui.sidebar.matSelect.value = currentMat;
+    const baseForTags = filterModelsWithFacets(modelsAfterText, { ...state.modelFacets, tags: [] });
+    const tagCounts = new Map();
+    for (const m of baseForTags) {
+      for (const t of (Array.isArray(m.tags) ? m.tags : [])) {
+        const key = String(t).trim();
+        if (!key) continue;
+        tagCounts.set(key, (tagCounts.get(key) || 0) + 1);
+      }
+    }
+    const topTags = Array.from(tagCounts.entries())
+      .sort((a,b)=> (b[1]-a[1]) || a[0].localeCompare(b[0]))
+      .slice(0, 30);
 
-  // Update datalist suggestions and keep input in sync if URL changed
-  ui.sidebar.pathDatalist.replaceChildren(
-    ...prefixesSorted.map(([p, n]) => el("option", { value: p }, `${p} (${n})`))
-  );
-  if ((ui.sidebar.pathInput.value || "") !== (facets.pathPrefix || "")) {
-    ui.sidebar.pathInput.value = facets.pathPrefix || "";
-  }
+    // Keep "home" hrefs up-to-date for copy/open-in-new-tab
+    if (ui.sidebar.brandLink) ui.sidebar.brandLink.href = routeWithFacets("#/");
+    if (ui.sidebar.overviewLink) ui.sidebar.overviewLink.href = routeWithFacets("#/");
 
-  const activeN = facetsActiveCount(facets);
-  ui.sidebar.clearFacetsBtn.textContent = activeN ? `Clear (${activeN})` : "Clear";
-  ui.sidebar.clearFacetsBtn.disabled = activeN === 0;
+    // ---- Sidebar lists ----
+    ui.sidebar.modelsTitle.textContent = `Models (${filteredModels.length})`;
+    ui.sidebar.sourcesTitle.textContent = `Sources (${filteredSources.length})`;
 
-  // Keep "home" hrefs up-to-date for copy/open-in-new-tab
-  if (ui.sidebar.brandLink) ui.sidebar.brandLink.href = routeWithFacets("#/");
-  if (ui.sidebar.overviewLink) ui.sidebar.overviewLink.href = routeWithFacets("#/");
+    ui.sidebar.tagDatalist.replaceChildren(
+      ...topTags.map(([t,n]) => el("option", { value:t }, `${t} (${n})`))
+    );
+    
+    const activeTags = new Set((state.modelFacets.tags || []).map(x => x.toLowerCase()));
 
-  // ---- Sidebar lists ----
-  ui.sidebar.modelsTitle.textContent = `Models (${filteredModels.length})`;
-  ui.sidebar.sourcesTitle.textContent = `Sources (${filteredSources.length})`;
+    ui.sidebar.tagBox.replaceChildren(
+      ...topTags.map(([t,n]) => {
+        const on = activeTags.has(t.toLowerCase());
+        const b = el("button", {
+          class: `facetChip ${on ? "active" : ""}`,
+          type:"button",
+          onclick: () => {
+            const tags = new Set(state.modelFacets.tags || []);
+            if (on) {
+              // remove case-insensitively
+              for (const x of Array.from(tags)) if (String(x).toLowerCase() === t.toLowerCase()) tags.delete(x);
+            } else {
+              tags.add(t);
+            }
+            state.modelFacets.tags = Array.from(tags);
+            replaceHashQuery((q)=> writeModelFacetsToQuery(q, state.modelFacets));
+            state.modelFacets = currentModelFacets();
+            updateSidebarLists();
+          }
+        }, `${t} (${n})`);
+        return b;
+      })
+    );
 
-  ui.sidebar.modelsList.replaceChildren(
-    ...filteredModels.map(m =>
-      el("li", { class: "item" },
+    function modelGroupKey(m) {
+      if (state.modelFacets.groupBy === "owner") {
+        const owners = Array.isArray(m.owners) ? m.owners : [];
+        return owners.length ? String(owners[0]) : "(unowned)";
+      }
+      if (state.modelFacets.groupBy === "domain") {
+        return (m.domain || stripModelsPrefix(m.path || "").split("/")[0] || "(no domain)");
+      }
+      return "";
+    }
+
+    function renderModelLi(m) {
+      const href = routeWithFacets(`#/model/${escapeHashPart(m.name)}`);
+      return el("li", { class:"item" },
         el("a", {
-          href: routeWithFacets(`#/model/${escapeHashPart(m.name)}`),
-          onclick: (e) => { e.preventDefault(); location.hash = routeWithFacets(`#/model/${escapeHashPart(m.name)}`); },
+          href,
+          onclick:(e)=>{ e.preventDefault(); location.hash = href; },
           title: [m.description_short || "", m.path ? `(${m.path})` : ""].filter(Boolean).join(" ") || m.name,
         },
           el("span", {}, m.name),
           pillForKind(m.kind === "python" ? "python" : "sql")
         )
-      )
-    )
-  );
-
-  ui.sidebar.sourcesList.replaceChildren(
-    ...filteredSources.map(s => {
-      const key = `${s.source_name}.${s.table_name}`;
-      const href = routeWithFacets(`#/source/${escapeHashPart(s.source_name)}/${escapeHashPart(s.table_name)}`);
-      return el("li", { class: "item" },
-        el("a", {
-          href,
-          onclick: (e) => { e.preventDefault(); location.hash = href; },
-          title: s.relation || key,
-        },
-          el("span", {}, key),
-          el("span", { class: "pill" }, (s.consumers || []).length ? `${s.consumers.length}` : "–")
-        )
       );
-    })
-  );
+    }
 
-  const macros = state.manifest.macros || [];
-  ui.sidebar.macrosTitle.textContent = `Macros (${macros.length})`;
-  ui.sidebar.macrosList.replaceChildren(
-    ...macros.map(m =>
-      el("li", { class: "item" },
-        el("a", {
-          href: routeWithFacets(`#/macro/${escapeHashPart(m.name)}`),
-          onclick: (e) => { e.preventDefault(); location.hash = routeWithFacets(`#/macro/${escapeHashPart(m.name)}`); },
-          title: m.path || m.name,
-        },
-          el("span", {}, m.name),
-          el("span", { class: "pill" }, m.kind)
+    if (!state.modelFacets.groupBy) {
+      ui.sidebar.modelsList.replaceChildren(...filteredModels.map(renderModelLi));
+    } else {
+      const groups = new Map();
+      for (const m of filteredModels) {
+        const k = modelGroupKey(m);
+        if (!groups.has(k)) groups.set(k, []);
+        groups.get(k).push(m);
+      }
+      const keys = Array.from(groups.keys()).sort((a,b)=> a.localeCompare(b));
+
+      const children = [];
+      for (const k of keys) {
+        const items = groups.get(k);
+        items.sort((a,b)=> (a.name||"").localeCompare(b.name||""));
+
+        children.push(el("li", { class:"groupHeader" },
+          el("div", { class:"groupHeaderRow" },
+            el("span", {}, k),
+            el("span", { class:"pill" }, String(items.length))
+          )
+        ));
+        for (const m of items) children.push(renderModelLi(m));
+      }
+      ui.sidebar.modelsList.replaceChildren(...children);
+    }
+
+    ui.sidebar.sourcesList.replaceChildren(
+      ...filteredSources.map(s => {
+        const key = `${s.source_name}.${s.table_name}`;
+        const href = routeWithFacets(`#/source/${escapeHashPart(s.source_name)}/${escapeHashPart(s.table_name)}`);
+        return el("li", { class: "item" },
+          el("a", {
+            href,
+            onclick: (e) => { e.preventDefault(); location.hash = href; },
+            title: s.relation || key,
+          },
+            el("span", {}, key),
+            el("span", { class: "pill" }, (s.consumers || []).length ? `${s.consumers.length}` : "–")
+          )
+        );
+      })
+    );
+
+    const macros = state.manifest.macros || [];
+    ui.sidebar.macrosTitle.textContent = `Macros (${macros.length})`;
+    ui.sidebar.macrosList.replaceChildren(
+      ...macros.map(m =>
+        el("li", { class: "item" },
+          el("a", {
+            href: routeWithFacets(`#/macro/${escapeHashPart(m.name)}`),
+            onclick: (e) => { e.preventDefault(); location.hash = routeWithFacets(`#/macro/${escapeHashPart(m.name)}`); },
+            title: m.path || m.name,
+          },
+            el("span", {}, m.name),
+            el("span", { class: "pill" }, m.kind)
+          )
         )
       )
-    )
-  );
+    );
 
-  // re-attach section headers with live counts
-  sectionHeader(ui.sidebar.modelsTitle, "models", `Models (${filteredModels.length})`);
-  sectionHeader(ui.sidebar.sourcesTitle, "sources", `Sources (${filteredSources.length})`);
-  sectionHeader(ui.sidebar.macrosTitle, "macros", `Macros (${macros.length})`);
+    // re-attach section headers with live counts
+    sectionHeader(ui.sidebar.modelsTitle, "models", `Models (${filteredModels.length})`);
+    sectionHeader(ui.sidebar.sourcesTitle, "sources", `Sources (${filteredSources.length})`);
+    sectionHeader(ui.sidebar.macrosTitle, "macros", `Macros (${macros.length})`);
 
-  applySidebarCollapse();
-}
+    applySidebarCollapse();
+  }
 
   function updateMain() {
     const route = parseRoute();
