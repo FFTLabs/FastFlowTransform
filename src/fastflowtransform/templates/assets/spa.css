@@ -584,3 +584,8 @@ tr.colHit{
   flex: 0 0 auto;
 }
 .docPillsHeader { margin-bottom: 10px; }
+
+.pillSmall.pillWarn{
+  border-color: color-mix(in srgb, #f59e0b, var(--border) 60%);
+  background: color-mix(in srgb, #f59e0b, transparent 88%);
+}

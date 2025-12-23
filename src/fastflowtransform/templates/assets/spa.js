@@ -222,6 +222,47 @@ function debounce(fn, ms = 180) {
   return wrapped;
 }
 
+
+// -------- Source freshness helpers -----------------------------------------
+function toNumOrNull(v) {
+  if (v == null) return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+function formatMinutesCompact(mins) {
+  const m = toNumOrNull(mins);
+  if (m == null) return "—";
+  const total = Math.max(0, Math.round(m));
+  const d = Math.floor(total / 1440);
+  const h = Math.floor((total % 1440) / 60);
+  const mm = total % 60;
+  const parts = [];
+  if (d) parts.push(`${d}d`);
+  if (h) parts.push(`${h}h`);
+  if (mm || parts.length === 0) parts.push(`${mm}m`);
+  return parts.join(" ");
+}
+
+function sourceFreshnessConfig(s) {
+  const loadedAtField = String((s && s.loaded_at_field) || "").trim();
+  const warnMinutes = toNumOrNull(s && s.warn_after_minutes);
+  const errorMinutes = toNumOrNull(s && s.error_after_minutes);
+
+  const hasLoaded = !!loadedAtField;
+  const hasThresh = warnMinutes != null || errorMinutes != null;
+  const configured = hasLoaded && hasThresh;
+
+  let reason = "";
+  if (configured) reason = "Freshness is configured (loaded_at field + thresholds).";
+  else if (!hasLoaded && hasThresh) reason = "Warn/error thresholds are set but loaded_at field is missing.";
+  else if (hasLoaded && !hasThresh) reason = "loaded_at field is set but warn/error thresholds are missing.";
+  else reason = "No freshness configuration found for this source.";
+
+  return { configured, reason, loadedAtField, warnMinutes, errorMinutes };
+}
+
+
 function setTabInHash(tab) {
   const full = (location.hash || "#/").slice(1);
   const [pathPart, queryPart] = full.split("?", 2);
@@ -1369,6 +1410,7 @@ function cssSafeId(s) {
   return String(s || "").replace(/[^a-zA-Z0-9_-]+/g, "_");
 }
 
+
 function renderSource(state, sourceName, tableName) {
   const key = `${sourceName}.${tableName}`;
   const s = state.bySource.get(key);
@@ -1377,14 +1419,27 @@ function renderSource(state, sourceName, tableName) {
     return el("div", { class: "card" }, el("h2", {}, "Source not found"), el("p", { class: "empty" }, key));
   }
 
-  const consumers = (s.consumers || []).map(m => el("a", { href: routeWithFacets(`#/model/${escapeHashPart(m)}`) }, m));
+  const consumers = (s.consumers || []).map(m =>
+    el("a", { href: routeWithFacets(`#/model/${escapeHashPart(m)}`) }, m)
+  );
 
-  const freshness = (() => {
-    const warn = s.warn_after_minutes != null ? `${s.warn_after_minutes}m warn` : null;
-    const err = s.error_after_minutes != null ? `${s.error_after_minutes}m error` : null;
-    const parts = [warn, err].filter(Boolean);
-    return parts.length ? parts.join(" • ") : "—";
-  })();
+  const fc = sourceFreshnessConfig(s);
+
+  const statusBadge = fc.configured
+    ? el("span", { class: "pillSmall pillGood", title: fc.reason }, "Configured")
+    : el("span", { class: "pillSmall pillBad", title: fc.reason }, "Missing freshness");
+
+  const loadedAtNode = fc.loadedAtField
+    ? el("code", {}, fc.loadedAtField)
+    : el("span", { class: "empty" }, "—");
+
+  const warnNode = fc.warnMinutes != null
+    ? el("span", { class: "pillSmall pillWarn", title: `${Math.round(fc.warnMinutes)} minutes` }, `Warn after ${formatMinutesCompact(fc.warnMinutes)}`)
+    : el("span", { class: "empty" }, "—");
+
+  const errNode = fc.errorMinutes != null
+    ? el("span", { class: "pillSmall pillBad", title: `${Math.round(fc.errorMinutes)} minutes` }, `Error after ${formatMinutesCompact(fc.errorMinutes)}`)
+    : el("span", { class: "empty" }, "—");
 
   return el("div", { class: "grid" },
     el("div", { class: "card" },
@@ -1396,9 +1451,11 @@ function renderSource(state, sourceName, tableName) {
       ),
       el("div", { class: "kv" },
         el("div", { class: "k" }, "Relation"), el("div", {}, el("code", {}, s.relation || "—")),
-        el("div", { class: "k" }, "Loaded at field"), el("div", {}, el("code", {}, s.loaded_at_field || "—")),
-        el("div", { class: "k" }, "Freshness"), el("div", {}, freshness),
-        el("div", { class: "k" }, "Consumers"), el("div", {}, consumers.length ? joinInline(consumers) : el("span", { class: "empty" }, "—")),
+        el("div", { class: "k" }, "Freshness"), el("div", {}, statusBadge),
+        el("div", { class: "k" }, "Loaded at field"), el("div", {}, loadedAtNode),
+        el("div", { class: "k" }, "Warn threshold"), el("div", {}, warnNode),
+        el("div", { class: "k" }, "Error threshold"), el("div", {}, errNode),
+        el("div", { class: "k" }, "Consumers"), el("div", {}, consumers.length ? joinInline(consumers) : el("span", { class: "empty" }, "—"))
       )
     ),
     s.description_html
