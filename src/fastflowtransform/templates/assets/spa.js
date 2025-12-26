@@ -1293,25 +1293,39 @@ function renderModelCodeTab(state, m, codeView) {
     // refs resolved
     // Prefer explicit rendered_refs mapping if provided, else derive from deps/sources_used.
     const rows = [];
+    const seen = new Set();
+    const pushRow = (r) => {
+      const key = `${r.kind}:${r.name}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      rows.push(r);
+    };
 
+    // Models: prefer rendered_refs, else deps
     if (m.rendered_refs) {
       if (Array.isArray(m.rendered_refs)) {
-        for (const r of m.rendered_refs) rows.push({ kind:"model", name:r.name || "", relation:r.relation || "" });
+        for (const r of m.rendered_refs) pushRow({ kind:"model", name:r.name || "", relation:r.relation || "" });
       } else if (typeof m.rendered_refs === "object") {
-        for (const [k, v] of Object.entries(m.rendered_refs)) rows.push({ kind:"model", name:k, relation:String(v || "") });
+        for (const [k, v] of Object.entries(m.rendered_refs)) pushRow({ kind:"model", name:k, relation:String(v || "") });
       }
     } else {
-      // derive from deps (models) + sources_used (sources)
       const byName = new Map((state.manifest.models || []).map(x => [x.name, x]));
       for (const d of (m.deps || [])) {
         const md = byName.get(d);
         rows.push({ kind:"model", name:d, relation: md?.relation || "" });
       }
-      for (const s of (m.sources_used || [])) {
-        // sources_used entries are {source_name, table_name, relation}
-        const nm = `${s.source_name}.${s.table_name}`;
-        rows.push({ kind:"source", name:nm, relation: s.relation || "" });
-      }
+    }
+
+    // Sources: ALWAYS include
+    for (const s of (m.sources_used || [])) {
+      const nm = `${s.source_name}.${s.table_name}`;
+      rows.push({ 
+        kind: "source",
+        name: `${s.source_name}.${s.table_name}`,
+        source_name: s.source_name,
+        table_name: s.table_name,
+        relation: s.relation || ""
+      });
     }
 
     if (!rows.length) return el("p", { class:"empty" }, "No references detected for this model.");
@@ -1323,15 +1337,33 @@ function renderModelCodeTab(state, m, codeView) {
         el("th", {}, "Resolved relation"),
       )),
       el("tbody", {},
-        ...rows.map(r => el("tr", {},
-          el("td", {}, el("span", { class:"pillSmall" }, r.kind)),
-          el("td", {}, r.kind === "model"
-            ? el("a", { href: routeWithFacets(`#/model/${escapeHashPart(r.name)}`),
-                        onclick:(e)=>{ e.preventDefault(); location.hash = routeWithFacets(`#/model/${escapeHashPart(r.name)}`); } }, r.name)
-            : el("span", {}, r.name)
-          ),
-          el("td", {}, r.relation ? el("code", {}, r.relation) : el("span", { class:"empty" }, "—"))
-        ))
+        ...rows.map(r => {
+          const refCell = (() => {
+            if (r.kind === "model") {
+              const href = routeWithFacets(`#/model/${escapeHashPart(r.name)}`);
+              return el("a", {
+                href,
+                onclick: (e) => { e.preventDefault(); location.hash = href; }
+              }, r.name);
+            }
+
+            if (r.kind === "source") {
+              const href = routeWithFacets(`#/source/${escapeHashPart(r.source_name)}/${escapeHashPart(r.table_name)}`);
+              return el("a", {
+                href,
+                onclick: (e) => { e.preventDefault(); location.hash = href; }
+              }, r.name);
+            }
+
+            return el("span", {}, r.name);
+          })();
+
+          return el("tr", {},
+            el("td", {}, el("span", { class:"pillSmall" }, r.kind)),
+            el("td", {}, refCell),
+            el("td", {}, r.relation ? el("code", {}, r.relation) : el("span", { class:"empty" }, "—"))
+          );
+        })
       )
     );
   })();
