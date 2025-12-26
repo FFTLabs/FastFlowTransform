@@ -632,3 +632,25 @@ tr.colHit{
   white-space: pre-wrap;
   word-break: break-word;
 }
+
+/* --- SQL highlighting (no deps) --- */
+.codeBlock code {
+  display: block;
+}
+
+/* defaults (light) */
+.codeBlock .tok-kw { color: #6d28d9; font-weight: 600; } /* keywords */
+.codeBlock .tok-fn { color: #1d4ed8; }                  /* functions */
+.codeBlock .tok-str { color: #15803d; }                 /* strings */
+.codeBlock .tok-num { color: #b45309; }                 /* numbers */
+.codeBlock .tok-com { color: #6b7280; font-style: italic; } /* comments */
+.codeBlock .tok-id  { color: inherit; }                 /* identifiers */
+
+/* dark mode */
+@media (prefers-color-scheme: dark) {
+  .codeBlock .tok-kw { color: #c084fc; }
+  .codeBlock .tok-fn { color: #93c5fd; }
+  .codeBlock .tok-str { color: #86efac; }
+  .codeBlock .tok-num { color: #fbbf24; }
+  .codeBlock .tok-com { color: #9ca3af; }
+}

@@ -1081,8 +1081,148 @@ function copyToClipboard(text) {
   }
 }
 
-function renderCodeBlock(text, { wrap = false } = {}) {
-  return el("pre", { class: `codeBlock ${wrap ? "codeWrap" : ""}` }, String(text || ""));
+function escapeHtml(s) {
+  return String(s)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+const SQL_KW = new Set([
+  "SELECT","FROM","WHERE","GROUP","BY","ORDER","HAVING","LIMIT","QUALIFY",
+  "JOIN","INNER","LEFT","RIGHT","FULL","CROSS","OUTER","ON","USING",
+  "UNION","ALL","DISTINCT","EXCEPT","INTERSECT",
+  "WITH","AS",
+  "CASE","WHEN","THEN","ELSE","END",
+  "AND","OR","NOT","IN","IS","NULL","LIKE","ILIKE","BETWEEN","EXISTS",
+  "CAST","TRY_CAST",
+  "CREATE","TABLE","VIEW","MATERIALIZED","REPLACE",
+  "INSERT","INTO","VALUES","UPDATE","SET","DELETE",
+  "OVER","PARTITION","ROWS","RANGE","CURRENT","ROW","FOLLOWING","PRECEDING",
+  "TRUE","FALSE"
+]);
+
+function highlightSqlToHtml(sql) {
+  const s = String(sql || "");
+  let i = 0;
+  let out = "";
+
+  const emit = (cls, chunk) => {
+    out += `<span class="${cls}">${escapeHtml(chunk)}</span>`;
+  };
+
+  const isWordStart = (c) => /[A-Za-z_]/.test(c);
+  const isWord = (c) => /[A-Za-z0-9_$]/.test(c);
+  const isDigit = (c) => /[0-9]/.test(c);
+
+  while (i < s.length) {
+    const c = s[i];
+    const n = s[i + 1];
+
+    // line comment --
+    if (c === "-" && n === "-") {
+      let j = i + 2;
+      while (j < s.length && s[j] !== "\n") j++;
+      emit("tok-com", s.slice(i, j));
+      i = j;
+      continue;
+    }
+
+    // block comment /* ... */
+    if (c === "/" && n === "*") {
+      let j = i + 2;
+      while (j < s.length && !(s[j] === "*" && s[j + 1] === "/")) j++;
+      j = Math.min(s.length, j + 2);
+      emit("tok-com", s.slice(i, j));
+      i = j;
+      continue;
+    }
+
+    // single-quoted string '...'
+    if (c === "'") {
+      let j = i + 1;
+      while (j < s.length) {
+        if (s[j] === "'") {
+          // doubled '' escape
+          if (s[j + 1] === "'") { j += 2; continue; }
+          j++;
+          break;
+        }
+        j++;
+      }
+      emit("tok-str", s.slice(i, j));
+      i = j;
+      continue;
+    }
+
+    // quoted identifiers "..." or `...`
+    if (c === '"' || c === "`") {
+      const q = c;
+      let j = i + 1;
+      while (j < s.length) {
+        if (s[j] === q) {
+          // doubled "" or `` escape
+          if (s[j + 1] === q) { j += 2; continue; }
+          j++;
+          break;
+        }
+        j++;
+      }
+      emit("tok-id", s.slice(i, j));
+      i = j;
+      continue;
+    }
+
+    // number
+    if (isDigit(c)) {
+      let j = i + 1;
+      while (j < s.length && /[0-9.]/.test(s[j])) j++;
+      emit("tok-num", s.slice(i, j));
+      i = j;
+      continue;
+    }
+
+    // word: keyword / function / identifier
+    if (isWordStart(c)) {
+      let j = i + 1;
+      while (j < s.length && isWord(s[j])) j++;
+      const word = s.slice(i, j);
+      const upper = word.toUpperCase();
+
+      // peek next non-space for function call
+      let k = j;
+      while (k < s.length && /\s/.test(s[k])) k++;
+      const isFn = s[k] === "(";
+
+      if (SQL_KW.has(upper)) emit("tok-kw", word);
+      else if (isFn) emit("tok-fn", word);
+      else emit("tok-id", word);
+
+      i = j;
+      continue;
+    }
+
+    // everything else (punctuation/whitespace)
+    out += escapeHtml(c);
+    i++;
+  }
+
+  return out;
+}
+
+function renderCodeBlock(text, { wrap = false, lang = "", highlight = false } = {}) {
+  const s = String(text || "");
+  const cls = `codeBlock ${wrap ? "codeWrap" : ""}`;
+
+  if (highlight && lang === "sql") {
+    return el("pre", { class: cls },
+      el("code", { class: "language-sql", html: highlightSqlToHtml(s) })
+    );
+  }
+
+  return el("pre", { class: cls }, s);
 }
 
 function renderModelCodeTab(state, m, codeView) {
@@ -1140,13 +1280,13 @@ function renderModelCodeTab(state, m, codeView) {
 
     if (view === "rendered") {
       return rendered
-        ? renderCodeBlock(rendered, { wrap: ui.wrap })
+        ? renderCodeBlock(rendered, { wrap: ui.wrap, lang: "sql", highlight: true })
         : el("p", { class:"empty" }, "Rendered SQL not available. Enable docs.include_rendered_sql in the generator.");
     }
 
     if (view === "raw") {
       return raw
-        ? renderCodeBlock(raw, { wrap: ui.wrap })
+        ? renderCodeBlock(raw, { wrap: ui.wrap, lang: "sql", highlight: true })
         : el("p", { class:"empty" }, "Raw SQL not available in the manifest.");
     }
 

@@ -235,6 +235,13 @@ def _compile_sql_for_docs(executor: Any, node: Node, rendered_sql: str) -> str:
         return ""
 
 
+_LEADING_BLANK_LINES = re.compile(r"^(?:[ \t]*\n)+")
+
+
+def _drop_leading_blank_lines(s: str) -> str:
+    return _LEADING_BLANK_LINES.sub("", s or "")
+
+
 def _render_sql_for_docs(
     nodes: dict[str, Node],
     executor: Any,
@@ -276,6 +283,7 @@ def _render_sql_for_docs(
                     ref_resolver=lambda nm: executor._resolve_ref(nm, REGISTRY.env),
                     source_resolver=executor._resolve_source,
                 )
+                rendered = _drop_leading_blank_lines(rendered)
             except Exception:
                 rendered = ""
 
