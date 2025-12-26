@@ -1,13 +1,40 @@
 const MANIFEST_URL = window.__FFT_MANIFEST_PATH__ || "assets/docs_manifest.json";
 
+// function el(tag, attrs = {}, ...children) {
+//   const n = document.createElement(tag);
+//   for (const [k, v] of Object.entries(attrs || {})) {
+//     if (k === "class") n.className = v;
+//     else if (k === "html") n.innerHTML = v;
+//     else if (k.startsWith("on") && typeof v === "function") n.addEventListener(k.slice(2).toLowerCase(), v);
+//     else n.setAttribute(k, String(v));
+//   }
+//   for (const c of children) {
+//     if (c == null) continue;
+//     n.appendChild(typeof c === "string" ? document.createTextNode(c) : c);
+//   }
+//   return n;
+// }
+
 function el(tag, attrs = {}, ...children) {
   const n = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs || {})) {
+    if (v == null) continue;
+
     if (k === "class") n.className = v;
     else if (k === "html") n.innerHTML = v;
-    else if (k.startsWith("on") && typeof v === "function") n.addEventListener(k.slice(2), v);
+    else if (k.startsWith("on") && typeof v === "function")
+      n.addEventListener(k.slice(2).toLowerCase(), v);
+
+    // ✅ critical: boolean attributes
+    else if (k === "disabled") n.disabled = !!v;
+    else if (typeof v === "boolean") {
+      if (v) n.setAttribute(k, "");
+      // if false: omit attribute
+    }
+
     else n.setAttribute(k, String(v));
   }
+
   for (const c of children) {
     if (c == null) continue;
     n.appendChild(typeof c === "string" ? document.createTextNode(c) : c);
@@ -216,6 +243,23 @@ function routeWithFacets(route) {
   const r = (route || "#/").startsWith("#") ? (route || "#/").slice(1) : (route || "/");
   const [pathPart, queryPart] = r.split("?", 2);
   const q = new URLSearchParams(queryPart || "");
+
+  if (String(pathPart || "").startsWith("/model/")) {
+    const curQ = parseHashWithQuery().query;
+    const curTab = curQ.get("tab") || "";
+    const curCode = curQ.get("code") || "";
+
+    if (!q.has("tab") && curTab) q.set("tab", curTab);
+
+    const effectiveTab = q.get("tab") || curTab;
+    if (effectiveTab === "code") {
+      if (!q.has("code") && curCode) q.set("code", curCode);
+    } else {
+      // avoid leaking stale code=... into non-code tabs
+      q.delete("code");
+    }
+  }
+  
   writeModelFacetsToQuery(q, facets);
 
   const next = q.toString() ? `${pathPart}?${q.toString()}` : `${pathPart}`;
@@ -310,6 +354,19 @@ function setModelQuery({ tab, col }) {
   location.hash = `#${next.startsWith("/") ? "" : "/"}${next}`;
 }
 
+function setModelCodeQuery({ code }) {
+  const full = (location.hash || "#/").slice(1);
+  const [pathPart, queryPart] = full.split("?", 2);
+  const q = new URLSearchParams(queryPart || "");
+
+  q.set("tab", "code");
+  if (code) q.set("code", code);
+  else q.delete("code");
+
+  const next = q.toString() ? `${pathPart}?${q.toString()}` : `${pathPart}`;
+  location.hash = `#${next.startsWith("/") ? "" : "/"}${next}`;
+}
+
 function parseRoute() {
   const { parts, query } = parseHashWithQuery();
   if (parts.length === 0) {
@@ -322,6 +379,7 @@ function parseRoute() {
       name: decodeURIComponent(parts.slice(1).join("/")),
       tab: query.get("tab") || "",
       col: query.get("col") || "",
+      code: query.get("code") || "",  // "rendered" | "raw" | "refs"
     };
   }
   if (parts[0] === "source" && parts[1] && parts[2]) {
@@ -1005,6 +1063,149 @@ function computeContractDrift(m, withSchema) {
 }
 
 
+// -------- Code Viewer helpers ---------------------
+
+function copyToClipboard(text) {
+  const s = String(text || "");
+  if (!s) return;
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(s).catch(() => {});
+  } else {
+    // fallback
+    const ta = document.createElement("textarea");
+    ta.value = s;
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand("copy"); } catch {}
+    ta.remove();
+  }
+}
+
+function renderCodeBlock(text, { wrap = false } = {}) {
+  return el("pre", { class: `codeBlock ${wrap ? "codeWrap" : ""}` }, String(text || ""));
+}
+
+function renderModelCodeTab(state, m, codeView) {
+  const isSql = (m.kind || "sql") !== "python";
+
+  const raw = m.raw_sql || m.sql || m.code || "";
+  const rendered = m.rendered_sql || m.compiled_sql || "";
+
+  // Default view: rendered if available, else raw
+  let view = (codeView || "").toLowerCase();
+  if (!["rendered", "raw", "refs"].includes(view)) {
+    view = rendered ? "rendered" : "raw";
+  }
+
+  state.codeUI ||= {};
+  const ui = (state.codeUI[m.name] ||= { wrap: false });
+
+  const setView = (v) => {
+    setModelCodeQuery({ code: v });
+  };
+
+  const headRight = el("div", { class: "row", style: "gap:8px; justify-content:flex-end;" },
+    el("button", {
+      class: "btnTiny",
+      type: "button",
+      onclick: () => { ui.wrap = !ui.wrap; updateMain(); }
+    }, ui.wrap ? "No wrap" : "Wrap"),
+    el("button", {
+      class: "btnTiny",
+      type: "button",
+      onclick: () => {
+        const txt =
+          view === "rendered" ? (rendered || "Rendered SQL not available. Enable docs.include_rendered_sql in the generator.") :
+          view === "raw" ? raw :
+          ""; // refs: nothing to copy
+        copyToClipboard(txt);
+      }
+    }, "Copy")
+  );
+
+  const tabs = el("div", { class: "pillRow" },
+    el("button", { class: `tab ${view === "rendered" ? "active" : ""}`, type:"button", onclick: () => setView("rendered") }, "Rendered"),
+    el("button", { class: `tab ${view === "raw" ? "active" : ""}`, type:"button", onclick: () => setView("raw") }, "Raw"),
+    el("button", { class: `tab ${view === "refs" ? "active" : ""}`, type:"button", onclick: () => setView("refs") }, "Refs resolved"),
+  );
+
+  const body = (() => {
+    if (!isSql) {
+      // Optional: show python source if you later add it to manifest
+      const py = m.python_source || m.source || "";
+      return py
+        ? renderCodeBlock(py, { wrap: ui.wrap })
+        : el("p", { class:"empty" }, "No source available for this model.");
+    }
+
+    if (view === "rendered") {
+      return rendered
+        ? renderCodeBlock(rendered, { wrap: ui.wrap })
+        : el("p", { class:"empty" }, "Rendered SQL not available. Enable docs.include_rendered_sql in the generator.");
+    }
+
+    if (view === "raw") {
+      return raw
+        ? renderCodeBlock(raw, { wrap: ui.wrap })
+        : el("p", { class:"empty" }, "Raw SQL not available in the manifest.");
+    }
+
+    // refs resolved
+    // Prefer explicit rendered_refs mapping if provided, else derive from deps/sources_used.
+    const rows = [];
+
+    if (m.rendered_refs) {
+      if (Array.isArray(m.rendered_refs)) {
+        for (const r of m.rendered_refs) rows.push({ kind:"model", name:r.name || "", relation:r.relation || "" });
+      } else if (typeof m.rendered_refs === "object") {
+        for (const [k, v] of Object.entries(m.rendered_refs)) rows.push({ kind:"model", name:k, relation:String(v || "") });
+      }
+    } else {
+      // derive from deps (models) + sources_used (sources)
+      const byName = new Map((state.manifest.models || []).map(x => [x.name, x]));
+      for (const d of (m.deps || [])) {
+        const md = byName.get(d);
+        rows.push({ kind:"model", name:d, relation: md?.relation || "" });
+      }
+      for (const s of (m.sources_used || [])) {
+        // sources_used entries are {source_name, table_name, relation}
+        const nm = `${s.source_name}.${s.table_name}`;
+        rows.push({ kind:"source", name:nm, relation: s.relation || "" });
+      }
+    }
+
+    if (!rows.length) return el("p", { class:"empty" }, "No references detected for this model.");
+
+    return el("table", { class:"table" },
+      el("thead", {}, el("tr", {},
+        el("th", {}, "Kind"),
+        el("th", {}, "Reference"),
+        el("th", {}, "Resolved relation"),
+      )),
+      el("tbody", {},
+        ...rows.map(r => el("tr", {},
+          el("td", {}, el("span", { class:"pillSmall" }, r.kind)),
+          el("td", {}, r.kind === "model"
+            ? el("a", { href: routeWithFacets(`#/model/${escapeHashPart(r.name)}`),
+                        onclick:(e)=>{ e.preventDefault(); location.hash = routeWithFacets(`#/model/${escapeHashPart(r.name)}`); } }, r.name)
+            : el("span", {}, r.name)
+          ),
+          el("td", {}, r.relation ? el("code", {}, r.relation) : el("span", { class:"empty" }, "—"))
+        ))
+      )
+    );
+  })();
+
+  return el("div", { class:"card" },
+    el("div", { class:"row", style:"align-items:center; justify-content:space-between;" },
+      el("h3", { style:"margin:0;" }, isSql ? "SQL" : "Code"),
+      headRight
+    ),
+    tabs,
+    body
+  );
+}
+
 // -------- Landing page (overview dashboard) helpers ---------------------
 
 function setModelFacetsAndGoHome(nextFacets, extra = {}) {
@@ -1579,11 +1780,9 @@ function renderModelPanel(state, m, tab, colFromRoute) {
   }
 
   if (tab === "code") {
-    // Placeholder until we add compiled SQL / python source to manifest
-    return el("div", { class: "card" },
-      el("h3", {}, "Code"),
-      el("p", { class: "empty" }, "Code view not yet available. Next step: include rendered SQL / Python source in the manifest.")
-    );
+    const { query } = parseHashWithQuery();
+    const codeView = query.get("code") || "";
+    return renderModelCodeTab(state, m, codeView);
   }
 
   if (tab === "meta") {
@@ -3251,7 +3450,10 @@ async function main() {
     paletteQuery: `fft_docs:${projKey}:palette_query`,
   };
   STORE.modelTab = `fft_docs:${projKey}:model_tab_default`;
+  STORE.modelCodeView = `fft_docs:${projKey}:model_code_view_default`;
+
   state.modelTabDefault = safeGet(STORE.modelTab) || "overview";
+  state.modelCodeViewDefault = safeGet(STORE.modelCodeView) || "";
   state.STORE = STORE;
 
   // Allow replaceHashQuery() (global) to keep lastHash in sync even when we use history.replaceState.

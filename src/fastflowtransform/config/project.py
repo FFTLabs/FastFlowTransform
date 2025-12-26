@@ -145,6 +145,7 @@ class DocsConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     dag_dir: str | None = None
+    include_rendered_sql: bool = Field(default=False)
 
 
 # ---------------------------------------------------------------------------

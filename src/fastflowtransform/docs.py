@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 import re
 import shutil
+from collections.abc import Mapping
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -122,6 +124,25 @@ def _read_project_yaml_docs(project_dir: Path) -> dict[str, Any]:
     return models if isinstance(models, dict) else {}
 
 
+def _read_project_yaml_docs_settings(project_dir: Path) -> dict[str, Any]:
+    """
+    Read docs settings from project.yml:
+      docs:
+        include_rendered_sql: true|false
+        ...
+    Returns the whole docs dict (or {}).
+    """
+    cfg_path = project_dir / "project.yml"
+    if not cfg_path.exists():
+        return {}
+    try:
+        cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+    docs = (cfg or {}).get("docs") or {}
+    return docs if isinstance(docs, dict) else {}
+
+
 _FRONT_MATTER_RE = re.compile(r"^\s*---\s*\n(.*?)\n---\s*\n?", re.DOTALL)
 _LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 _CODE_RE = re.compile(r"`([^`]+)`")
@@ -144,6 +165,128 @@ def _render_minimarkdown(md: str) -> str:
     parts = [p.strip() for p in re.split(r"\n\s*\n", body) if p.strip()]
     html = "".join(f"<p>{p.replace('\n', '<br/>')}</p>" for p in parts) if parts else ""
     return html
+
+
+def _rendered_refs_for_docs(executor: Any, node: Node) -> list[dict[str, str]]:
+    """
+    Best-effort list of resolved refs for the "Refs resolved" UI.
+    Avoids inlining ephemeral SQL (which can be huge); marks ephemeral as inlined.
+    """
+    out: list[dict[str, str]] = []
+    for d in node.deps or []:
+        try:
+            dep = REGISTRY.get_node(d) if hasattr(REGISTRY, "get_node") else REGISTRY.nodes.get(d)
+        except Exception:
+            dep = None
+        try:
+            if (
+                dep is not None
+                and str((dep.meta or {}).get("materialized", "")).lower() == "ephemeral"
+            ):
+                rel = "<ephemeral (inlined)>"
+            else:
+                rel = executor._format_relation_for_ref(d)
+        except Exception:
+            rel = relation_for(d)
+        out.append({"name": str(d), "relation": str(rel)})
+    return out
+
+
+def _compile_sql_for_docs(executor: Any, node: Node, rendered_sql: str) -> str:
+    """
+    Best-effort "compiled" SQL preview for docs:
+      - strips leading {{ config(...) }}
+      - if DDL-looking, returns the statement as-is
+      - else wraps selectable body into a generic CREATE OR REPLACE {TABLE|VIEW} ... AS <body>
+    For incremental/snapshot/ephemeral, returns "" (too engine/flow-specific).
+    """
+    meta: Mapping[str, Any] = getattr(node, "meta", {}) or {}
+    try:
+        if getattr(executor, "_meta_is_incremental", None) and executor._meta_is_incremental(meta):
+            return ""
+        if getattr(executor, "_meta_is_snapshot", None) and executor._meta_is_snapshot(meta):
+            return ""
+    except Exception:
+        pass
+    if str(meta.get("materialized", "")).lower() == "ephemeral":
+        return ""
+
+    try:
+        sql = executor._strip_leading_config(rendered_sql).strip()
+    except Exception:
+        sql = (rendered_sql or "").strip()
+    if not sql:
+        return ""
+
+    try:
+        if executor._looks_like_direct_ddl(sql):
+            return sql
+    except Exception:
+        pass
+
+    try:
+        body = executor._selectable_body(sql).rstrip(" ;\n\t")
+        target_sql = executor._format_relation_for_ref(node.name)
+        mat = str(meta.get("materialized", "table")).lower()
+        if mat == "view":
+            return f"CREATE OR REPLACE VIEW {target_sql} AS\n{body}"
+        return f"CREATE OR REPLACE TABLE {target_sql} AS\n{body}"
+    except Exception:
+        return ""
+
+
+def _render_sql_for_docs(
+    nodes: dict[str, Node],
+    executor: Any,
+    *,
+    include_payload: bool,
+    project_dir: Path | None = None,
+) -> tuple[dict[str, str], dict[str, str], dict[str, str], dict[str, list[dict[str, str]]]]:
+    """
+    Render SQL once and reuse for:
+      - lineage inference
+      - docs manifest SQL viewer payload
+    Returns:
+      rendered_by_model, raw_by_model, compiled_by_model, rendered_refs_by_model
+    """
+    rendered_by: dict[str, str] = {}
+    raw_by: dict[str, str] = {}
+    compiled_by: dict[str, str] = {}
+    refs_by: dict[str, list[dict[str, str]]] = {}
+
+    for n in nodes.values():
+        if n.kind != "sql":
+            continue
+
+        # Always try to read raw SQL (UI baseline), regardless of include_payload
+        try:
+            p = Path(n.path)
+            if not p.is_absolute() and project_dir is not None:
+                p = project_dir / p
+            raw_by[n.name] = p.read_text(encoding="utf-8")
+        except Exception:
+            raw_by[n.name] = ""
+
+        rendered = ""
+        if include_payload:
+            try:
+                rendered = executor.render_sql(
+                    n,
+                    REGISTRY.env,
+                    ref_resolver=lambda nm: executor._resolve_ref(nm, REGISTRY.env),
+                    source_resolver=executor._resolve_source,
+                )
+            except Exception:
+                rendered = ""
+
+        if rendered:
+            rendered_by[n.name] = rendered
+
+            if include_payload:
+                compiled_by[n.name] = _compile_sql_for_docs(executor, n, rendered)
+                refs_by[n.name] = _rendered_refs_for_docs(executor, n)
+
+    return rendered_by, raw_by, compiled_by, refs_by
 
 
 def _strip_html(text: str) -> str:
@@ -242,6 +385,11 @@ def _build_spa_manifest(
     cols_by_table: dict[str, list[ColumnInfo]],
     model_source_refs: dict[str, list[tuple[str, str]]],
     sources_by_key: dict[tuple[str, str], SourceDoc],
+    raw_sql_by_model: dict[str, str] | None = None,
+    rendered_sql_by_model: dict[str, str] | None = None,
+    compiled_sql_by_model: dict[str, str] | None = None,
+    rendered_refs_by_model: dict[str, list[dict[str, str]]] | None = None,
+    include_rendered_sql: bool = False,
 ) -> dict[str, Any]:
     def _col_to_dict(c: ColumnInfo) -> dict[str, Any]:
         html = c.description_html
@@ -299,6 +447,15 @@ def _build_spa_manifest(
                 "contract": m.contract,
             }
         )
+        if m.kind == "sql":
+            md = out_models[-1]
+            md["raw_sql"] = (raw_sql_by_model or {}).get(m.name, "")
+
+        if include_rendered_sql and m.kind == "sql":
+            md = out_models[-1]
+            md["rendered_sql"] = (rendered_sql_by_model or {}).get(m.name, "")
+            md["compiled_sql"] = (compiled_sql_by_model or {}).get(m.name, "")
+            md["rendered_refs"] = (rendered_refs_by_model or {}).get(m.name, [])
 
     out_sources: list[dict[str, Any]] = []
     for s in sources:
@@ -325,6 +482,7 @@ def _build_spa_manifest(
             "generated_at": datetime.now(UTC).isoformat(),
             "env": env_name,
             "with_schema": bool(with_schema),
+            "include_rendered_sql": bool(include_rendered_sql),
         },
         "dag": {"graph": graph, "mermaid": mermaid_src},
         "models": out_models,
@@ -566,21 +724,24 @@ def _infer_and_attach_lineage(
     cols_by_table: dict[str, list[ColumnInfo]],
     *,
     with_schema: bool,
+    rendered_sql_by_model: dict[str, str] | None = None,
 ) -> None:
     """Best-effort Lineage ermitteln (SQL/Python) und auf Columns mappen."""
     for m in models:
         inferred: dict[str, list[dict[str, Any]]] = {}
         try:
             if m.kind == "sql" and executor is not None:
-                try:
-                    rendered = executor.render_sql(
-                        REGISTRY.nodes[m.name],
-                        REGISTRY.env,
-                        ref_resolver=lambda nm: executor._resolve_ref(nm, REGISTRY.env),
-                        source_resolver=executor._resolve_source,
-                    )
-                except Exception:
-                    rendered = None
+                rendered = (rendered_sql_by_model or {}).get(m.name)
+                if not rendered:
+                    try:
+                        rendered = executor.render_sql(
+                            REGISTRY.nodes[m.name],
+                            REGISTRY.env,
+                            ref_resolver=lambda nm: executor._resolve_ref(nm, REGISTRY.env),
+                            source_resolver=executor._resolve_source,
+                        )
+                    except Exception:
+                        rendered = None
                 if rendered:
                     inferred = infer_sql_lineage(rendered)
                     overrides = parse_sql_lineage_overrides(rendered)
@@ -710,6 +871,7 @@ def render_site(
     with_schema: bool = True,
     spa: bool = True,
     legacy_pages: bool = False,
+    include_rendered_sql: bool | None = None,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     _copy_template_assets(out_dir)
@@ -734,14 +896,44 @@ def render_site(
         direction="LR",
     )
     proj_dir = _get_project_dir()
+    docs_settings = _read_project_yaml_docs_settings(proj_dir) if proj_dir else {}
+    if include_rendered_sql is None:
+        include_rendered_sql = bool((docs_settings or {}).get("include_rendered_sql"))
+
     docs_meta = read_docs_metadata(proj_dir) if proj_dir else {"models": {}, "columns": {}}
+
+    rendered_sql_by_model: dict[str, str] = {}
+    raw_sql_by_model: dict[str, str] = {}
+    compiled_sql_by_model: dict[str, str] = {}
+    rendered_refs_by_model: dict[str, list[dict[str, str]]] = {}
+
+    if executor is not None and (include_rendered_sql or with_schema):
+        rendered_sql_by_model, raw_sql_by_model, compiled_sql_by_model, rendered_refs_by_model = (
+            _render_sql_for_docs(
+                nodes, executor, include_payload=bool(include_rendered_sql), project_dir=proj_dir
+            )
+        )
+
+        # If we can, also resolve source relations to the physical reference the executor uses.
+        # This improves the "Refs resolved" view in the SPA.
+        for s in sources:
+            with suppress(Exception):
+                s.relation = executor._resolve_source(s.source_name, s.table_name)
+
     models = _collect_models(nodes)
     mat_legend = _materialization_legend()
     macro_list = _build_macro_list(proj_dir)
     cols_by_table = _collect_columns(executor) if (executor and with_schema) else {}
 
     _apply_descriptions_to_models(models, docs_meta, cols_by_table, with_schema=with_schema)
-    _infer_and_attach_lineage(models, executor, docs_meta, cols_by_table, with_schema=with_schema)
+    _infer_and_attach_lineage(
+        models,
+        executor,
+        docs_meta,
+        cols_by_table,
+        with_schema=with_schema,
+        rendered_sql_by_model=(rendered_sql_by_model or None),
+    )
 
     used_by = _reverse_deps(nodes)
 
@@ -762,6 +954,11 @@ def render_site(
             cols_by_table=cols_by_table,
             model_source_refs=model_source_refs,
             sources_by_key=sources_by_key,
+            raw_sql_by_model=(raw_sql_by_model or None),
+            rendered_sql_by_model=(rendered_sql_by_model or None),
+            compiled_sql_by_model=(compiled_sql_by_model or None),
+            rendered_refs_by_model=(rendered_refs_by_model or None),
+            include_rendered_sql=bool(include_rendered_sql),
         )
         assets_dir = out_dir / "assets"
         assets_dir.mkdir(parents=True, exist_ok=True)

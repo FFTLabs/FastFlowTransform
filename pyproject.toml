@@ -153,7 +153,7 @@ known-third-party = ["duckdb", "pandas"]
 combine-as-imports = true
 
 [tool.ruff.lint.pylint]
-max-args = 15
+max-args = 18
 max-returns = 15
 max-branches = 20
 max-statements = 60

@@ -7,6 +7,7 @@ models_dir: models
 docs:
   # Adjust `dag_dir` to change where `fft dag --html` writes documentation (docs/Technical_Overview.md#documentation).
   dag_dir: site/dag
+  include_rendered_sql: true
 
 # Project-level variables accessible via {{ var('key') }} inside models.
 # Example:
