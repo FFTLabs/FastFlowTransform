@@ -1,6 +1,7 @@
 # fastflowtransform/docs.py
 from __future__ import annotations
 
+import inspect
 import json
 import re
 import shutil
@@ -40,6 +41,11 @@ class ModelDoc:
     description_html: str | None = None
     description_short: str | None = None
     contract: dict[str, Any] | None = None
+    python_signature: str | None = None
+    python_docstring: str | None = None
+    python_source: str | None = None
+    python_requires: dict[str, list[str]] | None = None  # dep -> required columns (best-effort)
+    inferred_lineage: dict[str, list[dict[str, Any]]] | None = None  # out_col -> lineage refs
 
 
 @dataclass
@@ -453,6 +459,11 @@ def _build_spa_manifest(
                 "sources_used": src_used,
                 "columns": cols,
                 "contract": m.contract,
+                "python_signature": m.python_signature,
+                "python_docstring": m.python_docstring,
+                "python_source": m.python_source,
+                "python_requires": m.python_requires,
+                "inferred_lineage": m.inferred_lineage,
             }
         )
         if m.kind == "sql":
@@ -689,6 +700,52 @@ def _attach_consumers_to_sources(
         s.consumers = source_consumers.get((s.source_name, s.table_name), [])
 
 
+def _attach_python_model_details(models: list[ModelDoc]) -> None:
+    py_funcs = getattr(REGISTRY, "py_funcs", {}) or {}
+    py_requires = getattr(REGISTRY, "py_requires", {}) or {}
+
+    for m in models:
+        if m.kind != "python":
+            continue
+
+        fn = py_funcs.get(m.name)
+        if callable(fn):
+            # Signature
+            try:
+                sig = str(inspect.signature(fn))
+            except Exception:
+                sig = "(...)"
+            qn = getattr(fn, "__qualname__", getattr(fn, "__name__", m.name))
+            mod = getattr(fn, "__module__", None)
+            prefix = f"{mod}." if mod else ""
+            m.python_signature = f"{prefix}{qn}{sig}"
+
+            # Docstring (cleaned)
+            doc = inspect.getdoc(fn) or ""
+            m.python_docstring = doc.strip() or None
+
+        # Required-columns hints (best-effort)
+        req = py_requires.get(m.name)
+        if isinstance(req, dict):
+            norm: dict[str, list[str]] = {}
+            for dep, cols in req.items():
+                if not cols:
+                    continue
+                norm[str(dep)] = sorted(str(c) for c in cols)
+            m.python_requires = norm or None
+
+        # Python source (best-effort)
+        try:
+            p = Path(m.path)
+            if p.exists() and p.is_file():
+                txt = p.read_text(encoding="utf-8")
+                if len(txt) > 300_000:
+                    txt = txt[:300_000] + "\n\n# … truncated …\n"
+                m.python_source = txt
+        except Exception:
+            pass
+
+
 def _apply_descriptions_to_models(
     models: list[ModelDoc],
     docs_meta: dict[str, Any],
@@ -759,6 +816,9 @@ def _infer_and_attach_lineage(
                 inferred = infer_py_lineage(func)
         except Exception:
             inferred = {}
+
+        if m.kind == "python":
+            m.inferred_lineage = inferred or None
 
         # YAML overrides (bereits in docs_meta gemerged)
         model_meta = (
@@ -929,6 +989,9 @@ def render_site(
                 s.relation = executor._resolve_source(s.source_name, s.table_name)
 
     models = _collect_models(nodes)
+
+    _attach_python_model_details(models)
+
     mat_legend = _materialization_legend()
     macro_list = _build_macro_list(proj_dir)
     cols_by_table = _collect_columns(executor) if (executor and with_schema) else {}

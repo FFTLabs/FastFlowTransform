@@ -1212,6 +1212,165 @@ function highlightSqlToHtml(sql) {
   return out;
 }
 
+const PY_KW = new Set([
+  "False","None","True",
+  "and","as","assert","async","await",
+  "break","class","continue",
+  "def","del",
+  "elif","else","except",
+  "finally","for","from",
+  "global","if","import","in","is",
+  "lambda","nonlocal","not",
+  "or","pass",
+  "raise","return",
+  "try","while","with",
+  "yield"
+]);
+
+function highlightPythonToHtml(code) {
+  const s = String(code || "");
+  let i = 0;
+  let out = "";
+
+  const emit = (cls, chunk) => {
+    out += `<span class="${cls}">${escapeHtml(chunk)}</span>`;
+  };
+
+  const isWordStart = (c) => /[A-Za-z_]/.test(c);
+  const isWord = (c) => /[A-Za-z0-9_]/.test(c);
+  const isDigit = (c) => /[0-9]/.test(c);
+
+  // Remember if next identifier should be styled (def/class name)
+  let expectDefName = false;
+  let expectClassName = false;
+
+  const peekNonSpace = (idx) => {
+    let j = idx;
+    while (j < s.length && /\s/.test(s[j])) j++;
+    return s[j] || "";
+  };
+
+  while (i < s.length) {
+    const c = s[i];
+    const n = s[i + 1];
+    const n2 = s[i + 2];
+
+    // Comments: # ... (until newline)
+    if (c === "#") {
+      let j = i + 1;
+      while (j < s.length && s[j] !== "\n") j++;
+      emit("tok-com", s.slice(i, j));
+      i = j;
+      continue;
+    }
+
+    // Strings (single/double, triple, with optional prefix r/u/f/b combos)
+    // Detect prefix only if it immediately precedes a quote and is not part of an identifier.
+    const startsWithQuote = (ch) => ch === "'" || ch === '"';
+    const isPrefixChar = (ch) => /[rRuUbBfF]/.test(ch);
+
+    // Prefix handling: e.g. r"..." f'...' rf"""..."""
+    let prefixStart = i;
+    let prefix = "";
+    if (isPrefixChar(c)) {
+      let j = i;
+      while (j < s.length && isPrefixChar(s[j]) && (j - i) < 3) j++;
+      const q = s[j];
+      // ensure prefix isn't part of a larger identifier (word before prefixStart)
+      const prev = s[prefixStart - 1] || "";
+      if (!isWord(prev) && startsWithQuote(q)) {
+        prefix = s.slice(i, j);
+        i = j; // move i onto the quote
+      }
+    }
+
+    // Triple quotes
+    if ((s[i] === "'" && n === "'" && n2 === "'") || (s[i] === '"' && n === '"' && n2 === '"')) {
+      const quote = s[i];
+      let j = i + 3;
+      while (j < s.length && !(s[j] === quote && s[j + 1] === quote && s[j + 2] === quote)) j++;
+      j = Math.min(s.length, j + 3);
+      emit("tok-str", prefix + s.slice(i, j));
+      i = j;
+      prefix = "";
+      continue;
+    }
+
+    // Single/double quoted strings
+    if (s[i] === "'" || s[i] === '"') {
+      const quote = s[i];
+      let j = i + 1;
+      while (j < s.length) {
+        if (s[j] === "\\") { j += 2; continue; }
+        if (s[j] === quote) { j++; break; }
+        j++;
+      }
+      emit("tok-str", prefix + s.slice(i, j));
+      i = j;
+      prefix = "";
+      continue;
+    }
+
+    // Numbers (simple)
+    if (isDigit(c)) {
+      let j = i + 1;
+      while (j < s.length && /[0-9._]/.test(s[j])) j++;
+      emit("tok-num", s.slice(i, j));
+      i = j;
+      continue;
+    }
+
+    // Decorators
+    if (c === "@") {
+      let j = i + 1;
+      while (j < s.length && s[j] !== "\n") j++;
+      emit("tok-fn", s.slice(i, j)); // reuse tok-fn styling for decorators
+      i = j;
+      continue;
+    }
+
+    // Identifiers / keywords
+    if (isWordStart(c)) {
+      let j = i + 1;
+      while (j < s.length && isWord(s[j])) j++;
+      const word = s.slice(i, j);
+
+      if (expectDefName) {
+        emit("tok-fn", word);
+        expectDefName = false;
+        i = j;
+        continue;
+      }
+      if (expectClassName) {
+        emit("tok-id", word);
+        expectClassName = false;
+        i = j;
+        continue;
+      }
+
+      if (PY_KW.has(word)) {
+        emit("tok-kw", word);
+        if (word === "def") expectDefName = true;
+        if (word === "class") expectClassName = true;
+      } else {
+        // highlight function-like calls: name(...)
+        const next = peekNonSpace(j);
+        if (next === "(") emit("tok-fn", word);
+        else emit("tok-id", word);
+      }
+
+      i = j;
+      continue;
+    }
+
+    // Everything else
+    out += escapeHtml(c);
+    i++;
+  }
+
+  return out;
+}
+
 function renderCodeBlock(text, { wrap = false, lang = "", highlight = false } = {}) {
   const s = String(text || "");
   const cls = `codeBlock ${wrap ? "codeWrap" : ""}`;
@@ -1219,6 +1378,12 @@ function renderCodeBlock(text, { wrap = false, lang = "", highlight = false } = 
   if (highlight && lang === "sql") {
     return el("pre", { class: cls },
       el("code", { class: "language-sql", html: highlightSqlToHtml(s) })
+    );
+  }
+
+  if (highlight && lang === "python") {
+    return el("pre", { class: cls },
+      el("code", { class: "language-python", html: highlightPythonToHtml(s) })
     );
   }
 
@@ -1254,14 +1419,33 @@ function renderModelCodeTab(state, m, codeView) {
       class: "btnTiny",
       type: "button",
       onclick: () => {
-        const txt =
-          view === "rendered" ? (rendered || "Rendered SQL not available. Enable docs.include_rendered_sql in the generator.") :
-          view === "raw" ? raw :
-          ""; // refs: nothing to copy
+        const txt = !isSql
+          ? (m.python_source || m.source || "")
+          : view === "rendered"
+            ? (rendered || "Rendered SQL not available. Enable docs.include_rendered_sql in the generator.")
+            : view === "raw"
+              ? raw
+              : "";
         copyToClipboard(txt);
       }
     }, "Copy")
   );
+
+  // ---- Python models: no SQL sub-tabs ----
+  if (!isSql) {
+    const py = m.python_source || m.source || "";
+    const body = py
+      ? renderCodeBlock(py, { wrap: ui.wrap, lang: "python", highlight: true })
+      : el("p", { class:"empty" }, "No source available for this model.");
+
+    return el("div", { class:"card" },
+      el("div", { class:"row", style:"align-items:center; justify-content:space-between;" },
+        el("h3", { style:"margin:0;" }, "Python"),
+        headRight
+      ),
+      body
+    );
+  }
 
   const tabs = el("div", { class: "pillRow" },
     el("button", { class: `tab ${view === "rendered" ? "active" : ""}`, type:"button", onclick: () => setView("rendered") }, "Rendered"),
@@ -1270,14 +1454,6 @@ function renderModelCodeTab(state, m, codeView) {
   );
 
   const body = (() => {
-    if (!isSql) {
-      // Optional: show python source if you later add it to manifest
-      const py = m.python_source || m.source || "";
-      return py
-        ? renderCodeBlock(py, { wrap: ui.wrap })
-        : el("p", { class:"empty" }, "No source available for this model.");
-    }
-
     if (view === "rendered") {
       return rendered
         ? renderCodeBlock(rendered, { wrap: ui.wrap, lang: "sql", highlight: true })
@@ -1918,6 +2094,7 @@ function renderModelPanel(state, m, tab, colFromRoute) {
         )
       ),
       renderModelConfigMetaCard(m),
+      renderPythonModelCard(state, m),
       miniPanel,
       m.description_html
         ? el("div", { class: "card" }, el("h3", {}, "Description"), el("div", { class: "desc", html: m.description_html }))
@@ -1931,7 +2108,7 @@ function renderModelPanel(state, m, tab, colFromRoute) {
 
   if (tab === "lineage") {
     const cols = m.columns || [];
-    const rows = cols
+    const colRows = cols
       .filter(c => (c.lineage || []).length)
       .map(c =>
         el("tr", {},
@@ -1940,14 +2117,27 @@ function renderModelPanel(state, m, tab, colFromRoute) {
         )
       );
 
+    const inferred = m.inferred_lineage || {};
+    const infRows = Object.entries(inferred)
+      .filter(([_, lin]) => Array.isArray(lin) && lin.length)
+      .map(([outCol, lin]) =>
+        el("tr", {},
+          el("td", {}, el("code", {}, outCol)),
+          el("td", {}, renderLineage(lin || []))
+        )
+      );
+
+    const rows = colRows.length ? colRows : infRows;
+    const title = colRows.length ? "Column lineage" : "Inferred lineage";
+
     return el("div", { class: "card" },
-      el("h3", {}, "Column lineage"),
+      el("h3", {}, title),
       rows.length
         ? el("table", { class: "table" },
             el("thead", {}, el("tr", {}, el("th", {}, "Column"), el("th", {}, "Lineage"))),
             el("tbody", {}, ...rows)
           )
-        : el("p", { class: "empty" }, "No lineage available for this model’s columns.")
+        : el("p", { class: "empty" }, "No lineage available for this model.")
     );
   }
 
@@ -2337,6 +2527,41 @@ function renderModelConfigMetaCard(m, { includeRaw = false } = {}) {
     ),
     customDetails,
     rawBlock
+  );
+}
+
+function renderPythonModelCard(state, m) {
+  if ((m.kind || "sql") !== "python") return null;
+
+  const sig = (m.python_signature || "").trim();
+  const doc = (m.python_docstring || "").trim();
+  const req = m.python_requires || {};
+
+  const reqRows = Object.entries(req)
+    .sort((a,b) => a[0].localeCompare(b[0]))
+    .map(([dep, cols]) =>
+      el("tr", {},
+        el("td", {}, el("a", { href: routeWithFacets(`#/model/${escapeHashPart(dep)}`) }, dep)),
+        el("td", {}, (cols && cols.length)
+          ? el("code", {}, cols.join(", "))
+          : el("span", { class: "empty" }, "—")
+        ),
+      )
+    );
+
+  return el("div", { class: "card" },
+    el("h3", {}, "Python model"),
+    el("div", { class: "k" }, "Function signature"),
+    sig ? renderCodeBlock(sig, { wrap: true }) : el("p", { class: "empty" }, "Signature not available."),
+    el("div", { class: "k", style: "margin-top:10px;" }, "Docstring"),
+    doc ? el("pre", { class: "codeBlock codeWrap" }, doc) : el("p", { class: "empty" }, "No docstring."),
+    el("div", { class: "k", style: "margin-top:10px;" }, "Required inputs (best-effort)"),
+    reqRows.length
+      ? el("table", { class: "table" },
+          el("thead", {}, el("tr", {}, el("th", {}, "Dependency"), el("th", {}, "Required columns"))),
+          el("tbody", {}, ...reqRows)
+        )
+      : el("p", { class: "empty" }, "No required-column hints found.")
   );
 }
 
