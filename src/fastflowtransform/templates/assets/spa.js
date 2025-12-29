@@ -243,6 +243,80 @@ function filterModelsWithFacets(models, facets) {
   });
 }
 
+// Shareable UI state (URL-encoded)
+const SHARE_Q = {
+  sidebar: "sf",   // sidebar filter text
+  gPin: "gp",      // pinned node id
+  gMode: "gm",     // up|down|both|off
+  gDepth: "gd",    // 1..8
+  gDir: "gr",      // LR|TB
+};
+
+function readShareStateFromUrl(state) {
+  const { query } = parseHashWithQuery();
+
+  // Sidebar search (treat URL as source of truth)
+  state.filter = query.get(SHARE_Q.sidebar) || "";
+
+  // Graph state (defaults if absent)
+  state.graphUI ||= { mode: "both", depth: 2, pinned: "", dir: "LR" };
+
+  const mode = (query.get(SHARE_Q.gMode) || "").toLowerCase();
+  if (["up","down","both","off"].includes(mode)) state.graphUI.mode = mode;
+  else state.graphUI.mode = "both";
+
+  const depthRaw = Number(query.get(SHARE_Q.gDepth));
+  if (Number.isFinite(depthRaw)) state.graphUI.depth = Math.max(1, Math.min(8, depthRaw));
+  else state.graphUI.depth = 2;
+
+  state.graphUI.pinned = query.get(SHARE_Q.gPin) || "";
+
+  const dir = (query.get(SHARE_Q.gDir) || "").toUpperCase();
+  if (dir === "LR" || dir === "TB") state.graphUI.dir = dir;
+  else state.graphUI.dir = (state.manifest?.dag?.graph?.direction || "LR").toUpperCase();
+
+  // Keep sidebar input in sync if it exists
+  if (state.ui?.sidebar?.input) state.ui.sidebar.input.value = state.filter;
+}
+
+function writeShareStateToQuery(q, state) {
+  const sf = String(state.filter || "");
+  if (sf) q.set(SHARE_Q.sidebar, sf);
+  else q.delete(SHARE_Q.sidebar);
+
+  const g = state.graphUI || {};
+  if ((g.mode || "both") !== "both") q.set(SHARE_Q.gMode, g.mode);
+  else q.delete(SHARE_Q.gMode);
+
+  if (Number(g.depth || 2) !== 2) q.set(SHARE_Q.gDepth, String(g.depth));
+  else q.delete(SHARE_Q.gDepth);
+
+  if (g.pinned) q.set(SHARE_Q.gPin, g.pinned);
+  else q.delete(SHARE_Q.gPin);
+
+  if ((g.dir || "LR").toUpperCase() !== "LR") q.set(SHARE_Q.gDir, (g.dir || "LR").toUpperCase());
+  else q.delete(SHARE_Q.gDir);
+}
+
+function syncShareStateToUrl(state) {
+  replaceHashQuery((q) => writeShareStateToQuery(q, state));
+}
+
+function copyCurrentLink(state) {
+  // Ensure URL contains current search + graph state
+  syncShareStateToUrl(state);
+  copyToClipboard(location.href);
+}
+
+function copyLinkBtn(state, cls = "btnTiny") {
+  return el("button", {
+    class: cls,
+    type: "button",
+    title: "Copy a shareable link to this view",
+    onclick: () => copyCurrentLink(state),
+  }, "Copy link");
+}
+
 // Merge current facet params into an arbitrary hash route (e.g. "#/model/x?tab=columns")
 function routeWithFacets(route) {
   const facets = currentModelFacets();
@@ -264,6 +338,12 @@ function routeWithFacets(route) {
       // avoid leaking stale code=... into non-code tabs
       q.delete("code");
     }
+  }
+
+  // Preserve share-state params across navigation unless target already sets them
+  const curQ = parseHashWithQuery().query;
+  for (const k of Object.values(SHARE_Q)) {
+    if (!q.has(k) && curQ.has(k)) q.set(k, curQ.get(k));
   }
   
   writeModelFacetsToQuery(q, facets);
@@ -1908,7 +1988,11 @@ function renderHome(state) {
   const modeBtn = (id, label) =>
     el("button", {
       class: `btn ${state.graphUI.mode === id ? "active" : ""}`,
-      onclick: () => { state.graphUI.mode = id; state._graphCtl?.refresh?.(); }
+      onclick: () => {
+        state.graphUI.mode = id;
+        syncShareStateToUrl(state);
+        state._graphCtl?.refresh?.();
+      }
     }, label);
 
   const depthPill = el("span", { class: "pill" }, `Depth ${state.graphUI.depth}`);
@@ -1917,6 +2001,7 @@ function renderHome(state) {
     value: String(state.graphUI.depth),
     oninput: (e) => {
       state.graphUI.depth = Number(e.target.value || 2);
+      syncShareStateToUrl(state);
       depthPill.textContent = `Depth ${state.graphUI.depth}`;
       rerenderMini();
     }
@@ -1939,6 +2024,7 @@ function renderHome(state) {
     if (state.graphUI.dir === dir) return;
 
     state.graphUI.dir = dir;
+    syncShareStateToUrl(state);
 
     // update segmented control UI
     lrBtn.classList.toggle("active", dir === "LR");
@@ -1971,6 +2057,7 @@ function renderHome(state) {
 
         el("div", { class: "dagHeaderRight" },
           el("div", { class: "dagToolsRow" },
+            copyLinkBtn(state),
             fitBtn, resetBtn, zoomOutBtn, zoomInBtn,
             layoutTabs
           ),
@@ -2068,6 +2155,7 @@ function renderModel(state, name, tabFromRoute, colFromRoute) {
           class: "btn",
           onclick: () => { location.hash = routeWithFacets("#/"); }
         }, "← Overview"),
+        copyLinkBtn(state, "btn"),
         el("button", {
           class: "btn",
           onclick: async () => { try { await navigator.clipboard.writeText(m.path || ""); } catch {} }
@@ -2287,7 +2375,8 @@ function renderSource(state, sourceName, tableName) {
       el("div", { class: "grid2" },
         el("div", {}, el("h2", {}, key)),
         el("div", {},
-          el("button", { class: "btn", onclick: () => { location.hash = routeWithFacets("#/"); } }, "← Overview")
+          el("button", { class: "btn", onclick: () => { location.hash = routeWithFacets("#/"); } }, "← Overview"),
+          copyLinkBtn(state, "btn"),
         )
       ),
       el("div", { class: "kv" },
@@ -2384,7 +2473,8 @@ function renderMacros(state, qFromRoute) {
             el("div", { class: "docRowPills" },
               el("span", { class: "pillSmall" }, m.kind || "macro")
             )
-          )
+          ),
+          copyLinkBtn(state, "btn"),
         );
       })
     );
@@ -3585,6 +3675,7 @@ function mountGraph(state, host, graph, opts = {}) {
 
   function setPinned(id) {
     state.graphUI.pinned = id || "";
+    syncShareStateToUrl(state);
     applyHighlight();
   }
 
@@ -4145,6 +4236,7 @@ async function main() {
 
   // Initialize model facets from URL (shareable filters)
   state.modelFacets = currentModelFacets();
+  readShareStateFromUrl(state);
 
   toastOnce({
     key: `fft_docs_search_toast_seen:${projKey}`,
@@ -4509,6 +4601,7 @@ async function main() {
     oninput: (e) => {
       state.filter = e.target.value || "";
       safeSet(STORE.filter, state.filter);
+      syncShareStateToUrl(state);
       updateSidebarLists();
     },
     onkeydown: (e) => {
@@ -5121,6 +5214,9 @@ async function main() {
   window.addEventListener("hashchange", () => {
     safeSet(STORE.lastHash, location.hash || "#/");
     closePalette();   // optional: close palette on navigation
+
+    readShareStateFromUrl(state);
+    
     updateSidebarLists();
     updateMain();
   });
