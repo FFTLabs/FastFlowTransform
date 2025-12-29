@@ -1,20 +1,5 @@
 const MANIFEST_URL = window.__FFT_MANIFEST_PATH__ || "assets/docs_manifest.json";
 
-// function el(tag, attrs = {}, ...children) {
-//   const n = document.createElement(tag);
-//   for (const [k, v] of Object.entries(attrs || {})) {
-//     if (k === "class") n.className = v;
-//     else if (k === "html") n.innerHTML = v;
-//     else if (k.startsWith("on") && typeof v === "function") n.addEventListener(k.slice(2).toLowerCase(), v);
-//     else n.setAttribute(k, String(v));
-//   }
-//   for (const c of children) {
-//     if (c == null) continue;
-//     n.appendChild(typeof c === "string" ? document.createTextNode(c) : c);
-//   }
-//   return n;
-// }
-
 function el(tag, attrs = {}, ...children) {
   const n = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs || {})) {
@@ -122,6 +107,7 @@ const FACET_Q = {
   materialized: "mm", // normalized materialization, or "__unknown__"
   path: "mp",         // path prefix
   tags:"mt", 
+  owner: "mo",
   group:"mg"
 };
 const MAT_UNKNOWN = "__unknown__";
@@ -153,6 +139,9 @@ function readModelFacetsFromQuery(query) {
   const mt = (query.get(FACET_Q.tags) || "").trim();
   const tags = mt ? mt.split(",").map(s => s.trim()).filter(Boolean) : [];
 
+  const mo = (query.get(FACET_Q.owner) || "").trim();
+  const owners = mo ? mo.split(",").map(s => s.trim()).filter(Boolean) : [];
+
   const mg = (query.get(FACET_Q.group) || "").trim().toLowerCase();
   const groupBy = (mg === "owner" || mg === "domain") ? mg : "";
 
@@ -168,6 +157,7 @@ function readModelFacetsFromQuery(query) {
     materialized: normalizeMaterialized(query.get(FACET_Q.materialized) || ""),
     pathPrefix: query.get(FACET_Q.path) || "",
     tags,
+    owners,
     groupBy
   };
 }
@@ -190,6 +180,9 @@ function writeModelFacetsToQuery(query, facets) {
   if (facets.tags && facets.tags.length) query.set(FACET_Q.tags, facets.tags.join(","));
   else query.delete(FACET_Q.tags);
 
+  if (facets.owners && facets.owners.length) query.set(FACET_Q.owner, facets.owners.join(","));
+  else query.delete(FACET_Q.owner);
+
   if (facets.groupBy) query.set(FACET_Q.group, facets.groupBy);
   else query.delete(FACET_Q.group);
 }
@@ -202,8 +195,14 @@ function facetsActiveCount(f) {
   const kinds = new Set(f.kinds || []);
   const kindActive = !(kinds.has("sql") && kinds.has("python"));
   const tagsN = (f.tags || []).length;
+  const ownersN = (f.owners || []).length;
   const groupActive = f.groupBy ? 1 : 0;
-  return (kindActive ? 1 : 0) + (f.materialized ? 1 : 0) + (f.pathPrefix ? 1 : 0) + tagsN + groupActive;
+  return (kindActive ? 1 : 0)
+    + (f.materialized ? 1 : 0)
+    + (f.pathPrefix ? 1 : 0)
+    + tagsN
+    + ownersN
+    + groupActive;
 }
 
 function filterModelsWithFacets(models, facets) {
@@ -211,6 +210,7 @@ function filterModelsWithFacets(models, facets) {
   const mat = normalizeMaterialized(facets.materialized || "");
   const pref = facets.pathPrefix || "";
   const tagSet = new Set((facets.tags || []).map(t => t.toLowerCase()));
+  const ownerSet = new Set((facets.owners || []).map(o => String(o).toLowerCase()));
 
   return (models || []).filter(m => {
     const kind = normalizeModelKind(m.kind);
@@ -230,6 +230,12 @@ function filterModelsWithFacets(models, facets) {
     if (tagSet.size) {
       const mtags = Array.isArray(m.tags) ? m.tags : [];
       const ok = mtags.some(t => tagSet.has(String(t).toLowerCase()));
+      if (!ok) return false;
+    }
+
+    if (ownerSet.size) {
+      const owners = Array.isArray(m.owners) ? m.owners : [];
+      const ok = owners.some(o => ownerSet.has(String(o).toLowerCase()));
       if (!ok) return false;
     }
 
@@ -1811,11 +1817,90 @@ function renderRecentChangedCard(state, changed) {
   );
 }
 
+function filterGraphWithModelFacets(graph, models, facets) {
+  if (!graph || !Array.isArray(graph.nodes)) return graph;
 
+  // Which model names survive facets?
+  const keepModelNames = new Set(
+    filterModelsWithFacets(models || [], facets).map(m => m.name)
+  );
+
+  const byId = new Map((graph.nodes || []).map(n => [n.id, n]));
+
+  // Start with kept model node IDs
+  const keepIds = new Set();
+  for (const n of (graph.nodes || [])) {
+    if (n.kind === "model" && keepModelNames.has(n.name)) keepIds.add(n.id);
+  }
+
+  // Keep edges where all model endpoints are kept; pull in connected sources
+  const edges = [];
+  for (const e of (graph.edges || [])) {
+    const a = byId.get(e.from);
+    const b = byId.get(e.to);
+    if (!a || !b) continue;
+
+    if (a.kind === "model" && !keepIds.has(a.id)) continue;
+    if (b.kind === "model" && !keepIds.has(b.id)) continue;
+
+    // skip source->source noise (shouldn't happen, but safe)
+    if (a.kind !== "model" && b.kind !== "model") continue;
+
+    edges.push({ ...e });
+    keepIds.add(a.id);
+    keepIds.add(b.id);
+  }
+
+  const nodes = (graph.nodes || [])
+    .filter(n => keepIds.has(n.id))
+    .map(n => ({ ...n }));
+
+  // Empty result → small safe bounds so Fit doesn't explode
+  if (!nodes.length) {
+    return { nodes: [], edges: [], direction: graph.direction || "LR", bounds: { minx:0, miny:0, maxx:100, maxy:100, width:100, height:100 } };
+  }
+
+  // Normalize coordinates so min x/y are near PAD (important for your translate-based renderer)
+  const PAD = 24;
+  let minx = Infinity, miny = Infinity, maxx = -Infinity, maxy = -Infinity;
+  for (const n of nodes) {
+    const x = Number(n.x || 0), y = Number(n.y || 0);
+    const w = Number(n.w || 0), h = Number(n.h || 0);
+    minx = Math.min(minx, x);
+    miny = Math.min(miny, y);
+    maxx = Math.max(maxx, x + w);
+    maxy = Math.max(maxy, y + h);
+  }
+  const dx = PAD - minx;
+  const dy = PAD - miny;
+  for (const n of nodes) { n.x = Number(n.x || 0) + dx; n.y = Number(n.y || 0) + dy; }
+  maxx += dx; maxy += dy;
+
+  return {
+    nodes,
+    edges,
+    direction: graph.direction || "LR",
+    bounds: { minx: PAD, miny: PAD, maxx, maxy, width: (maxx - PAD + PAD), height: (maxy - PAD + PAD) }
+  };
+}
 
 function renderHome(state) {
   const { manifest } = state;
-  const graph = manifest.dag?.graph;
+
+  const facets = currentModelFacets();
+  const allModels = manifest.models || [];
+
+  const graphRaw = manifest.dag?.graph;
+  const graphBase = filterGraphWithModelFacets(graphRaw, allModels, facets);
+
+  // If the pinned node got filtered away, clear it (avoids “nothing highlights” confusion)
+  if (state.graphUI.pinned && !(graphBase.nodes || []).some(n => n.id === state.graphUI.pinned)) {
+    state.graphUI.pinned = "";
+  }
+
+  function rerenderMini() {
+    state._graphCtl?.refresh?.();
+  }
 
   const graphHost = el("div", { class: "graphHost" });
   const miniHost  = el("div", { class: "minimapHost" });
@@ -1861,7 +1946,7 @@ function renderHome(state) {
     dirPill.textContent = dir === "TB" ? "Top → Bottom" : "Left → Right";
 
     // remount graph
-    const g = graphTransformDirection(state.manifest.dag.graph, dir);
+    const g = graphTransformDirection(graphBase, dir);
     state._graphCtl = mountGraph(state, graphHost, g, { miniHost, showMini: true });
   }
 
@@ -1906,18 +1991,16 @@ function renderHome(state) {
   );
 
   queueMicrotask(() => {
-    const g0 = graphTransformDirection(graph, state.graphUI.dir);
+    const g0 = graphTransformDirection(graphBase, state.graphUI.dir);
     state._graphCtl = mountGraph(state, graphHost, g0, { miniHost, showMini: true });
 
-    const r = parseRoute();
+    const r = parseRoute(); 
     if (r.route === "home" && r.focus) {
       state._graphCtl?.focus?.(r.focus, { zoom: 1.25, pin: true });
     }
   });
 
   // Dashboard data respects the current model facets (kind/materialized/path prefix).
-  const facets = currentModelFacets();
-  const allModels = manifest.models || [];
   const modelsSubset = filterModelsWithFacets(allModels, facets);
 
   // If the URL requests a section, set the default undoc tab.
@@ -2112,10 +2195,15 @@ function renderModelPanel(state, m, tab, colFromRoute) {
       .filter(c => (c.lineage || []).length)
       .map(c =>
         el("tr", {},
-          el("td", {}, el("code", {}, c.name)),
-          el("td", {}, renderLineage(c.lineage || []))
+          el("td", {},
+            (() => {
+              const href = routeWithFacets(`#/model/${escapeHashPart(m.name)}?tab=columns&col=${encodeURIComponent(c.name)}`);
+              return el("a", { href, onclick:(e)=>{ e.preventDefault(); location.hash = href; } }, el("code", {}, c.name));
+            })()
+          ),
+          el("td", {}, renderLineage(state, c.lineage || []))
         )
-      );
+      )
 
     const inferred = m.inferred_lineage || {};
     const infRows = Object.entries(inferred)
@@ -2123,7 +2211,7 @@ function renderModelPanel(state, m, tab, colFromRoute) {
       .map(([outCol, lin]) =>
         el("tr", {},
           el("td", {}, el("code", {}, outCol)),
-          el("td", {}, renderLineage(lin || []))
+          el("td", {}, renderLineage(state, lin || []))
         )
       );
 
@@ -2565,15 +2653,34 @@ function renderPythonModelCard(state, m) {
   );
 }
 
-function renderLineage(items) {
-  if (!items || !items.length) return el("span", { class: "empty" }, "—");
-  // items are already normalized by docs.py lineage logic:
-  // { from_relation, from_column, transformed }
-  const ul = el("ul", { style: "margin:0; padding-left:16px;" });
-  for (const it of items) {
-    const label = `${it.from_relation}.${it.from_column}` + (it.transformed ? " (xform)" : "");
-    ul.appendChild(el("li", {}, el("code", {}, label)));
+// function renderLineage(items) {
+//   if (!items || !items.length) return el("span", { class: "empty" }, "—");
+//   // items are already normalized by docs.py lineage logic:
+//   // { from_relation, from_column, transformed }
+//   const ul = el("ul", { style: "margin:0; padding-left:16px;" });
+//   for (const it of items) {
+//     const label = `${it.from_relation}.${it.from_column}` + (it.transformed ? " (xform)" : "");
+//     ul.appendChild(el("li", {}, el("code", {}, label)));
+//   }
+//   return ul;
+// }
+
+function renderLineage(state, items) {
+  const ul = el("ul", { class: "lineage" });
+
+  for (const it of (items || [])) {
+    const conf = (it.confidence || "inferred").toLowerCase();
+
+    ul.append(
+      el("li", {},
+        renderRelationColRef(state, it.from_relation, it.from_column),
+        " ",
+        renderConfPill(conf),
+        it.transformed ? el("span", { class: "pillSmall" }, "XFORM") : ""
+      )
+    );
   }
+
   return ul;
 }
 
@@ -2774,7 +2881,7 @@ function buildColumnsCard(state, m, colFromRoute) {
 
     const lin = c.lineage || [];
     const linNode = lin.length
-      ? renderLineage(lin)
+      ? renderLineage(state, lin)
       : el("span", { class: "empty" }, "No lineage available.");
 
     const copyName = el("button", {
@@ -2814,11 +2921,71 @@ function buildColumnsCard(state, m, colFromRoute) {
       onclick: async (e) => {
         e.stopPropagation();
         const rows = (lin || []).map(x =>
-          [x.from_relation ?? "", x.from_column ?? "", x.transformed ? "1" : "0"].join(",")
+          [x.from_relation ?? "", x.from_column ?? "", (x.confidence ?? "inferred"), x.transformed ? "1" : "0"].join(",")
         );
-        await copyText(["from_relation,from_column,transformed", ...rows].join("\n"));
+        await copyText(["from_relation,from_column,confidence,transformed", ...rows].join("\n"));
       }
     }, "Copy lineage CSV");
+
+    ensureLineageIndex(state);
+    const idx = state.lineageIndex;
+    const selfKey = colKey(m.relation || "", c.name);
+
+    const upstream = idx.forward.get(selfKey) || [];
+    const downstream = idx.reverse.get(selfKey) || [];
+
+    // dedupe downstream by model+col
+    const seenDown = new Set();
+    const downRows = [];
+    for (const e of downstream) {
+      const k = `${e.to_model}::${e.to_column}`;
+      if (seenDown.has(k)) continue;
+      seenDown.add(k);
+      downRows.push(e);
+    }
+
+    const impactNode = el("div", {},
+      el("div", { style: "margin-bottom:10px;" },
+        el("div", { class: "drawerTitle", style: "margin-bottom:6px;" }, "Upstream columns"),
+        upstream.length
+          ? el("ul", { class: "lineage" },
+              ...upstream.map(e =>
+                el("li", {},
+                  renderRelationColRef(state, e.from_relation, e.from_column),
+                  " ",
+                  renderConfPill(e.confidence),
+                  e.transformed ? el("span", { class: "pillSmall" }, "XFORM") : ""
+                )
+              )
+            )
+          : el("span", { class: "empty" }, "No upstream columns detected.")
+      ),
+
+      el("div", {},
+        el("div", { class: "drawerTitle", style: "margin-bottom:6px;" }, "Used downstream in"),
+        downRows.length
+          ? el("table", { class: "table" },
+              el("thead", {}, el("tr", {},
+                el("th", {}, "Model"),
+                el("th", {}, "Column"),
+                el("th", {}, "Confidence"),
+              )),
+              el("tbody", {},
+                ...downRows.map(e => {
+                  const href = routeWithFacets(`#/model/${escapeHashPart(e.to_model)}?tab=columns&col=${encodeURIComponent(e.to_column)}`);
+                  return el("tr", {},
+                    el("td", {},
+                      el("a", { href, onclick:(ev)=>{ ev.preventDefault(); location.hash = href; } }, e.to_model)
+                    ),
+                    el("td", {}, el("code", {}, e.to_column)),
+                    el("td", {}, renderConfPill(e.confidence)),
+                  );
+                })
+              )
+            )
+          : el("span", { class: "empty" }, "No downstream usage detected.")
+      )
+    );
 
     return el("div", { class: "drawer" },
       el("div", { class: "colTools" },
@@ -2841,6 +3008,10 @@ function buildColumnsCard(state, m, colFromRoute) {
         el("div", { class: "drawerBox" },
           el("div", { class: "drawerTitle" }, "Lineage"),
           linNode
+        ),
+        el("div", { class: "drawerBox" },
+          el("div", { class: "drawerTitle" }, "Impact analysis"),
+          impactNode
         )
       )
     );
@@ -3788,6 +3959,106 @@ function mountGraph(state, host, graph, opts = {}) {
   };
 }
 
+function normRel(r) {
+  return String(r || "")
+    .trim()
+    .replace(/["`]/g, "")
+    .replace(/\s+/g, " ")
+    .toLowerCase();
+}
+function normCol(c) {
+  return String(c || "").trim().toLowerCase();
+}
+function colKey(rel, col) {
+  return `${normRel(rel)}::${normCol(col)}`;
+}
+
+function buildLineageIndex(manifest) {
+  const relToEntity = new Map();
+
+  for (const m of (manifest.models || [])) {
+    if (m.relation) relToEntity.set(normRel(m.relation), { kind: "model", name: m.name, relation: m.relation });
+  }
+  for (const s of (manifest.sources || [])) {
+    if (s.relation) relToEntity.set(normRel(s.relation), { kind: "source", source_name: s.source_name, table_name: s.table_name, relation: s.relation });
+  }
+
+  const forward = new Map(); // toKey -> edges[]
+  const reverse = new Map(); // fromKey -> edges[]
+
+  const push = (mp, k, v) => {
+    if (!mp.has(k)) mp.set(k, []);
+    mp.get(k).push(v);
+  };
+
+  for (const m of (manifest.models || [])) {
+    if (!m.relation) continue;
+    for (const c of (m.columns || [])) {
+      const toKey = colKey(m.relation, c.name);
+      for (const it of (c.lineage || [])) {
+        const fromRel = it.from_relation || "";
+        const fromCol = it.from_column || "";
+        if (!fromRel || !fromCol) continue;
+
+        const fromKey = colKey(fromRel, fromCol);
+        const edge = {
+          from_relation: fromRel,
+          from_column: fromCol,
+          confidence: (it.confidence || "inferred").toLowerCase(),
+          transformed: !!it.transformed,
+
+          // downstream target
+          to_model: m.name,
+          to_column: c.name,
+          to_relation: m.relation,
+
+          fromKey,
+          toKey,
+        };
+
+        push(forward, toKey, edge);
+        push(reverse, fromKey, edge);
+      }
+    }
+  }
+
+  return { relToEntity, forward, reverse };
+}
+
+function ensureLineageIndex(state) {
+  if (!state.lineageIndex) state.lineageIndex = buildLineageIndex(state.manifest);
+}
+
+function renderConfPill(conf) {
+  const c = String(conf || "inferred").toLowerCase();
+  if (c === "annotated") return el("span", { class: "pillSmall pillGood", title: "Annotated (manual override / YAML)" }, "ANNOTATED");
+  if (c === "inferred") return el("span", { class: "pillSmall pillWarn", title: "Inferred from SQL/Python" }, "INFERRED");
+  return el("span", { class: "pillSmall" }, c.toUpperCase());
+}
+
+function renderRelationColRef(state, rel, col) {
+  ensureLineageIndex(state);
+  const ent = state.lineageIndex.relToEntity.get(normRel(rel));
+
+  if (ent?.kind === "model") {
+    const href = routeWithFacets(`#/model/${escapeHashPart(ent.name)}?tab=columns&col=${encodeURIComponent(col)}`);
+    return el("a", {
+      href,
+      onclick: (e) => { e.preventDefault(); location.hash = href; }
+    }, `${ent.name}.${col}`);
+  }
+
+  if (ent?.kind === "source") {
+    const href = routeWithFacets(`#/source/${escapeHashPart(ent.source_name)}/${escapeHashPart(ent.table_name)}`);
+    return el("a", {
+      href,
+      onclick: (e) => { e.preventDefault(); location.hash = href; }
+    }, `${ent.source_name}.${ent.table_name}.${col}`);
+  }
+
+  return el("code", {}, `${rel}.${col}`);
+}
+
 async function copyText(text) {
   try { await navigator.clipboard.writeText(String(text ?? "")); return true; }
   catch { return false; }
@@ -3827,6 +4098,7 @@ async function main() {
     paletteList: null,
   };
   state.ui = ui;
+  state.lineageIndex = buildLineageIndex(state.manifest);
 
   // Mount shell once
   const shell = el("div", { class: "shell" },
@@ -4331,7 +4603,14 @@ async function main() {
     type: "button",
     onclick: () => {
       debouncedPath.cancel();
-      state.modelFacets = { kinds: ["sql", "python"], materialized: "", pathPrefix: "", tags: [], groupBy: "" };
+      state.modelFacets = {
+        kinds: ["sql", "python"],
+        materialized: "",
+        pathPrefix: "",
+        tags: [],
+        owners: [],
+        groupBy: ""
+      };
       ui.sidebar.pathInput.value = "";
       applyFacetsToUrl();
       updateSidebarLists();
@@ -4370,6 +4649,27 @@ async function main() {
       ui.sidebar.tagInput.value = "";
     }
   };
+
+
+  ui.sidebar.ownerBox = el("div", { class:"facetChips facetChipsWrap" });
+  ui.sidebar.ownerInput = el("input", { class:"facetInput", placeholder:"Add owner…", list:"modelOwners" });
+  ui.sidebar.ownerDatalist = el("datalist", { id:"modelOwners" });
+
+  ui.sidebar.ownerInput.onkeydown = (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      const o = (ui.sidebar.ownerInput.value || "").trim();
+      if (!o) return;
+      const owners = new Set(state.modelFacets.owners || []);
+      owners.add(o);
+      state.modelFacets.owners = Array.from(owners);
+      ui.sidebar.ownerInput.value = "";
+      replaceHashQuery((q)=> writeModelFacetsToQuery(q, state.modelFacets));
+      state.modelFacets = currentModelFacets();
+      updateSidebarLists();
+    }
+  };
+
   ui.sidebar.facetBox = el("div", { class:"facetBox" },
     el("div", { class:"facetRow" },
       el("div", { class:"facetChips" }, ui.sidebar.kindSqlBtn, ui.sidebar.kindPyBtn),
@@ -4386,6 +4686,12 @@ async function main() {
     ),
     ui.sidebar.tagBox,
     ui.sidebar.tagDatalist,
+    el("div", { class:"facetRow" },
+      el("div", { class:"facetLabel" }, "Owners"),
+      ui.sidebar.ownerInput
+    ),
+    ui.sidebar.ownerBox,
+    ui.sidebar.ownerDatalist,
     ui.sidebar.pathDatalist
   );
 
@@ -4633,6 +4939,46 @@ async function main() {
           }
         }, `${t} (${n})`);
         return b;
+      })
+    );
+
+    const baseForOwners = filterModelsWithFacets(modelsAfterText, { ...state.modelFacets, owners: [] });
+    const ownerCounts = new Map();
+    for (const m of baseForOwners) {
+      for (const o of (Array.isArray(m.owners) ? m.owners : [])) {
+        const key = String(o).trim();
+        if (!key) continue;
+        ownerCounts.set(key, (ownerCounts.get(key) || 0) + 1);
+      }
+    }
+    const topOwners = Array.from(ownerCounts.entries())
+      .sort((a,b)=> (b[1]-a[1]) || a[0].localeCompare(b[0]))
+      .slice(0, 30);
+
+    ui.sidebar.ownerDatalist.replaceChildren(
+      ...topOwners.map(([o,n]) => el("option", { value:o }, `${o} (${n})`))
+    );
+
+    const activeOwners = new Set((state.modelFacets.owners || []).map(x => String(x).toLowerCase()));
+    ui.sidebar.ownerBox.replaceChildren(
+      ...topOwners.map(([o,n]) => {
+        const on = activeOwners.has(o.toLowerCase());
+        return el("button", {
+          class: `facetChip ${on ? "active" : ""}`,
+          type:"button",
+          onclick: () => {
+            const owners = new Set(state.modelFacets.owners || []);
+            if (on) {
+              for (const x of Array.from(owners)) if (String(x).toLowerCase() === o.toLowerCase()) owners.delete(x);
+            } else {
+              owners.add(o);
+            }
+            state.modelFacets.owners = Array.from(owners);
+            replaceHashQuery((q)=> writeModelFacetsToQuery(q, state.modelFacets));
+            state.modelFacets = currentModelFacets();
+            updateSidebarLists();
+          }
+        }, `${o} (${n})`);
       })
     );
 

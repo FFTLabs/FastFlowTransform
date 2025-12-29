@@ -782,6 +782,15 @@ def _apply_descriptions_to_models(
             c.description_html = rel_desc_map.get(c.name) or mdl_desc_map.get(c.name)
 
 
+def _mark_lineage_confidence(lin: dict[str, list[dict[str, Any]]], conf: str) -> None:
+    for items in (lin or {}).values():
+        if not isinstance(items, list):
+            continue
+        for it in items:
+            if isinstance(it, dict):
+                it.setdefault("confidence", conf)
+
+
 def _infer_and_attach_lineage(
     models: list[ModelDoc],
     executor: Any | None,
@@ -809,11 +818,16 @@ def _infer_and_attach_lineage(
                         rendered = None
                 if rendered:
                     inferred = infer_sql_lineage(rendered)
+                    _mark_lineage_confidence(inferred, "inferred")
+
                     overrides = parse_sql_lineage_overrides(rendered)
+                    _mark_lineage_confidence(overrides, "annotated")
+
                     inferred = merge_lineage(inferred, overrides)
             elif m.kind == "python":
                 func = getattr(REGISTRY, "py_funcs", {}).get(m.name)
                 inferred = infer_py_lineage(func)
+                _mark_lineage_confidence(inferred, "inferred")
         except Exception:
             inferred = {}
 
@@ -842,12 +856,15 @@ def _infer_and_attach_lineage(
                                 "from_relation": s["table"],
                                 "from_column": s["column"],
                                 "transformed": transformed_flag,
+                                "confidence": "annotated",
                             }
                         )
                 if items:
                     norm[out_col] = items
             if norm:
                 inferred = merge_lineage(inferred, norm)
+
+        _mark_lineage_confidence(inferred, "inferred")
 
         if with_schema and (m.relation in cols_by_table) and inferred:
             for c in cols_by_table[m.relation]:
