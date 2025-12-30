@@ -1,4 +1,6 @@
 const MANIFEST_URL = window.__FFT_MANIFEST_PATH__ || "assets/docs_manifest.json";
+const RUN_RESULTS_URL  = window.__FFT_RUN_RESULTS_PATH__  || "assets/run_results.json";
+const TEST_RESULTS_URL = window.__FFT_TEST_RESULTS_PATH__ || "assets/test_results.json";
 
 function el(tag, attrs = {}, ...children) {
   const n = document.createElement(tag);
@@ -2188,6 +2190,7 @@ function renderModelPanel(state, m, tab, colFromRoute) {
       el("a", { href: routeWithFacets(`#/source/${escapeHashPart(s.source_name)}/${escapeHashPart(s.table_name)}`) }, `${s.source_name}.${s.table_name}`)
     );
     const modelId = m.name;
+    const healthCard = renderHealthCardForModel(state, m);
 
     // --- Neighborhood mini-graph (MODEL PAGE) ---
     state.modelMini = state.modelMini || { mode: "both", depth: 2 };
@@ -2264,6 +2267,7 @@ function renderModelPanel(state, m, tab, colFromRoute) {
           el("div", { class: "k" }, "Sources"), el("div", {}, sourcesUsed.length ? joinInline(sourcesUsed) : el("span", { class: "empty" }, "—")),
         )
       ),
+      healthCard ? healthCard : null,
       renderModelConfigMetaCard(m),
       renderPythonModelCard(state, m),
       miniPanel,
@@ -2742,18 +2746,6 @@ function renderPythonModelCard(state, m) {
       : el("p", { class: "empty" }, "No required-column hints found.")
   );
 }
-
-// function renderLineage(items) {
-//   if (!items || !items.length) return el("span", { class: "empty" }, "—");
-//   // items are already normalized by docs.py lineage logic:
-//   // { from_relation, from_column, transformed }
-//   const ul = el("ul", { style: "margin:0; padding-left:16px;" });
-//   for (const it of items) {
-//     const label = `${it.from_relation}.${it.from_column}` + (it.transformed ? " (xform)" : "");
-//     ul.appendChild(el("li", {}, el("code", {}, label)));
-//   }
-//   return ul;
-// }
 
 function renderLineage(state, items) {
   const ul = el("ul", { class: "lineage" });
@@ -4150,6 +4142,220 @@ function renderRelationColRef(state, rel, col) {
   return el("code", {}, `${rel}.${col}`);
 }
 
+// -------- Health helpers -----------------------------------------
+
+function fmtDateTime(v) {
+  const d = (typeof v === "number") ? new Date(v) : new Date(String(v || ""));
+  if (Number.isNaN(d.getTime())) return "";
+  return d.toLocaleString(undefined, {
+    year: "numeric", month: "short", day: "2-digit",
+    hour: "2-digit", minute: "2-digit",
+  });
+}
+
+function fmtDurationMs(ms) {
+  ms = Number(ms || 0);
+  if (!Number.isFinite(ms) || ms <= 0) return "—";
+  const s = Math.round(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60), rs = s % 60;
+  if (m < 60) return `${m}m ${rs}s`;
+  const h = Math.floor(m / 60), rm = m % 60;
+  return `${h}h ${rm}m`;
+}
+
+function testBucket(t) {
+  const st = String(t.status || t.state || "").toLowerCase();
+  if (st === "pass" || st === "ok" || st === "success") return "pass";
+  if (st === "warn" || st === "warning") return "warn";
+  if (st === "skip" || st === "skipped") return "skip";
+  // fallback if you ever store boolean ok
+  if (t.ok === true) return "pass";
+  if (t.ok === false) return "fail";
+  return "fail";
+}
+
+function buildTestIndex(state) {
+  const tests = (state.testResults?.results || state.testResults?.tests || []);
+  const relToEnt = new Map();
+
+  for (const m of (state.manifest.models || [])) {
+    if (m.relation) relToEnt.set(normRel(m.relation), { kind: "model", name: m.name });
+  }
+  for (const s of (state.manifest.sources || [])) {
+    if (s.relation) relToEnt.set(normRel(s.relation), {
+      kind: "source",
+      key: `${s.source_name}.${s.table_name}`,
+      source_name: s.source_name,
+      table_name: s.table_name,
+    });
+  }
+
+  const byModel = new Map();
+  const bySource = new Map();
+  const byModelCol = new Map();
+  const summary = { pass: 0, warn: 0, fail: 0, skip: 0, total: 0 };
+
+  for (const t of tests) {
+    const bucket = testBucket(t);
+    summary[bucket] = (summary[bucket] || 0) + 1;
+    summary.total++;
+
+    // Figure out the target entity
+    let ent = null;
+
+    if (t.model_name) {
+      ent = { kind: "model", name: String(t.model_name) };
+    } else if (t.source_name && t.table_name) {
+      ent = { kind: "source", key: `${t.source_name}.${t.table_name}`, source_name: t.source_name, table_name: t.table_name };
+    } else {
+      const rel = normRel(t.relation || t.table || t.target_relation || t.target_table || "");
+      ent = rel ? relToEnt.get(rel) : null;
+    }
+
+    if (!ent) continue;
+
+    const rec = { ...t, _bucket: bucket };
+    const col = String(t.column || t.target_column || "").trim();
+
+    if (ent.kind === "model") {
+      const arr = byModel.get(ent.name) || [];
+      arr.push(rec);
+      byModel.set(ent.name, arr);
+
+      if (col) {
+        const k = `${ent.name}.${col}`;
+        const arr2 = byModelCol.get(k) || [];
+        arr2.push(rec);
+        byModelCol.set(k, arr2);
+      }
+    } else if (ent.kind === "source") {
+      const arr = bySource.get(ent.key) || [];
+      arr.push(rec);
+      bySource.set(ent.key, arr);
+    }
+  }
+
+  return { byModel, bySource, byModelCol, summary };
+}
+
+function pillForRunStatus(status) {
+  const st = String(status || "").toLowerCase();
+  const cls =
+    (st === "success" || st === "ok" || st === "pass") ? "pillGood" :
+    (st === "skipped" || st === "warn" || st === "warning") ? "pillWarn" :
+    (st ? "pillBad" : "pill");
+  return el("span", { class: `pillSmall ${cls}` }, st || "unknown");
+}
+
+function pillForTestBucket(bucket) {
+  const cls =
+    bucket === "pass" ? "pillGood" :
+    bucket === "warn" ? "pillWarn" :
+    bucket === "skip" ? "" :
+    "pillBad";
+  return el("span", { class: `pillSmall ${cls}` }, bucket);
+}
+
+function renderHealthCardForModel(state, m) {
+  const hasRuns = !!state.runResults;
+  const hasTests = !!state.testResults;
+
+  if (!hasRuns && !hasTests) return null;
+
+  const run = state.byRun?.[m.name] || state.byRun?.get?.(m.name);
+  const tests = state.testIndex?.byModel?.get?.(m.name) || [];
+
+  const runBlock = (() => {
+    if (!hasRuns) return el("p", { class: "empty" }, "No run results were loaded.");
+    if (!run) return el("p", { class: "empty" }, "No run info found for this model in run_results.json.");
+
+    return el("div", { class: "kv" },
+      el("div", { class: "k" }, "Status"),
+      el("div", {}, pillForRunStatus(run.status)),
+
+      el("div", { class: "k" }, "Finished"),
+      el("div", {}, fmtDateTime(run.finished_at || run.started_at) || "—"),
+
+      el("div", { class: "k" }, "Duration"),
+      el("div", {}, fmtDurationMs(run.duration_ms)),
+
+      el("div", { class: "k" }, "Rows"),
+      el("div", {}, (run.rows == null ? "—" : String(run.rows))),
+
+      el("div", { class: "k" }, "Bytes scanned"),
+      el("div", {}, (run.bytes_scanned == null ? "—" : String(run.bytes_scanned))),
+    );
+  })();
+
+  const testsBlock = (() => {
+    if (!hasTests) return el("p", { class: "empty" }, "No test results were loaded.");
+    if (!tests.length) return el("p", { class: "empty" }, "No tests recorded for this model.");
+
+    const counts = { pass: 0, warn: 0, fail: 0, skip: 0 };
+    for (const t of tests) counts[t._bucket] = (counts[t._bucket] || 0) + 1;
+
+    const header = el("div", { class: "row", style: "gap:8px; flex-wrap:wrap;" },
+      el("span", { class: "pillSmall pillGood" }, `pass ${counts.pass || 0}`),
+      el("span", { class: "pillSmall pillWarn" }, `warn ${counts.warn || 0}`),
+      el("span", { class: "pillSmall pillBad" }, `fail ${counts.fail || 0}`),
+      el("span", { class: "pillSmall" }, `skip ${counts.skip || 0}`),
+    );
+
+    const rows = tests
+      .slice()
+      .sort((a, b) => String(a._bucket).localeCompare(String(b._bucket))) // keeps fails near top-ish
+      .slice(0, 50);
+
+    return el("div", {},
+      header,
+      el("details", { style: "margin-top:10px;" },
+        el("summary", {}, "Show test details"),
+        el("table", { class: "table", style: "margin-top:10px;" },
+          el("thead", {}, el("tr", {},
+            el("th", {}, "Status"),
+            el("th", {}, "Test"),
+            el("th", {}, "Column"),
+            el("th", {}, "Message"),
+          )),
+          el("tbody", {},
+            ...rows.map(t => el("tr", {},
+              el("td", {}, pillForTestBucket(t._bucket)),
+              el("td", {}, el("code", {}, String(t.name || t.test_name || t.test || t.kind || "test"))),
+              el("td", {}, t.column ? el("code", {}, String(t.column)) : el("span", { class: "empty" }, "—")),
+              el("td", {}, String(t.message || t.msg || t.error || "")),
+            ))
+          )
+        )
+      )
+    );
+  })();
+
+  return el("div", { class: "card" },
+    el("h3", { style: "margin-top:0;" }, "Health"),
+    el("div", { class: "healthSplit" },
+      el("div", { class: "healthPane" },
+        el("h4", {}, "Last run"),
+        runBlock
+      ),
+      el("div", { class: "healthPane" },
+        el("h4", {}, "Tests"),
+        testsBlock
+      )
+    )
+  );
+}
+
+async function loadOptionalJson(url) {
+  try {
+    const res = await fetch(url, { cache: "no-store" });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
 async function copyText(text) {
   try { await navigator.clipboard.writeText(String(text ?? "")); return true; }
   catch { return false; }
@@ -4166,12 +4372,22 @@ async function main() {
   app.textContent = "Loading…";
 
   const manifest = await loadManifest();
+    const [runResults, testResults] = await Promise.all([
+    loadOptionalJson(RUN_RESULTS_URL),
+    loadOptionalJson(TEST_RESULTS_URL),
+  ]);
+
   const state = {
     manifest,
     filter: "",
     byModel: byName(manifest.models || [], (m) => m.name),
     bySource: byName(manifest.sources || [], (s) => `${s.source_name}.${s.table_name}`),
+    runResults,
+    testResults,
   };
+  state.byRun = byName((runResults?.results || []), (r) => r.name);
+  state.testIndex = buildTestIndex(state);
+
   state.sidebarMatches = { models: 0, sources: 0 };
   state.graphUI = {
     mode: "both",   // "up" | "down" | "both" | "off"
@@ -5170,31 +5386,47 @@ async function main() {
   }
 
   function updateMain() {
-    const route = parseRoute();
-    let view;
-    if (route.route === "model") view = renderModel(state, route.name, route.tab, route.col);
-    else if (route.route === "source") view = renderSource(state, route.source, route.table);
-    else if (route.route === "macro") view = renderMacro(state, route.name);
-    else if (route.route === "macros") { state.macroQuery = route.q || ""; view = renderMacros(state, state.macroQuery); }
-    else view = renderHome(state);
+    try {
+      const route = parseRoute();
+      let view;
+      if (route.route === "model") view = renderModel(state, route.name, route.tab, route.col);
+      else if (route.route === "source") view = renderSource(state, route.source, route.table);
+      else if (route.route === "macro") view = renderMacro(state, route.name);
+      else if (route.route === "macros") { state.macroQuery = route.q || ""; view = renderMacros(state, state.macroQuery); }
+      else view = renderHome(state);
 
-    state.ui.mainHost.replaceChildren(view);
+      state.ui.mainHost.replaceChildren(view);
 
-    // If home view contains mermaid, render it now (same as before)
-    if (route.route === "home") {
-      queueMicrotask(async () => {
-        const target = document.getElementById("mermaidTarget");
-        if (!target) return;
-        const dagSrc = state.manifest.dag?.mermaid || "";
-        if (!state.mermaid) {
-          target.textContent = dagSrc;
-          return;
-        }
-        target.innerHTML = `<pre class="mermaid">${dagSrc}</pre>`;
-        try { await state.mermaid.run({ querySelector: "#mermaidTarget .mermaid" }); } catch {}
-      });
+      // If home view contains mermaid, render it now (same as before)
+      if (route.route === "home") {
+        queueMicrotask(async () => {
+          const target = document.getElementById("mermaidTarget");
+          if (!target) return;
+          const dagSrc = state.manifest.dag?.mermaid || "";
+          if (!state.mermaid) {
+            target.textContent = dagSrc;
+            return;
+          }
+          target.innerHTML = `<pre class="mermaid">${dagSrc}</pre>`;
+          try { await state.mermaid.run({ querySelector: "#mermaidTarget .mermaid" }); } catch {}
+        });
+      }
+    } catch (e) {
+      console.error(e);
+      state.ui.mainHost.replaceChildren(
+        el("div", { class: "main" },
+          el("div", { class: "card" },
+            el("h2", {}, "Render failed"),
+            el("p", { class: "empty" }, String(e?.message || e)),
+            el("pre", { class: "mono", style: "white-space:pre-wrap; margin:10px 0 0 0;" },
+              String(e?.stack || "")
+            )
+          )
+        )
+      );
     }
   }
+  
 
   window.addEventListener("keydown", (e) => {
     const tag = e.target?.tagName?.toLowerCase();

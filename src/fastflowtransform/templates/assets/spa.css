@@ -654,3 +654,22 @@ tr.colHit{
   .codeBlock .tok-num { color: #fbbf24; }
   .codeBlock .tok-com { color: #9ca3af; }
 }
+
+/* Health strip layout */
+.healthSplit{
+  display:flex;
+  gap:14px;                 /* controls spacing between Last run and Tests */
+  align-items:flex-start;
+  justify-content:flex-start;
+  flex-wrap:wrap;           /* stacks on narrow screens */
+}
+
+.healthPane{
+  flex: 1 1 360px;          /* two columns when space allows */
+  min-width: 320px;         /* prevent ultra-narrow columns */
+}
+
+/* Optional: tighten headings inside health */
+.healthPane h4{
+  margin: 0 0 8px 0;
+}

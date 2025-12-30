@@ -248,6 +248,22 @@ def _drop_leading_blank_lines(s: str) -> str:
     return _LEADING_BLANK_LINES.sub("", s or "")
 
 
+def _copy_runtime_artifacts(out_dir: Path, proj_dir: Path | None) -> None:
+    if not proj_dir:
+        return
+    src_dir = proj_dir / ".fastflowtransform" / "target"
+    if not src_dir.exists():
+        return
+
+    assets_dir = out_dir / "assets"
+    assets_dir.mkdir(parents=True, exist_ok=True)
+
+    for fname in ("run_results.json", "test_results.json"):
+        src = src_dir / fname
+        if src.exists():
+            shutil.copy2(src, assets_dir / fname)
+
+
 def _render_sql_for_docs(
     nodes: dict[str, Node],
     executor: Any,
@@ -1053,6 +1069,8 @@ def render_site(
         (assets_dir / "docs_manifest.json").write_text(
             json.dumps(manifest, indent=2), encoding="utf-8"
         )
+
+        _copy_runtime_artifacts(out_dir, proj_dir)
 
         # SPA shell (index.html.j2)
         _render_index(
