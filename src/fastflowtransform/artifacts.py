@@ -389,3 +389,47 @@ def write_test_results(
     }
     _json_dump(path, data)
     return path
+
+
+# ---------- UNIT TEST RESULTS ----------
+
+
+@dataclass
+class UTestResult:
+    model: str
+    case: str
+    status: str  # "pass" | "fail" | "error" | "skip"
+    duration_ms: int
+    cache_hit: bool = False
+
+    message: str | None = None
+    target_relation: str | None = None
+    spec_path: str = ""
+
+
+def write_utest_results(
+    project_dir: Path,
+    *,
+    started_at: str,
+    finished_at: str,
+    failures: int,
+    results: list[UTestResult],
+    engine: str | None = None,
+) -> Path:
+    """
+    Write utest_results.json containing a run envelope + per-case results.
+    """
+    project_dir = Path(project_dir)
+    out_dir = _target_dir(project_dir)
+    path = out_dir / "utest_results.json"
+
+    data = {
+        "metadata": {"tool": "fastflowtransform", "generated_at": _iso_now()},
+        "utest_started_at": started_at,
+        "utest_finished_at": finished_at,
+        "engine": engine or "",
+        "failures": int(failures or 0),
+        "results": [asdict(r) for r in results],
+    }
+    _json_dump(path, data)
+    return path

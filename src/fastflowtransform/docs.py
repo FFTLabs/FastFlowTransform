@@ -258,7 +258,7 @@ def _copy_runtime_artifacts(out_dir: Path, proj_dir: Path | None) -> None:
     assets_dir = out_dir / "assets"
     assets_dir.mkdir(parents=True, exist_ok=True)
 
-    for fname in ("run_results.json", "test_results.json"):
+    for fname in ("run_results.json", "test_results.json", "utest_results.json"):
         src = src_dir / fname
         if src.exists():
             shutil.copy2(src, assets_dir / fname)

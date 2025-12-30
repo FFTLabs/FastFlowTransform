@@ -673,3 +673,36 @@ tr.colHit{
 .healthPane h4{
   margin: 0 0 8px 0;
 }
+
+.healthStack{
+  display:flex;
+  flex-direction:column;
+  gap:12px;
+}
+
+.healthRow{
+  border: 1px solid var(--border, rgba(0,0,0,.12));
+  border-radius: 10px;
+  padding: 10px 12px;
+  background: var(--card, transparent);
+}
+
+.healthRowSummary{
+  cursor: pointer;
+  list-style: none;
+  display:flex;
+  align-items:center;
+  gap:10px;
+}
+
+/* remove default marker in some browsers */
+.healthRowSummary::-webkit-details-marker{ display:none; }
+
+.healthRowHead{
+  flex: 0 0 auto;
+}
+
+.healthRowBody{
+  margin-top:10px;
+}
+

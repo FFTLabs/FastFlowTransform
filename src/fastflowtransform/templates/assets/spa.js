@@ -1,6 +1,7 @@
 const MANIFEST_URL = window.__FFT_MANIFEST_PATH__ || "assets/docs_manifest.json";
 const RUN_RESULTS_URL  = window.__FFT_RUN_RESULTS_PATH__  || "assets/run_results.json";
 const TEST_RESULTS_URL = window.__FFT_TEST_RESULTS_PATH__ || "assets/test_results.json";
+const UTEST_RESULTS_URL = window.__FFT_UTEST_RESULTS_PATH__ || "assets/utest_results.json";
 
 function el(tag, attrs = {}, ...children) {
   const n = document.createElement(tag);
@@ -4239,6 +4240,39 @@ function buildTestIndex(state) {
   return { byModel, bySource, byModelCol, summary };
 }
 
+function utestBucket(t) {
+  const st = String(t.status || t.state || "").toLowerCase();
+  if (st === "pass" || st === "ok" || st === "success") return "pass";
+  if (st === "skip" || st === "skipped") return "skip";
+  if (st === "error") return "error";
+  if (st === "fail" || st === "failed") return "fail";
+  if (t.ok === true) return "pass";
+  if (t.ok === false) return "fail";
+  return st || "fail";
+}
+
+function buildUTestIndex(state) {
+  const tests = (state.utestResults?.results || state.utestResults?.tests || []);
+  const byModel = new Map();
+  const summary = { pass: 0, fail: 0, error: 0, skip: 0, total: 0 };
+
+  for (const t of tests) {
+    const model = String(t.model || t.model_name || "").trim();
+    if (!model) continue;
+
+    const bucket = utestBucket(t);
+    summary[bucket] = (summary[bucket] || 0) + 1;
+    summary.total++;
+
+    const rec = { ...t, _bucket: bucket };
+    const arr = byModel.get(model) || [];
+    arr.push(rec);
+    byModel.set(model, arr);
+  }
+
+  return { byModel, summary };
+}
+
 function pillForRunStatus(status) {
   const st = String(status || "").toLowerCase();
   const cls =
@@ -4257,14 +4291,24 @@ function pillForTestBucket(bucket) {
   return el("span", { class: `pillSmall ${cls}` }, bucket);
 }
 
+function pillForUTestBucket(bucket) {
+  const cls =
+    bucket === "pass" ? "pillGood" :
+    bucket === "skip" ? "" :
+    "pillBad"; // fail + error both bad
+  return el("span", { class: `pillSmall ${cls}` }, bucket);
+}
+
 function renderHealthCardForModel(state, m) {
   const hasRuns = !!state.runResults;
   const hasTests = !!state.testResults;
+  const hasUTests = !!state.utestResults;
 
-  if (!hasRuns && !hasTests) return null;
+  if (!hasRuns && !hasTests && !hasUTests) return null;
 
   const run = state.byRun?.[m.name] || state.byRun?.get?.(m.name);
   const tests = state.testIndex?.byModel?.get?.(m.name) || [];
+  const utests = state.utestIndex?.byModel?.get?.(m.name) || [];
 
   const runBlock = (() => {
     if (!hasRuns) return el("p", { class: "empty" }, "No run results were loaded.");
@@ -4331,17 +4375,76 @@ function renderHealthCardForModel(state, m) {
     );
   })();
 
+  const utestsBlock = (() => {
+    if (!hasUTests) return el("p", { class: "empty" }, "No unit test results were loaded.");
+    if (!utests.length) return el("p", { class: "empty" }, "No unit tests recorded for this model.");
+
+    const counts = { pass: 0, fail: 0, error: 0, skip: 0 };
+    for (const t of utests) counts[t._bucket] = (counts[t._bucket] || 0) + 1;
+
+    const header = el("div", { class: "row", style: "gap:8px; flex-wrap:wrap;" },
+      el("span", { class: "pillSmall pillGood" }, `pass ${counts.pass || 0}`),
+      el("span", { class: "pillSmall pillBad" }, `fail ${counts.fail || 0}`),
+      el("span", { class: "pillSmall pillBad" }, `error ${counts.error || 0}`),
+      el("span", { class: "pillSmall" }, `skip ${counts.skip || 0}`),
+    );
+
+    const rows = utests
+      .slice()
+      .sort((a, b) => String(a._bucket).localeCompare(String(b._bucket)))
+      .slice(0, 50);
+
+    return el("div", {},
+      header,
+      el("details", { style: "margin-top:10px;" },
+        el("summary", {}, "Show unit test details"),
+        el("table", { class: "table", style: "margin-top:10px;" },
+          el("thead", {}, el("tr", {},
+            el("th", {}, "Status"),
+            el("th", {}, "Case"),
+            el("th", {}, "Duration"),
+            el("th", {}, "Cache"),
+            el("th", {}, "Message"),
+          )),
+          el("tbody", {},
+            ...rows.map(t => el("tr", {},
+              el("td", {}, pillForUTestBucket(t._bucket)),
+              el("td", {}, el("code", {}, String(t.case || ""))),
+              el("td", {}, fmtDurationMs(t.duration_ms)),
+              el("td", {}, t.cache_hit ? el("span", { class: "pillSmall" }, "hit") : el("span", { class: "empty" }, "—")),
+              el("td", {}, String(t.message || "")),
+            ))
+          )
+        )
+      )
+    );
+  })();
+
   return el("div", { class: "card" },
     el("h3", { style: "margin-top:0;" }, "Health"),
-    el("div", { class: "healthSplit" },
-      el("div", { class: "healthPane" },
-        el("h4", {}, "Last run"),
-        runBlock
+
+    el("div", { class: "healthStack" },
+      // Row 1: Last run (always visible)
+      el("div", { class: "healthRow" },
+        el("div", { class: "healthRowHead" }, el("h4", { style:"margin:0;" }, "Last run")),
+        el("div", { class: "healthRowBody" }, runBlock)
       ),
-      el("div", { class: "healthPane" },
-        el("h4", {}, "Tests"),
-        testsBlock
-      )
+
+      // Row 2: Tests (collapsible)
+      hasTests ? el("details", { class: "healthRow", open: false },
+        el("summary", { class: "healthRowSummary" },
+          el("div", { class: "healthRowHead" }, el("h4", { style:"margin:0;" }, "Tests")),
+        ),
+        el("div", { class: "healthRowBody" }, testsBlock)
+      ) : null,
+
+      // Row 3: Unit tests (collapsible)
+      hasUTests ? el("details", { class: "healthRow", open: false },
+        el("summary", { class: "healthRowSummary" },
+          el("div", { class: "healthRowHead" }, el("h4", { style:"margin:0;" }, "Unit tests")),
+        ),
+        el("div", { class: "healthRowBody" }, utestsBlock)
+      ) : null
     )
   );
 }
@@ -4372,9 +4475,10 @@ async function main() {
   app.textContent = "Loading…";
 
   const manifest = await loadManifest();
-    const [runResults, testResults] = await Promise.all([
+    const [runResults, testResults, utestResults] = await Promise.all([
     loadOptionalJson(RUN_RESULTS_URL),
     loadOptionalJson(TEST_RESULTS_URL),
+    loadOptionalJson(UTEST_RESULTS_URL),
   ]);
 
   const state = {
@@ -4384,9 +4488,11 @@ async function main() {
     bySource: byName(manifest.sources || [], (s) => `${s.source_name}.${s.table_name}`),
     runResults,
     testResults,
+    utestResults,
   };
   state.byRun = byName((runResults?.results || []), (r) => r.name);
   state.testIndex = buildTestIndex(state);
+  state.utestIndex = buildUTestIndex(state);
 
   state.sidebarMatches = { models: 0, sources: 0 };
   state.graphUI = {
