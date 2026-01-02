@@ -382,7 +382,9 @@ def test_infer_and_attach_lineage_sql_branch_is_used(monkeypatch: pytest.MonkeyP
     # ASSERT
     col_id = cols_by_table["project.dataset.model_sql"][0]
     assert col_id.name == "id"
-    assert col_id.lineage == [{"from_relation": "src_table", "from_column": "id"}]
+    assert col_id.lineage == [
+        {"from_relation": "src_table", "from_column": "id", "confidence": "inferred"}
+    ]
 
 
 @pytest.mark.unit
@@ -448,5 +450,6 @@ def test_infer_and_attach_lineage_yaml_override_branch_is_used(monkeypatch: pyte
             "from_relation": "project.dataset.orders",
             "from_column": "amount",
             "transformed": True,
+            "confidence": "annotated",
         }
     ]

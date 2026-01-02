@@ -807,6 +807,31 @@ def _mark_lineage_confidence(lin: dict[str, list[dict[str, Any]]], conf: str) ->
                 it.setdefault("confidence", conf)
 
 
+def _clean_lineage(lin: dict[str, list[dict[str, Any]]]) -> dict[str, list[dict[str, Any]]]:
+    out: dict[str, list[dict[str, Any]]] = {}
+    for out_col, items in (lin or {}).items():
+        if not isinstance(items, list):
+            continue
+        keep: list[dict[str, Any]] = []
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            fr = str(it.get("from_relation") or "").strip()
+            fc = str(it.get("from_column") or "").strip()
+
+            # drop empty / unknown placeholders like "?" so UI doesn't show "?.?"
+            if not fr or not fc:
+                continue
+            if fr in {"?", "unknown"} or fc in {"?", "unknown"}:
+                continue
+
+            keep.append(it)
+
+        if keep:
+            out[out_col] = keep
+    return out
+
+
 def _infer_and_attach_lineage(
     models: list[ModelDoc],
     executor: Any | None,
@@ -834,15 +859,18 @@ def _infer_and_attach_lineage(
                         rendered = None
                 if rendered:
                     inferred = infer_sql_lineage(rendered)
+                    inferred = _clean_lineage(inferred)
                     _mark_lineage_confidence(inferred, "inferred")
 
                     overrides = parse_sql_lineage_overrides(rendered)
+                    overrides = _clean_lineage(overrides)
                     _mark_lineage_confidence(overrides, "annotated")
 
                     inferred = merge_lineage(inferred, overrides)
             elif m.kind == "python":
                 func = getattr(REGISTRY, "py_funcs", {}).get(m.name)
-                inferred = infer_py_lineage(func)
+                src = m.python_source or (inspect.getsource(func) if callable(func) else "")
+                inferred = infer_py_lineage(src)
                 _mark_lineage_confidence(inferred, "inferred")
         except Exception:
             inferred = {}
@@ -882,10 +910,28 @@ def _infer_and_attach_lineage(
 
         _mark_lineage_confidence(inferred, "inferred")
 
+        # Always expose inferred lineage on the model as a fallback/debug view (SQL + Python)
+        m.inferred_lineage = inferred or None
+
         if with_schema and (m.relation in cols_by_table) and inferred:
+
+            def _norm_col(s: object) -> str:
+                x = str(s or "").strip()
+                # strip common identifier quotes
+                if (x.startswith("`") and x.endswith("`")) or (
+                    x.startswith('"') and x.endswith('"')
+                ):
+                    x = x[1:-1]
+                if x.startswith("[") and x.endswith("]"):
+                    x = x[1:-1]
+                return x.lower()
+
+            inferred_norm = {_norm_col(k): v for k, v in inferred.items()}
+
             for c in cols_by_table[m.relation]:
-                if c.name in inferred:
-                    c.lineage = inferred[c.name]
+                items = inferred_norm.get(_norm_col(c.name), [])
+                if items:
+                    c.lineage = items
 
 
 def _reverse_deps(nodes: dict[str, Node]) -> dict[str, list[str]]:
@@ -1210,7 +1256,10 @@ def read_docs_metadata(project_dir: Path) -> dict[str, Any]:
         "models": {
           <model>: {
             "description_html": "<p>…</p>" | None,
-            "columns": { <col>: "<p>…</p>" }
+            "columns": {
+                <col>:
+                    "description_html": "<p>…</p>" | None,
+            }
           },
         },
         "columns": { <relation>: { <col>: "<p>…</p>" } }
@@ -1226,11 +1275,19 @@ def read_docs_metadata(project_dir: Path) -> dict[str, Any]:
         contract_yaml = (meta or {}).get("contract")
         contract_norm = _normalize_contract(contract_yaml)
 
+        def _col_desc(v: Any) -> str | None:
+            if v is None:
+                return None
+            if isinstance(v, dict):
+                v = v.get("description") or v.get("desc")
+            if not v:
+                return None
+            return _render_minimarkdown(str(v))
+
         out_models[model] = {
             "description_html": _render_minimarkdown(desc) if desc else None,
             "columns": {
-                str(k): _render_minimarkdown(str(v))
-                for k, v in (cols.items() if isinstance(cols, dict) else [])
+                str(k): _col_desc(v) for k, v in (cols.items() if isinstance(cols, dict) else [])
             },
         }
         if isinstance(lineage_yaml, dict):

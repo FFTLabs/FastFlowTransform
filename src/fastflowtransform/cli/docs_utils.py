@@ -1,6 +1,7 @@
 # fastflowtransform/cli/docs_utils.py
 from __future__ import annotations
 
+import inspect
 import re
 from datetime import UTC, datetime
 from pathlib import Path
@@ -99,7 +100,8 @@ def _build_docs_manifest(
                 lineage_map = lineage_mod.infer_sql_lineage(rendered, alias_map)
             elif n.kind == "python":
                 func = REGISTRY.py_funcs[n.name]
-                lineage_map = lineage_mod.infer_py_lineage(func, getattr(n, "requires", None), None)
+                src = inspect.getsource(func)
+                lineage_map = lineage_mod.infer_py_lineage(src, getattr(n, "requires", None))
         except Exception:
             lineage_map = {}
 

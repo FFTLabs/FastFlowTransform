@@ -8,6 +8,14 @@ docs:
   # Adjust `dag_dir` to change where `fft dag --html` writes documentation (docs/Technical_Overview.md#documentation).
   dag_dir: site/dag
   include_rendered_sql: true
+  models:
+    users_clean.ff:
+      description: "Normalizes CRM users and extracts email_domain."
+      columns:
+        email_domain: 
+          description: "Lowercased domain extracted from email."
+    mart_users_by_domain.ff:
+      description: "Aggregates signup counts per email domain."
 
 # Project-level variables accessible via {{ var('key') }} inside models.
 # Example:

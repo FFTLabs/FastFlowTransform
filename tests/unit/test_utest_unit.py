@@ -525,8 +525,9 @@ def test_execute_and_update_cache_success(fake_registry, duckdbutor):
         cache_mode="rw",
     )
     node = fake_registry.nodes["model_a"]
-    ok = utest._execute_and_update_cache(node, "abc123", ctx)
+    ok, msg = utest._execute_and_update_cache(node, "abc123", ctx)
     assert ok is True
+    assert msg is None
     assert ctx.computed_fps["model_a"] == "abc123"
 
 
@@ -545,8 +546,9 @@ def test_execute_and_update_cache_failure(fake_registry, duckdbutor):
         cache_mode="off",
     )
     node = fake_registry.nodes["model_a"]
-    ok = utest._execute_and_update_cache(node, None, ctx)
+    ok, msg = utest._execute_and_update_cache(node, None, ctx)
     assert ok is False
+    assert msg is not None
     assert ctx.failures == 1
 
 
