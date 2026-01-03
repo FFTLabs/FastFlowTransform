@@ -4,10 +4,11 @@ import difflib
 import hashlib
 import json
 import os
-from collections.abc import Iterable, Mapping
+from collections.abc import Generator, Iterable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
+from time import perf_counter
 from typing import Any, cast
 
 import pandas as pd
@@ -655,29 +656,251 @@ def _maybe_skip_by_cache(node: Any, cand_fp: str | None, ctx: UtestCtx) -> bool:
     return False
 
 
-def _execute_and_update_cache(node: Any, cand_fp: str | None, ctx: UtestCtx) -> bool:
+def _execute_and_update_cache(
+    node: Any, cand_fp: str | None, ctx: UtestCtx
+) -> tuple[bool, str | None]:
+    """
+    Execute the model node and update cache fingerprint if enabled.
+
+    Returns:
+        (ok, message) where message is only set on failure.
+    """
     ok, err = _execute_node(ctx.executor, node, ctx.jenv)
     if not ok:
-        print(f"   ❌ execution failed: {err}")
+        msg = f"execution failed: {err}"
+        print(f"   ❌ {msg}")
         ctx.failures += 1
-        return False
+        return False, msg
+
     if cand_fp and ctx.cache and ctx.cache_mode == "rw":
         ctx.computed_fps[node.name] = cand_fp
-    return True
+
+    return True, None
 
 
-def _read_and_assert(spec: Any, case: Any, ctx: UtestCtx) -> None:
+def _read_and_assert(spec: Any, case: Any, ctx: UtestCtx) -> tuple[bool, str | None]:
+    """
+    Read the target relation and assert expected rows.
+
+    Returns:
+        (ok, message) where message is set when read/assert fails.
+    """
     ok, df_or_exc, target_rel = _read_target_df(ctx.executor, spec, case)
+
     if not ok:
-        print(f"   ❌ cannot read result '{target_rel}': {df_or_exc}")
+        msg: str | None = f"cannot read result '{target_rel}': {df_or_exc}"
+        print(f"   ❌ {msg}")
         ctx.failures += 1
-        return
+        return False, msg
+
     ok2, msg = _assert_expected_rows(df_or_exc, case)
     if ok2:
         print("   ✅ ok")
-    else:
-        print(f"   ❌ {msg}")
-        ctx.failures += 1
+        return True, None
+
+    # msg is already a human-readable diff/summary from your assert helper
+    print(f"   ❌ {msg}")
+    ctx.failures += 1
+    return False, msg
+
+
+def _build_utest_ctx(executor: Any, jenv: Any, cache_mode: str) -> UtestCtx:
+    project_dir = _get_project_dir_safe()
+    engine_name = _detect_engine_name(executor)
+    env_ctx = _make_env_ctx(engine_name)
+    cache = _make_cache(project_dir, engine_name)
+
+    return UtestCtx(
+        executor=executor,
+        jenv=jenv,
+        engine_name=engine_name,
+        env_ctx=env_ctx,
+        cache=cache,
+        cache_mode=cache_mode,
+    )
+
+
+def _append_result(
+    results_out: list[dict[str, Any]] | None,
+    *,
+    spec: UnitSpec,
+    case_name: str,
+    status: str,
+    message: str | None,
+    duration_ms: int,
+    cache_hit: bool,
+    target_relation: str,
+) -> None:
+    if results_out is None:
+        return
+
+    results_out.append(
+        {
+            "model": spec.model,
+            "case": case_name,
+            "status": status,
+            "message": (message or ""),
+            "duration_ms": duration_ms,
+            "cache_hit": cache_hit,
+            "target_relation": target_relation,
+            "spec_path": str(spec.path),
+        }
+    )
+
+
+def _record_model_not_found(
+    ctx: UtestCtx,
+    *,
+    spec: UnitSpec,
+    results_out: list[dict[str, Any]] | None,
+) -> None:
+    print(f"⚠️  Model '{spec.model}' not found (in {spec.path})")
+    ctx.failures += 1
+    _append_result(
+        results_out,
+        spec=spec,
+        case_name="",
+        status="error",
+        message="model not found",
+        duration_ms=0,
+        cache_hit=False,
+        target_relation="",
+    )
+
+
+def _compute_target_relation(spec_model: str, case: Any) -> str:
+    target_rel_cfg = getattr(case, "expect", None)
+    if isinstance(target_rel_cfg, UnitExpect):
+        return target_rel_cfg.relation or relation_for(spec_model)
+    if isinstance(target_rel_cfg, Mapping):
+        return target_rel_cfg.get("relation") or relation_for(spec_model)
+    return relation_for(spec_model)
+
+
+def _iter_cases(spec: UnitSpec, only_case: str | None) -> Generator[UnitCase]:
+    for raw_case in spec.cases:
+        case = spec.merged_case(raw_case)
+        if only_case and case.name != only_case:
+            continue
+        yield case
+
+
+def _duration_ms(t0: float, t1: float) -> int:
+    return int((t1 - t0) * 1000)
+
+
+def _skip_due_to_input_failure(
+    ctx: UtestCtx,
+    *,
+    spec: UnitSpec,
+    case: Any,
+    t0: float,
+    results_out: list[dict[str, Any]] | None,
+) -> None:
+    print("   ⚠️ skipping execution due to input load failure")
+    t1 = perf_counter()
+    _append_result(
+        results_out,
+        spec=spec,
+        case_name=case.name,
+        status="error",
+        message="input load failure",
+        duration_ms=_duration_ms(t0, t1),
+        cache_hit=False,
+        target_relation="",
+    )
+
+
+def _run_one_case(
+    ctx: UtestCtx,
+    *,
+    spec: UnitSpec,
+    case: Any,
+    node: Any,
+    reuse_meta: bool,
+    results_out: list[dict[str, Any]] | None,
+) -> None:
+    print(f"→ {spec.model} :: {case.name}")
+    t0 = perf_counter()
+
+    status = "pass"
+    message: str | None = None
+
+    if not reuse_meta:
+        with suppress(Exception):
+            delete_meta_for_node(ctx.executor, node.name)
+
+    cand_fp = _fingerprint_case(node, spec, case, ctx)
+
+    before_failures = ctx.failures
+    ctx.failures += _load_inputs_for_case(ctx.executor, spec, case, node)
+    if ctx.failures > before_failures:
+        _skip_due_to_input_failure(ctx, spec=spec, case=case, t0=t0, results_out=results_out)
+        return
+
+    target_rel = _compute_target_relation(spec.model, case)
+
+    if _maybe_skip_by_cache(node, cand_fp, ctx):
+        ok, msg = _read_and_assert(spec, case, ctx)
+        if not ok:
+            status = "fail"
+            message = msg
+
+        _cleanup_inputs_for_case(ctx.executor, case)
+        t1 = perf_counter()
+        _append_result(
+            results_out,
+            spec=spec,
+            case_name=case.name,
+            status=status,
+            message=message,
+            duration_ms=_duration_ms(t0, t1),
+            cache_hit=True,
+            target_relation=target_rel,
+        )
+        return
+
+    _reset_utest_relation(ctx.executor, target_rel)
+
+    ok_exec, exec_msg = _execute_and_update_cache(node, cand_fp, ctx)
+    if not ok_exec:
+        _cleanup_inputs_for_case(ctx.executor, case)
+        t1 = perf_counter()
+        _append_result(
+            results_out,
+            spec=spec,
+            case_name=case.name,
+            status="error",
+            message=exec_msg,
+            duration_ms=_duration_ms(t0, t1),
+            cache_hit=False,
+            target_relation=target_rel,
+        )
+        return
+
+    ok, msg = _read_and_assert(spec, case, ctx)
+    if not ok:
+        status = "fail"
+        message = msg
+
+    _cleanup_inputs_for_case(ctx.executor, case)
+    t1 = perf_counter()
+    _append_result(
+        results_out,
+        spec=spec,
+        case_name=case.name,
+        status=status,
+        message=message,
+        duration_ms=_duration_ms(t0, t1),
+        cache_hit=False,
+        target_relation=target_rel,
+    )
+
+
+def _finalize_cache(ctx: UtestCtx) -> None:
+    if ctx.cache and ctx.computed_fps and ctx.cache_mode == "rw":  # pragma: no cover
+        ctx.cache.update_many(ctx.computed_fps)
+        ctx.cache.save()
 
 
 def run_unit_specs(
@@ -688,6 +911,7 @@ def run_unit_specs(
     *,
     cache_mode: str = "off",
     reuse_meta: bool = False,
+    results_out: list[dict[str, Any]] | None = None,
 ) -> int:
     """
     Execute discovered unit-test specs. Returns the number of failed cases.
@@ -697,79 +921,28 @@ def run_unit_specs(
         reuse_meta: reserved (no-op).
     """
     cache_mode = _normalize_cache_mode(cache_mode)
-
-    project_dir = _get_project_dir_safe()
-    engine_name = _detect_engine_name(executor)
-    env_ctx = _make_env_ctx(engine_name)
-    cache = _make_cache(project_dir, engine_name)
-
-    ctx = UtestCtx(
-        executor=executor,
-        jenv=jenv,
-        engine_name=engine_name,
-        env_ctx=env_ctx,
-        cache=cache,
-        cache_mode=cache_mode,
-    )
+    ctx = _build_utest_ctx(executor, jenv, cache_mode)
 
     for spec in specs:
-        if spec.engine and spec.engine != engine_name:
+        if spec.engine and spec.engine != ctx.engine_name:
             continue
 
         node = REGISTRY.nodes.get(spec.model)
         if not node:
-            print(f"⚠️  Model '{spec.model}' not found (in {spec.path})")
-            ctx.failures += 1
+            _record_model_not_found(ctx, spec=spec, results_out=results_out)
             continue
 
-        for raw_case in spec.cases:
-            # Apply spec.defaults to each case (merged view)
-            case = spec.merged_case(raw_case)
+        for case in _iter_cases(spec, only_case):
+            _run_one_case(
+                ctx,
+                spec=spec,
+                case=case,
+                node=node,
+                reuse_meta=reuse_meta,
+                results_out=results_out,
+            )
 
-            if only_case and case.name != only_case:
-                continue
-            print(f"→ {spec.model} :: {case.name}")
-
-            if not reuse_meta:
-                with suppress(Exception):
-                    delete_meta_for_node(executor, node.name)
-
-            cand_fp = _fingerprint_case(node, spec, case, ctx)
-
-            before_failures = ctx.failures
-            ctx.failures += _load_inputs_for_case(executor, spec, case, node)
-
-            # If any input failed to load, skip execution & assertion for this case.
-            if ctx.failures > before_failures:
-                print("   ⚠️ skipping execution due to input load failure")
-                continue
-
-            if _maybe_skip_by_cache(node, cand_fp, ctx):
-                _read_and_assert(spec, case, ctx)
-                _cleanup_inputs_for_case(executor, case)
-                continue
-
-            target_rel_cfg = getattr(case, "expect", None)
-            if isinstance(target_rel_cfg, UnitExpect):
-                target_rel = target_rel_cfg.relation or relation_for(spec.model)
-            elif isinstance(target_rel_cfg, Mapping):
-                target_rel = target_rel_cfg.get("relation") or relation_for(spec.model)
-            else:
-                target_rel = relation_for(spec.model)
-
-            _reset_utest_relation(executor, target_rel)
-
-            if not _execute_and_update_cache(node, cand_fp, ctx):
-                _cleanup_inputs_for_case(executor, case)
-                continue
-
-            _read_and_assert(spec, case, ctx)
-            _cleanup_inputs_for_case(executor, case)
-
-    if ctx.cache and ctx.computed_fps and ctx.cache_mode == "rw":  # pragma: no cover
-        ctx.cache.update_many(ctx.computed_fps)
-        ctx.cache.save()
-
+    _finalize_cache(ctx)
     return ctx.failures
 
 

@@ -530,3 +530,179 @@ tr.colHit{
   cursor: pointer;
 }
 .facetClear:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* Docs coverage UI */
+.docPills{
+  display:flex;
+  gap:8px;
+  flex-wrap:wrap;
+  margin-top:8px;
+}
+.docPillsCompact{ margin-top:0; }
+
+.docList{
+  list-style:none;
+  margin:12px 0 0 0;
+  padding:0;
+  display:flex;
+  flex-direction:column;
+  gap:8px;
+}
+.docRow a{
+  display:flex;
+  justify-content:space-between;
+  align-items:flex-start;
+  gap:12px;
+  border:1px solid var(--border);
+  border-radius:14px;
+  padding:10px 12px;
+  text-decoration:none;
+  color:inherit;
+}
+.docRow a:hover{
+  border-color:var(--accent);
+  background: color-mix(in srgb, var(--accent), transparent 94%);
+}
+.docRowMain{ min-width: 0; }
+.docRowTitle{ font-weight:600; }
+.docRowSub{
+  margin-top:4px;
+  font-size:12px;
+  color:var(--muted);
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+  max-width: 60ch;
+}
+.docRowPills{
+  display:flex;
+  gap:8px;
+  flex-wrap:wrap;
+  justify-content:flex-end;
+  align-items:center;
+  margin-top:2px;
+  flex: 0 0 auto;
+}
+.docPillsHeader { margin-bottom: 10px; }
+
+.pillSmall.pillWarn{
+  border-color: color-mix(in srgb, #f59e0b, var(--border) 60%);
+  background: color-mix(in srgb, #f59e0b, transparent 88%);
+}
+
+.codeDetails { margin-top: 8px; }
+.codeSummary { cursor: pointer; color: var(--fg); }
+.codeBlock {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  overflow: auto;
+  background: color-mix(in srgb, var(--card), transparent 10%);
+}
+
+.codeSummary { cursor: pointer; }
+.codeDetails { margin-top: 8px; }
+
+.facetChipsWrap { flex-wrap: wrap; }
+
+.groupHeader { margin-top: 10px; list-style:none; }
+.groupHeaderRow{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:10px;
+  color: var(--muted);
+  font-size: 11px;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  padding: 6px 2px;
+}
+
+.codeBlock{
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  overflow: auto;
+  background: color-mix(in srgb, var(--card), transparent 10%);
+  max-height: 520px;
+}
+.codeWrap{
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* --- SQL highlighting (no deps) --- */
+.codeBlock code {
+  display: block;
+}
+
+/* defaults (light) */
+.codeBlock .tok-kw { color: #6d28d9; font-weight: 600; } /* keywords */
+.codeBlock .tok-fn { color: #1d4ed8; }                  /* functions */
+.codeBlock .tok-str { color: #15803d; }                 /* strings */
+.codeBlock .tok-num { color: #b45309; }                 /* numbers */
+.codeBlock .tok-com { color: #6b7280; font-style: italic; } /* comments */
+.codeBlock .tok-id  { color: inherit; }                 /* identifiers */
+
+/* dark mode */
+@media (prefers-color-scheme: dark) {
+  .codeBlock .tok-kw { color: #c084fc; }
+  .codeBlock .tok-fn { color: #93c5fd; }
+  .codeBlock .tok-str { color: #86efac; }
+  .codeBlock .tok-num { color: #fbbf24; }
+  .codeBlock .tok-com { color: #9ca3af; }
+}
+
+/* Health strip layout */
+.healthSplit{
+  display:flex;
+  gap:14px;                 /* controls spacing between Last run and Tests */
+  align-items:flex-start;
+  justify-content:flex-start;
+  flex-wrap:wrap;           /* stacks on narrow screens */
+}
+
+.healthPane{
+  flex: 1 1 360px;          /* two columns when space allows */
+  min-width: 320px;         /* prevent ultra-narrow columns */
+}
+
+/* Optional: tighten headings inside health */
+.healthPane h4{
+  margin: 0 0 8px 0;
+}
+
+.healthStack{
+  display:flex;
+  flex-direction:column;
+  gap:12px;
+}
+
+.healthRow{
+  border: 1px solid var(--border, rgba(0,0,0,.12));
+  border-radius: 10px;
+  padding: 10px 12px;
+  background: var(--card, transparent);
+}
+
+.healthRowSummary{
+  cursor: pointer;
+  list-style: none;
+  display:flex;
+  align-items:center;
+  gap:10px;
+}
+
+/* remove default marker in some browsers */
+.healthRowSummary::-webkit-details-marker{ display:none; }
+
+.healthRowHead{
+  flex: 0 0 auto;
+}
+
+.healthRowBody{
+  margin-top:10px;
+}
+

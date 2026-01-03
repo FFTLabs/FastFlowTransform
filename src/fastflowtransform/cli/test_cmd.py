@@ -4,12 +4,15 @@ from __future__ import annotations
 import re
 import time
 from collections.abc import Callable, Iterable, Mapping
+from contextlib import suppress
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import typer
 
+from fastflowtransform.artifacts import TestResult, write_test_results
 from fastflowtransform.cli.bootstrap import _prepare_context, configure_executor_contracts
 from fastflowtransform.cli.options import (
     EngineOpt,
@@ -49,6 +52,7 @@ class DQResult:
     severity: Severity = "error"
     param_str: str = ""
     example_sql: str | None = None
+    relation: str | None = None
 
 
 _REF_CALL_RE = re.compile(r"^ref\(\s*(['\"])([^'\"]+)\1\s*\)$")
@@ -351,6 +355,10 @@ def _run_dq_tests(executor: BaseExecutor, tests: Iterable[Any]) -> list[DQResult
             table_for_exec,
         ) = _prepare_test(raw_test, executor)
 
+        relation: str | None = None
+        if isinstance(table_for_exec, str) and table_for_exec.strip():
+            relation = table_for_exec.strip()
+
         t0 = time.perf_counter()
 
         runner: Runner | None = TESTS.get(kind)
@@ -373,6 +381,7 @@ def _run_dq_tests(executor: BaseExecutor, tests: Iterable[Any]) -> list[DQResult
                     severity=severity,
                     param_str=param_str,
                     example_sql=None,
+                    relation=relation,
                 )
             )
             continue
@@ -392,6 +401,7 @@ def _run_dq_tests(executor: BaseExecutor, tests: Iterable[Any]) -> list[DQResult
                 severity=severity,
                 param_str=param_str,
                 example_sql=example,
+                relation=relation,
             )
         )
 
@@ -494,8 +504,35 @@ def test(
         typer.secho("No tests configured.", fg="bright_black")
         raise typer.Exit(code=0)
 
+    started_at = datetime.now(UTC).isoformat(timespec="seconds")
+
     results = _run_dq_tests(execu, tests)
     _print_summary(results)
+
+    finished_at = datetime.now(UTC).isoformat(timespec="seconds")
+
+    # Persist for docs (best-effort; never fail the command because of artifact IO)
+    with suppress(Exception):
+        write_test_results(
+            ctx.project,
+            started_at=started_at,
+            finished_at=finished_at,
+            results=[
+                TestResult(
+                    kind=r.kind,
+                    table=r.table,
+                    relation=r.relation,
+                    column=r.column,
+                    ok=bool(r.ok),
+                    severity=str(r.severity),
+                    duration_ms=int(r.ms),
+                    msg=r.msg,
+                    param_str=r.param_str,
+                    example_sql=r.example_sql,
+                )
+                for r in results
+            ],
+        )
 
     # Exit code: count only ERROR fails
     failed = sum((not r.ok) and (r.severity != "warn") for r in results)

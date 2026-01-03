@@ -1,9 +1,12 @@
 # fastflowtransform/docs.py
 from __future__ import annotations
 
+import inspect
 import json
 import re
 import shutil
+from collections.abc import Mapping
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -32,8 +35,17 @@ class ModelDoc:
     relation: str
     deps: list[str]
     materialized: str
+    owners: list[str] = field(default_factory=list)
+    tags: list[str] = field(default_factory=list)
+    domain: str | None = None
     description_html: str | None = None
     description_short: str | None = None
+    contract: dict[str, Any] | None = None
+    python_signature: str | None = None
+    python_docstring: str | None = None
+    python_source: str | None = None
+    python_requires: dict[str, list[str]] | None = None  # dep -> required columns (best-effort)
+    inferred_lineage: dict[str, list[dict[str, Any]]] | None = None  # out_col -> lineage refs
 
 
 @dataclass
@@ -53,6 +65,30 @@ def _safe_filename(name: str) -> str:
     """Filename sanitized while keeping dots/slashes meaningful."""
     s = re.sub(r"[^A-Za-z0-9_.-]", "_", name)
     return s or "_model"
+
+
+def _as_list(v: Any) -> list[str]:
+    if v is None:
+        return []
+    if isinstance(v, list):
+        return [str(x).strip() for x in v if str(x).strip()]
+    if isinstance(v, str):
+        # allow comma-separated
+        return [s.strip() for s in v.split(",") if s.strip()]
+    s = str(v).strip()
+    return [s] if s else []
+
+
+def _domain_from_path(path: str) -> str:
+    p = (path or "").replace("\\", "/").lstrip("/")
+    # try to make domain stable even if absolute paths leak in
+    # common case: ".../models/<domain>/..."
+    if "/models/" in p.lower():
+        p = p.lower().split("/models/", 1)[1]
+    elif p.lower().startswith("models/"):
+        p = p[7:]
+    parts = [x for x in p.split("/") if x]
+    return parts[0] if parts else ""
 
 
 def _collect_columns(executor: Any) -> dict[str, list[ColumnInfo]]:
@@ -94,6 +130,25 @@ def _read_project_yaml_docs(project_dir: Path) -> dict[str, Any]:
     return models if isinstance(models, dict) else {}
 
 
+def _read_project_yaml_docs_settings(project_dir: Path) -> dict[str, Any]:
+    """
+    Read docs settings from project.yml:
+      docs:
+        include_rendered_sql: true|false
+        ...
+    Returns the whole docs dict (or {}).
+    """
+    cfg_path = project_dir / "project.yml"
+    if not cfg_path.exists():
+        return {}
+    try:
+        cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+    docs = (cfg or {}).get("docs") or {}
+    return docs if isinstance(docs, dict) else {}
+
+
 _FRONT_MATTER_RE = re.compile(r"^\s*---\s*\n(.*?)\n---\s*\n?", re.DOTALL)
 _LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 _CODE_RE = re.compile(r"`([^`]+)`")
@@ -116,6 +171,152 @@ def _render_minimarkdown(md: str) -> str:
     parts = [p.strip() for p in re.split(r"\n\s*\n", body) if p.strip()]
     html = "".join(f"<p>{p.replace('\n', '<br/>')}</p>" for p in parts) if parts else ""
     return html
+
+
+def _rendered_refs_for_docs(executor: Any, node: Node) -> list[dict[str, str]]:
+    """
+    Best-effort list of resolved refs for the "Refs resolved" UI.
+    Avoids inlining ephemeral SQL (which can be huge); marks ephemeral as inlined.
+    """
+    out: list[dict[str, str]] = []
+    for d in node.deps or []:
+        try:
+            dep = REGISTRY.get_node(d) if hasattr(REGISTRY, "get_node") else REGISTRY.nodes.get(d)
+        except Exception:
+            dep = None
+        try:
+            if (
+                dep is not None
+                and str((dep.meta or {}).get("materialized", "")).lower() == "ephemeral"
+            ):
+                rel = "<ephemeral (inlined)>"
+            else:
+                rel = executor._format_relation_for_ref(d)
+        except Exception:
+            rel = relation_for(d)
+        out.append({"name": str(d), "relation": str(rel)})
+    return out
+
+
+def _compile_sql_for_docs(executor: Any, node: Node, rendered_sql: str) -> str:
+    """
+    Best-effort "compiled" SQL preview for docs:
+      - strips leading {{ config(...) }}
+      - if DDL-looking, returns the statement as-is
+      - else wraps selectable body into a generic CREATE OR REPLACE {TABLE|VIEW} ... AS <body>
+    For incremental/snapshot/ephemeral, returns "" (too engine/flow-specific).
+    """
+    meta: Mapping[str, Any] = getattr(node, "meta", {}) or {}
+    try:
+        if getattr(executor, "_meta_is_incremental", None) and executor._meta_is_incremental(meta):
+            return ""
+        if getattr(executor, "_meta_is_snapshot", None) and executor._meta_is_snapshot(meta):
+            return ""
+    except Exception:
+        pass
+    if str(meta.get("materialized", "")).lower() == "ephemeral":
+        return ""
+
+    try:
+        sql = executor._strip_leading_config(rendered_sql).strip()
+    except Exception:
+        sql = (rendered_sql or "").strip()
+    if not sql:
+        return ""
+
+    try:
+        if executor._looks_like_direct_ddl(sql):
+            return sql
+    except Exception:
+        pass
+
+    try:
+        body = executor._selectable_body(sql).rstrip(" ;\n\t")
+        target_sql = executor._format_relation_for_ref(node.name)
+        mat = str(meta.get("materialized", "table")).lower()
+        if mat == "view":
+            return f"CREATE OR REPLACE VIEW {target_sql} AS\n{body}"
+        return f"CREATE OR REPLACE TABLE {target_sql} AS\n{body}"
+    except Exception:
+        return ""
+
+
+_LEADING_BLANK_LINES = re.compile(r"^(?:[ \t]*\n)+")
+
+
+def _drop_leading_blank_lines(s: str) -> str:
+    return _LEADING_BLANK_LINES.sub("", s or "")
+
+
+def _copy_runtime_artifacts(out_dir: Path, proj_dir: Path | None) -> None:
+    if not proj_dir:
+        return
+    src_dir = proj_dir / ".fastflowtransform" / "target"
+    if not src_dir.exists():
+        return
+
+    assets_dir = out_dir / "assets"
+    assets_dir.mkdir(parents=True, exist_ok=True)
+
+    for fname in ("run_results.json", "test_results.json", "utest_results.json"):
+        src = src_dir / fname
+        if src.exists():
+            shutil.copy2(src, assets_dir / fname)
+
+
+def _render_sql_for_docs(
+    nodes: dict[str, Node],
+    executor: Any,
+    *,
+    include_payload: bool,
+    project_dir: Path | None = None,
+) -> tuple[dict[str, str], dict[str, str], dict[str, str], dict[str, list[dict[str, str]]]]:
+    """
+    Render SQL once and reuse for:
+      - lineage inference
+      - docs manifest SQL viewer payload
+    Returns:
+      rendered_by_model, raw_by_model, compiled_by_model, rendered_refs_by_model
+    """
+    rendered_by: dict[str, str] = {}
+    raw_by: dict[str, str] = {}
+    compiled_by: dict[str, str] = {}
+    refs_by: dict[str, list[dict[str, str]]] = {}
+
+    for n in nodes.values():
+        if n.kind != "sql":
+            continue
+
+        # Always try to read raw SQL (UI baseline), regardless of include_payload
+        try:
+            p = Path(n.path)
+            if not p.is_absolute() and project_dir is not None:
+                p = project_dir / p
+            raw_by[n.name] = p.read_text(encoding="utf-8")
+        except Exception:
+            raw_by[n.name] = ""
+
+        rendered = ""
+        if include_payload:
+            try:
+                rendered = executor.render_sql(
+                    n,
+                    REGISTRY.env,
+                    ref_resolver=lambda nm: executor._resolve_ref(nm, REGISTRY.env),
+                    source_resolver=executor._resolve_source,
+                )
+                rendered = _drop_leading_blank_lines(rendered)
+            except Exception:
+                rendered = ""
+
+        if rendered:
+            rendered_by[n.name] = rendered
+
+            if include_payload:
+                compiled_by[n.name] = _compile_sql_for_docs(executor, n, rendered)
+                refs_by[n.name] = _rendered_refs_for_docs(executor, n)
+
+    return rendered_by, raw_by, compiled_by, refs_by
 
 
 def _strip_html(text: str) -> str:
@@ -214,6 +415,11 @@ def _build_spa_manifest(
     cols_by_table: dict[str, list[ColumnInfo]],
     model_source_refs: dict[str, list[tuple[str, str]]],
     sources_by_key: dict[tuple[str, str], SourceDoc],
+    raw_sql_by_model: dict[str, str] | None = None,
+    rendered_sql_by_model: dict[str, str] | None = None,
+    compiled_sql_by_model: dict[str, str] | None = None,
+    rendered_refs_by_model: dict[str, list[dict[str, str]]] | None = None,
+    include_rendered_sql: bool = False,
 ) -> dict[str, Any]:
     def _col_to_dict(c: ColumnInfo) -> dict[str, Any]:
         html = c.description_html
@@ -260,13 +466,31 @@ def _build_spa_manifest(
                 "deps": list(m.deps or []),
                 "used_by": list(used_by.get(m.name, []) or []),
                 "materialized": m.materialized,
+                "owners": list(m.owners or []),
+                "tags": list(m.tags or []),
+                "domain": m.domain,
                 "description_html": m.description_html,
                 "description_text": _html_to_text(model_desc_html_s),
                 "description_short": m.description_short,
                 "sources_used": src_used,
                 "columns": cols,
+                "contract": m.contract,
+                "python_signature": m.python_signature,
+                "python_docstring": m.python_docstring,
+                "python_source": m.python_source,
+                "python_requires": m.python_requires,
+                "inferred_lineage": m.inferred_lineage,
             }
         )
+        if m.kind == "sql":
+            md = out_models[-1]
+            md["raw_sql"] = (raw_sql_by_model or {}).get(m.name, "")
+
+        if include_rendered_sql and m.kind == "sql":
+            md = out_models[-1]
+            md["rendered_sql"] = (rendered_sql_by_model or {}).get(m.name, "")
+            md["compiled_sql"] = (compiled_sql_by_model or {}).get(m.name, "")
+            md["rendered_refs"] = (rendered_refs_by_model or {}).get(m.name, [])
 
     out_sources: list[dict[str, Any]] = []
     for s in sources:
@@ -293,6 +517,7 @@ def _build_spa_manifest(
             "generated_at": datetime.now(UTC).isoformat(),
             "env": env_name,
             "with_schema": bool(with_schema),
+            "include_rendered_sql": bool(include_rendered_sql),
         },
         "dag": {"graph": graph, "mermaid": mermaid_src},
         "models": out_models,
@@ -340,17 +565,33 @@ def _build_macro_list(proj_dir: Path | None) -> list[dict[str, str]]:
 
 
 def _collect_models(nodes: dict[str, Node]) -> list[ModelDoc]:
-    models = [
-        ModelDoc(
-            name=n.name,
-            kind=n.kind,
-            path=str(n.path),
-            relation=relation_for(n.name),
-            deps=list(n.deps or []),
-            materialized=(getattr(n, "meta", {}) or {}).get("materialized", "table"),
+    models: list[ModelDoc] = []
+    for n in nodes.values():
+        meta = getattr(n, "meta", {}) or {}
+        if not isinstance(meta, dict):
+            meta = {}
+
+        # Prefer explicit meta; fall back to deriving domain from path
+        owners = _as_list(meta.get("owners") or meta.get("owner"))
+        tags = _as_list(meta.get("tags") or meta.get("tag"))
+        domain = meta.get("domain") or meta.get("group")
+        domain_s = str(domain).strip() if domain is not None else ""
+        if not domain_s:
+            domain_s = _domain_from_path(str(n.path))
+
+        models.append(
+            ModelDoc(
+                name=n.name,
+                kind=n.kind,
+                path=str(n.path),
+                relation=relation_for(n.name),
+                deps=list(n.deps or []),
+                materialized=(meta or {}).get("materialized", "table"),
+                owners=owners,
+                tags=tags,
+                domain=domain_s or None,
+            )
         )
-        for n in nodes.values()
-    ]
     models.sort(key=lambda m: m.name)
     return models
 
@@ -475,6 +716,52 @@ def _attach_consumers_to_sources(
         s.consumers = source_consumers.get((s.source_name, s.table_name), [])
 
 
+def _attach_python_model_details(models: list[ModelDoc]) -> None:
+    py_funcs = getattr(REGISTRY, "py_funcs", {}) or {}
+    py_requires = getattr(REGISTRY, "py_requires", {}) or {}
+
+    for m in models:
+        if m.kind != "python":
+            continue
+
+        fn = py_funcs.get(m.name)
+        if callable(fn):
+            # Signature
+            try:
+                sig = str(inspect.signature(fn))
+            except Exception:
+                sig = "(...)"
+            qn = getattr(fn, "__qualname__", getattr(fn, "__name__", m.name))
+            mod = getattr(fn, "__module__", None)
+            prefix = f"{mod}." if mod else ""
+            m.python_signature = f"{prefix}{qn}{sig}"
+
+            # Docstring (cleaned)
+            doc = inspect.getdoc(fn) or ""
+            m.python_docstring = doc.strip() or None
+
+        # Required-columns hints (best-effort)
+        req = py_requires.get(m.name)
+        if isinstance(req, dict):
+            norm: dict[str, list[str]] = {}
+            for dep, cols in req.items():
+                if not cols:
+                    continue
+                norm[str(dep)] = sorted(str(c) for c in cols)
+            m.python_requires = norm or None
+
+        # Python source (best-effort)
+        try:
+            p = Path(m.path)
+            if p.exists() and p.is_file():
+                txt = p.read_text(encoding="utf-8")
+                if len(txt) > 300_000:
+                    txt = txt[:300_000] + "\n\n# … truncated …\n"
+                m.python_source = txt
+        except Exception:
+            pass
+
+
 def _apply_descriptions_to_models(
     models: list[ModelDoc],
     docs_meta: dict[str, Any],
@@ -497,6 +784,11 @@ def _apply_descriptions_to_models(
             m.description_short = (short[:char_limit] + "…") if len(short) > char_limit else short
         else:
             m.description_short = None
+        m.contract = (
+            _normalize_contract(model_meta.get("contract"))
+            if isinstance(model_meta, dict)
+            else None
+        )
 
         if not with_schema or m.relation not in cols_by_table:
             continue
@@ -506,6 +798,40 @@ def _apply_descriptions_to_models(
             c.description_html = rel_desc_map.get(c.name) or mdl_desc_map.get(c.name)
 
 
+def _mark_lineage_confidence(lin: dict[str, list[dict[str, Any]]], conf: str) -> None:
+    for items in (lin or {}).values():
+        if not isinstance(items, list):
+            continue
+        for it in items:
+            if isinstance(it, dict):
+                it.setdefault("confidence", conf)
+
+
+def _clean_lineage(lin: dict[str, list[dict[str, Any]]]) -> dict[str, list[dict[str, Any]]]:
+    out: dict[str, list[dict[str, Any]]] = {}
+    for out_col, items in (lin or {}).items():
+        if not isinstance(items, list):
+            continue
+        keep: list[dict[str, Any]] = []
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            fr = str(it.get("from_relation") or "").strip()
+            fc = str(it.get("from_column") or "").strip()
+
+            # drop empty / unknown placeholders like "?" so UI doesn't show "?.?"
+            if not fr or not fc:
+                continue
+            if fr in {"?", "unknown"} or fc in {"?", "unknown"}:
+                continue
+
+            keep.append(it)
+
+        if keep:
+            out[out_col] = keep
+    return out
+
+
 def _infer_and_attach_lineage(
     models: list[ModelDoc],
     executor: Any | None,
@@ -513,30 +839,44 @@ def _infer_and_attach_lineage(
     cols_by_table: dict[str, list[ColumnInfo]],
     *,
     with_schema: bool,
+    rendered_sql_by_model: dict[str, str] | None = None,
 ) -> None:
     """Best-effort Lineage ermitteln (SQL/Python) und auf Columns mappen."""
     for m in models:
         inferred: dict[str, list[dict[str, Any]]] = {}
         try:
             if m.kind == "sql" and executor is not None:
-                try:
-                    rendered = executor.render_sql(
-                        REGISTRY.nodes[m.name],
-                        REGISTRY.env,
-                        ref_resolver=lambda nm: executor._resolve_ref(nm, REGISTRY.env),
-                        source_resolver=executor._resolve_source,
-                    )
-                except Exception:
-                    rendered = None
+                rendered = (rendered_sql_by_model or {}).get(m.name)
+                if not rendered:
+                    try:
+                        rendered = executor.render_sql(
+                            REGISTRY.nodes[m.name],
+                            REGISTRY.env,
+                            ref_resolver=lambda nm: executor._resolve_ref(nm, REGISTRY.env),
+                            source_resolver=executor._resolve_source,
+                        )
+                    except Exception:
+                        rendered = None
                 if rendered:
                     inferred = infer_sql_lineage(rendered)
+                    inferred = _clean_lineage(inferred)
+                    _mark_lineage_confidence(inferred, "inferred")
+
                     overrides = parse_sql_lineage_overrides(rendered)
+                    overrides = _clean_lineage(overrides)
+                    _mark_lineage_confidence(overrides, "annotated")
+
                     inferred = merge_lineage(inferred, overrides)
             elif m.kind == "python":
                 func = getattr(REGISTRY, "py_funcs", {}).get(m.name)
-                inferred = infer_py_lineage(func)
+                src = m.python_source or (inspect.getsource(func) if callable(func) else "")
+                inferred = infer_py_lineage(src)
+                _mark_lineage_confidence(inferred, "inferred")
         except Exception:
             inferred = {}
+
+        if m.kind == "python":
+            m.inferred_lineage = inferred or None
 
         # YAML overrides (bereits in docs_meta gemerged)
         model_meta = (
@@ -560,6 +900,7 @@ def _infer_and_attach_lineage(
                                 "from_relation": s["table"],
                                 "from_column": s["column"],
                                 "transformed": transformed_flag,
+                                "confidence": "annotated",
                             }
                         )
                 if items:
@@ -567,10 +908,30 @@ def _infer_and_attach_lineage(
             if norm:
                 inferred = merge_lineage(inferred, norm)
 
+        _mark_lineage_confidence(inferred, "inferred")
+
+        # Always expose inferred lineage on the model as a fallback/debug view (SQL + Python)
+        m.inferred_lineage = inferred or None
+
         if with_schema and (m.relation in cols_by_table) and inferred:
+
+            def _norm_col(s: object) -> str:
+                x = str(s or "").strip()
+                # strip common identifier quotes
+                if (x.startswith("`") and x.endswith("`")) or (
+                    x.startswith('"') and x.endswith('"')
+                ):
+                    x = x[1:-1]
+                if x.startswith("[") and x.endswith("]"):
+                    x = x[1:-1]
+                return x.lower()
+
+            inferred_norm = {_norm_col(k): v for k, v in inferred.items()}
+
             for c in cols_by_table[m.relation]:
-                if c.name in inferred:
-                    c.lineage = inferred[c.name]
+                items = inferred_norm.get(_norm_col(c.name), [])
+                if items:
+                    c.lineage = items
 
 
 def _reverse_deps(nodes: dict[str, Node]) -> dict[str, list[str]]:
@@ -657,6 +1018,7 @@ def render_site(
     with_schema: bool = True,
     spa: bool = True,
     legacy_pages: bool = False,
+    include_rendered_sql: bool | None = None,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     _copy_template_assets(out_dir)
@@ -681,14 +1043,47 @@ def render_site(
         direction="LR",
     )
     proj_dir = _get_project_dir()
+    docs_settings = _read_project_yaml_docs_settings(proj_dir) if proj_dir else {}
+    if include_rendered_sql is None:
+        include_rendered_sql = bool((docs_settings or {}).get("include_rendered_sql"))
+
     docs_meta = read_docs_metadata(proj_dir) if proj_dir else {"models": {}, "columns": {}}
+
+    rendered_sql_by_model: dict[str, str] = {}
+    raw_sql_by_model: dict[str, str] = {}
+    compiled_sql_by_model: dict[str, str] = {}
+    rendered_refs_by_model: dict[str, list[dict[str, str]]] = {}
+
+    if executor is not None and (include_rendered_sql or with_schema):
+        rendered_sql_by_model, raw_sql_by_model, compiled_sql_by_model, rendered_refs_by_model = (
+            _render_sql_for_docs(
+                nodes, executor, include_payload=bool(include_rendered_sql), project_dir=proj_dir
+            )
+        )
+
+        # If we can, also resolve source relations to the physical reference the executor uses.
+        # This improves the "Refs resolved" view in the SPA.
+        for s in sources:
+            with suppress(Exception):
+                s.relation = executor._resolve_source(s.source_name, s.table_name)
+
     models = _collect_models(nodes)
+
+    _attach_python_model_details(models)
+
     mat_legend = _materialization_legend()
     macro_list = _build_macro_list(proj_dir)
     cols_by_table = _collect_columns(executor) if (executor and with_schema) else {}
 
     _apply_descriptions_to_models(models, docs_meta, cols_by_table, with_schema=with_schema)
-    _infer_and_attach_lineage(models, executor, docs_meta, cols_by_table, with_schema=with_schema)
+    _infer_and_attach_lineage(
+        models,
+        executor,
+        docs_meta,
+        cols_by_table,
+        with_schema=with_schema,
+        rendered_sql_by_model=(rendered_sql_by_model or None),
+    )
 
     used_by = _reverse_deps(nodes)
 
@@ -709,12 +1104,19 @@ def render_site(
             cols_by_table=cols_by_table,
             model_source_refs=model_source_refs,
             sources_by_key=sources_by_key,
+            raw_sql_by_model=(raw_sql_by_model or None),
+            rendered_sql_by_model=(rendered_sql_by_model or None),
+            compiled_sql_by_model=(compiled_sql_by_model or None),
+            rendered_refs_by_model=(rendered_refs_by_model or None),
+            include_rendered_sql=bool(include_rendered_sql),
         )
         assets_dir = out_dir / "assets"
         assets_dir.mkdir(parents=True, exist_ok=True)
         (assets_dir / "docs_manifest.json").write_text(
             json.dumps(manifest, indent=2), encoding="utf-8"
         )
+
+        _copy_runtime_artifacts(out_dir, proj_dir)
 
         # SPA shell (index.html.j2)
         _render_index(
@@ -763,6 +1165,89 @@ def render_site(
         _render_source_pages(env, out_dir, sources)
 
 
+def _normalize_contract(obj: Any) -> dict[str, Any] | None:
+    """
+    Normalize contract specs from YAML/front-matter into a manifest-friendly shape:
+      {
+        "enforced": bool | None,
+        "columns": [
+          {"name": str, "dtype": str|None, "nullable": bool|None, "constraints": list[Any]}
+        ],
+        "constraints": list[Any],
+      }
+    """
+    if obj is None or obj is False:
+        return None
+
+    # Allow "contract: true" as a lightweight marker
+    if obj is True:
+        return {"enforced": None, "columns": [], "constraints": []}
+
+    if not isinstance(obj, dict):
+        return None
+
+    enforced = obj.get("enforced", None)
+    if enforced is None:
+        enforced = obj.get("enabled", None)
+    if enforced is not None:
+        enforced = bool(enforced)
+
+    # Accept aliases: columns/schema/fields
+    cols_spec = obj.get("columns", None)
+    if cols_spec is None:
+        cols_spec = obj.get("schema", None)
+    if cols_spec is None:
+        cols_spec = obj.get("fields", None)
+
+    cols_out: list[dict[str, Any]] = []
+
+    def _constraints(v: Any) -> list[Any]:
+        if v is None or v == "":
+            return []
+        if isinstance(v, list):
+            return v
+        return [v]
+
+    if isinstance(cols_spec, dict):
+        for name, spec in cols_spec.items():
+            row: dict[str, Any] = {"name": str(name)}
+            if isinstance(spec, str):
+                row["dtype"] = spec
+            elif isinstance(spec, dict):
+                row["dtype"] = spec.get("dtype") or spec.get("type") or spec.get("data_type")
+                if "nullable" in spec:
+                    row["nullable"] = bool(spec.get("nullable"))
+                elif "not_null" in spec:
+                    row["nullable"] = not bool(spec.get("not_null"))
+                row["constraints"] = _constraints(spec.get("constraints") or spec.get("tests"))
+            cols_out.append(row)
+    elif isinstance(cols_spec, list):
+        for it in cols_spec:
+            if not isinstance(it, dict):
+                continue
+            nm = it.get("name")
+            if not nm:
+                continue
+            row = {"name": str(nm)}
+            row["dtype"] = it.get("dtype") or it.get("type") or it.get("data_type")
+            if "nullable" in it:
+                row["nullable"] = bool(it.get("nullable"))
+            elif "not_null" in it:
+                row["nullable"] = not bool(it.get("not_null"))
+            row["constraints"] = _constraints(it.get("constraints") or it.get("tests"))
+            cols_out.append(row)
+
+    tbl_constraints = obj.get("constraints") or obj.get("table_constraints") or []
+    if tbl_constraints and not isinstance(tbl_constraints, list):
+        tbl_constraints = [tbl_constraints]
+
+    return {
+        "enforced": enforced,
+        "columns": cols_out,
+        "constraints": tbl_constraints or [],
+    }
+
+
 def read_docs_metadata(project_dir: Path) -> dict[str, Any]:
     """
     Merge YAML + Markdown descriptions with priority: Markdown > YAML.
@@ -771,7 +1256,10 @@ def read_docs_metadata(project_dir: Path) -> dict[str, Any]:
         "models": {
           <model>: {
             "description_html": "<p>…</p>" | None,
-            "columns": { <col>: "<p>…</p>" }
+            "columns": {
+                <col>:
+                    "description_html": "<p>…</p>" | None,
+            }
           },
         },
         "columns": { <relation>: { <col>: "<p>…</p>" } }
@@ -784,26 +1272,45 @@ def read_docs_metadata(project_dir: Path) -> dict[str, Any]:
         desc = (meta or {}).get("description")
         cols = (meta or {}).get("columns") or {}
         lineage_yaml = (meta or {}).get("lineage")
+        contract_yaml = (meta or {}).get("contract")
+        contract_norm = _normalize_contract(contract_yaml)
+
+        def _col_desc(v: Any) -> str | None:
+            if v is None:
+                return None
+            if isinstance(v, dict):
+                v = v.get("description") or v.get("desc")
+            if not v:
+                return None
+            return _render_minimarkdown(str(v))
 
         out_models[model] = {
             "description_html": _render_minimarkdown(desc) if desc else None,
             "columns": {
-                str(k): _render_minimarkdown(str(v))
-                for k, v in (cols.items() if isinstance(cols, dict) else [])
+                str(k): _col_desc(v) for k, v in (cols.items() if isinstance(cols, dict) else [])
             },
         }
         if isinstance(lineage_yaml, dict):
             out_models[model]["lineage"] = lineage_yaml
+        if contract_norm is not None:
+            out_models[model]["contract"] = contract_norm
 
     # 2) Markdown model overrides: docs/models/<model>.md
     md_models_dir = project_dir / "docs" / "models"
     if md_models_dir.exists():
         for p in md_models_dir.glob("*.md"):
             model_name = p.stem
-            _, body = _read_markdown_file(p)
+            fm, body = _read_markdown_file(p)
             if body.strip():
                 out_models.setdefault(model_name, {"description_html": None, "columns": {}})
                 out_models[model_name]["description_html"] = _render_minimarkdown(body)
+
+            # contract in front matter overrides YAML
+            if isinstance(fm, dict) and "contract" in fm:
+                c = _normalize_contract(fm.get("contract"))
+                if c is not None:
+                    out_models.setdefault(model_name, {"description_html": None, "columns": {}})
+                    out_models[model_name]["contract"] = c
 
     # 3) Markdown column overrides: docs/columns/<relation>/<column>.md
     out_columns: dict[str, dict[str, str]] = {}

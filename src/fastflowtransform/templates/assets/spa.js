@@ -1,13 +1,28 @@
 const MANIFEST_URL = window.__FFT_MANIFEST_PATH__ || "assets/docs_manifest.json";
+const RUN_RESULTS_URL  = window.__FFT_RUN_RESULTS_PATH__  || "assets/run_results.json";
+const TEST_RESULTS_URL = window.__FFT_TEST_RESULTS_PATH__ || "assets/test_results.json";
+const UTEST_RESULTS_URL = window.__FFT_UTEST_RESULTS_PATH__ || "assets/utest_results.json";
 
 function el(tag, attrs = {}, ...children) {
   const n = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs || {})) {
+    if (v == null) continue;
+
     if (k === "class") n.className = v;
     else if (k === "html") n.innerHTML = v;
-    else if (k.startsWith("on") && typeof v === "function") n.addEventListener(k.slice(2), v);
+    else if (k.startsWith("on") && typeof v === "function")
+      n.addEventListener(k.slice(2).toLowerCase(), v);
+
+    // ✅ critical: boolean attributes
+    else if (k === "disabled") n.disabled = !!v;
+    else if (typeof v === "boolean") {
+      if (v) n.setAttribute(k, "");
+      // if false: omit attribute
+    }
+
     else n.setAttribute(k, String(v));
   }
+
   for (const c of children) {
     if (c == null) continue;
     n.appendChild(typeof c === "string" ? document.createTextNode(c) : c);
@@ -94,6 +109,9 @@ const FACET_Q = {
   kind: "mk",         // "sql" | "python" (omit => both)
   materialized: "mm", // normalized materialization, or "__unknown__"
   path: "mp",         // path prefix
+  tags:"mt", 
+  owner: "mo",
+  group:"mg"
 };
 const MAT_UNKNOWN = "__unknown__";
 
@@ -121,6 +139,15 @@ function modelMatchesPathPrefix(modelPath, prefix) {
 
 function readModelFacetsFromQuery(query) {
   const mk = (query.get(FACET_Q.kind) || "").trim().toLowerCase();
+  const mt = (query.get(FACET_Q.tags) || "").trim();
+  const tags = mt ? mt.split(",").map(s => s.trim()).filter(Boolean) : [];
+
+  const mo = (query.get(FACET_Q.owner) || "").trim();
+  const owners = mo ? mo.split(",").map(s => s.trim()).filter(Boolean) : [];
+
+  const mg = (query.get(FACET_Q.group) || "").trim().toLowerCase();
+  const groupBy = (mg === "owner" || mg === "domain") ? mg : "";
+
   const kinds = mk
     ? mk.split(",").map(s => s.trim()).filter(Boolean)
     : ["sql", "python"];
@@ -132,6 +159,9 @@ function readModelFacetsFromQuery(query) {
     kinds: Array.from(validKinds),
     materialized: normalizeMaterialized(query.get(FACET_Q.materialized) || ""),
     pathPrefix: query.get(FACET_Q.path) || "",
+    tags,
+    owners,
+    groupBy
   };
 }
 
@@ -149,6 +179,15 @@ function writeModelFacetsToQuery(query, facets) {
 
   if (facets.pathPrefix) query.set(FACET_Q.path, facets.pathPrefix);
   else query.delete(FACET_Q.path);
+
+  if (facets.tags && facets.tags.length) query.set(FACET_Q.tags, facets.tags.join(","));
+  else query.delete(FACET_Q.tags);
+
+  if (facets.owners && facets.owners.length) query.set(FACET_Q.owner, facets.owners.join(","));
+  else query.delete(FACET_Q.owner);
+
+  if (facets.groupBy) query.set(FACET_Q.group, facets.groupBy);
+  else query.delete(FACET_Q.group);
 }
 
 function currentModelFacets() {
@@ -158,13 +197,23 @@ function currentModelFacets() {
 function facetsActiveCount(f) {
   const kinds = new Set(f.kinds || []);
   const kindActive = !(kinds.has("sql") && kinds.has("python"));
-  return (kindActive ? 1 : 0) + (f.materialized ? 1 : 0) + (f.pathPrefix ? 1 : 0);
+  const tagsN = (f.tags || []).length;
+  const ownersN = (f.owners || []).length;
+  const groupActive = f.groupBy ? 1 : 0;
+  return (kindActive ? 1 : 0)
+    + (f.materialized ? 1 : 0)
+    + (f.pathPrefix ? 1 : 0)
+    + tagsN
+    + ownersN
+    + groupActive;
 }
 
 function filterModelsWithFacets(models, facets) {
   const kinds = new Set((facets.kinds || []).map(k => (k || "").toLowerCase()));
   const mat = normalizeMaterialized(facets.materialized || "");
   const pref = facets.pathPrefix || "";
+  const tagSet = new Set((facets.tags || []).map(t => t.toLowerCase()));
+  const ownerSet = new Set((facets.owners || []).map(o => String(o).toLowerCase()));
 
   return (models || []).filter(m => {
     const kind = normalizeModelKind(m.kind);
@@ -180,9 +229,95 @@ function filterModelsWithFacets(models, facets) {
     }
 
     if (pref && !modelMatchesPathPrefix(m.path || "", pref)) return false;
+    
+    if (tagSet.size) {
+      const mtags = Array.isArray(m.tags) ? m.tags : [];
+      const ok = mtags.some(t => tagSet.has(String(t).toLowerCase()));
+      if (!ok) return false;
+    }
+
+    if (ownerSet.size) {
+      const owners = Array.isArray(m.owners) ? m.owners : [];
+      const ok = owners.some(o => ownerSet.has(String(o).toLowerCase()));
+      if (!ok) return false;
+    }
 
     return true;
   });
+}
+
+// Shareable UI state (URL-encoded)
+const SHARE_Q = {
+  sidebar: "sf",   // sidebar filter text
+  gPin: "gp",      // pinned node id
+  gMode: "gm",     // up|down|both|off
+  gDepth: "gd",    // 1..8
+  gDir: "gr",      // LR|TB
+};
+
+function readShareStateFromUrl(state) {
+  const { query } = parseHashWithQuery();
+
+  // Sidebar search (treat URL as source of truth)
+  state.filter = query.get(SHARE_Q.sidebar) || "";
+
+  // Graph state (defaults if absent)
+  state.graphUI ||= { mode: "both", depth: 2, pinned: "", dir: "LR" };
+
+  const mode = (query.get(SHARE_Q.gMode) || "").toLowerCase();
+  if (["up","down","both","off"].includes(mode)) state.graphUI.mode = mode;
+  else state.graphUI.mode = "both";
+
+  const depthRaw = Number(query.get(SHARE_Q.gDepth));
+  if (Number.isFinite(depthRaw)) state.graphUI.depth = Math.max(1, Math.min(8, depthRaw));
+  else state.graphUI.depth = 2;
+
+  state.graphUI.pinned = query.get(SHARE_Q.gPin) || "";
+
+  const dir = (query.get(SHARE_Q.gDir) || "").toUpperCase();
+  if (dir === "LR" || dir === "TB") state.graphUI.dir = dir;
+  else state.graphUI.dir = (state.manifest?.dag?.graph?.direction || "LR").toUpperCase();
+
+  // Keep sidebar input in sync if it exists
+  if (state.ui?.sidebar?.input) state.ui.sidebar.input.value = state.filter;
+}
+
+function writeShareStateToQuery(q, state) {
+  const sf = String(state.filter || "");
+  if (sf) q.set(SHARE_Q.sidebar, sf);
+  else q.delete(SHARE_Q.sidebar);
+
+  const g = state.graphUI || {};
+  if ((g.mode || "both") !== "both") q.set(SHARE_Q.gMode, g.mode);
+  else q.delete(SHARE_Q.gMode);
+
+  if (Number(g.depth || 2) !== 2) q.set(SHARE_Q.gDepth, String(g.depth));
+  else q.delete(SHARE_Q.gDepth);
+
+  if (g.pinned) q.set(SHARE_Q.gPin, g.pinned);
+  else q.delete(SHARE_Q.gPin);
+
+  if ((g.dir || "LR").toUpperCase() !== "LR") q.set(SHARE_Q.gDir, (g.dir || "LR").toUpperCase());
+  else q.delete(SHARE_Q.gDir);
+}
+
+function syncShareStateToUrl(state) {
+  replaceHashQuery((q) => writeShareStateToQuery(q, state));
+}
+
+function copyCurrentLink(state) {
+  // Ensure URL contains current search + graph state
+  syncShareStateToUrl(state);
+  copyToClipboard(location.href);
+}
+
+function copyLinkBtn(state, cls = "btnTiny") {
+  return el("button", {
+    class: cls,
+    type: "button",
+    title: "Copy a shareable link to this view",
+    onclick: () => copyCurrentLink(state),
+  }, "Copy link");
 }
 
 // Merge current facet params into an arbitrary hash route (e.g. "#/model/x?tab=columns")
@@ -191,6 +326,29 @@ function routeWithFacets(route) {
   const r = (route || "#/").startsWith("#") ? (route || "#/").slice(1) : (route || "/");
   const [pathPart, queryPart] = r.split("?", 2);
   const q = new URLSearchParams(queryPart || "");
+
+  if (String(pathPart || "").startsWith("/model/")) {
+    const curQ = parseHashWithQuery().query;
+    const curTab = curQ.get("tab") || "";
+    const curCode = curQ.get("code") || "";
+
+    if (!q.has("tab") && curTab) q.set("tab", curTab);
+
+    const effectiveTab = q.get("tab") || curTab;
+    if (effectiveTab === "code") {
+      if (!q.has("code") && curCode) q.set("code", curCode);
+    } else {
+      // avoid leaking stale code=... into non-code tabs
+      q.delete("code");
+    }
+  }
+
+  // Preserve share-state params across navigation unless target already sets them
+  const curQ = parseHashWithQuery().query;
+  for (const k of Object.values(SHARE_Q)) {
+    if (!q.has(k) && curQ.has(k)) q.set(k, curQ.get(k));
+  }
+  
   writeModelFacetsToQuery(q, facets);
 
   const next = q.toString() ? `${pathPart}?${q.toString()}` : `${pathPart}`;
@@ -222,6 +380,47 @@ function debounce(fn, ms = 180) {
   return wrapped;
 }
 
+
+// -------- Source freshness helpers -----------------------------------------
+function toNumOrNull(v) {
+  if (v == null) return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+function formatMinutesCompact(mins) {
+  const m = toNumOrNull(mins);
+  if (m == null) return "—";
+  const total = Math.max(0, Math.round(m));
+  const d = Math.floor(total / 1440);
+  const h = Math.floor((total % 1440) / 60);
+  const mm = total % 60;
+  const parts = [];
+  if (d) parts.push(`${d}d`);
+  if (h) parts.push(`${h}h`);
+  if (mm || parts.length === 0) parts.push(`${mm}m`);
+  return parts.join(" ");
+}
+
+function sourceFreshnessConfig(s) {
+  const loadedAtField = String((s && s.loaded_at_field) || "").trim();
+  const warnMinutes = toNumOrNull(s && s.warn_after_minutes);
+  const errorMinutes = toNumOrNull(s && s.error_after_minutes);
+
+  const hasLoaded = !!loadedAtField;
+  const hasThresh = warnMinutes != null || errorMinutes != null;
+  const configured = hasLoaded && hasThresh;
+
+  let reason = "";
+  if (configured) reason = "Freshness is configured (loaded_at field + thresholds).";
+  else if (!hasLoaded && hasThresh) reason = "Warn/error thresholds are set but loaded_at field is missing.";
+  else if (hasLoaded && !hasThresh) reason = "loaded_at field is set but warn/error thresholds are missing.";
+  else reason = "No freshness configuration found for this source.";
+
+  return { configured, reason, loadedAtField, warnMinutes, errorMinutes };
+}
+
+
 function setTabInHash(tab) {
   const full = (location.hash || "#/").slice(1);
   const [pathPart, queryPart] = full.split("?", 2);
@@ -244,6 +443,19 @@ function setModelQuery({ tab, col }) {
   location.hash = `#${next.startsWith("/") ? "" : "/"}${next}`;
 }
 
+function setModelCodeQuery({ code }) {
+  const full = (location.hash || "#/").slice(1);
+  const [pathPart, queryPart] = full.split("?", 2);
+  const q = new URLSearchParams(queryPart || "");
+
+  q.set("tab", "code");
+  if (code) q.set("code", code);
+  else q.delete("code");
+
+  const next = q.toString() ? `${pathPart}?${q.toString()}` : `${pathPart}`;
+  location.hash = `#${next.startsWith("/") ? "" : "/"}${next}`;
+}
+
 function parseRoute() {
   const { parts, query } = parseHashWithQuery();
   if (parts.length === 0) {
@@ -256,12 +468,18 @@ function parseRoute() {
       name: decodeURIComponent(parts.slice(1).join("/")),
       tab: query.get("tab") || "",
       col: query.get("col") || "",
+      code: query.get("code") || "",  // "rendered" | "raw" | "refs"
     };
   }
   if (parts[0] === "source" && parts[1] && parts[2]) {
     return { route: "source", source: decodeURIComponent(parts[1]), table: decodeURIComponent(parts[2]) };
   }
-  if (parts[0] === "macros") return { route: "macros" };
+
+  if (parts[0] === "macro" && parts[1]) {
+    return { route: "macro", name: decodeURIComponent(parts.slice(1).join("/")) };
+  }
+
+  if (parts[0] === "macros") return { route: "macros", q: query.get("mq") || "" };
 
   return { route: "home" };
 }
@@ -500,9 +718,1272 @@ function buildNeighborhoodGraph(fullGraph, centerId, opts) {
   return { ...fullGraph, nodes, edges, bounds, direction: "LR" };
 }
 
+
+function hasDocs(obj) {
+  const txt = (obj?.description_text || "").trim();
+  const html = (obj?.description_html || "").trim();
+  return !!(txt || html);
+}
+
+function isColumnDocumented(c) {
+  const txt = (c?.description_text || "").trim();
+  const html = (c?.description_html || "").trim();
+  return !!(txt || html);
+}
+
+function modelDocsStatus(state, m) {
+  const described = hasDocs(m);
+  const withSchema = !!state.manifest.project?.with_schema;
+
+  if (!withSchema) {
+    return { described, withSchema: false, colDoc: 0, colTotal: 0, colMissing: 0 };
+  }
+
+  const cols = m.columns || [];
+  const colTotal = cols.length;
+  const colDoc = cols.filter(isColumnDocumented).length;
+  const colMissing = colTotal - colDoc;
+
+  return { described, withSchema: true, colDoc, colTotal, colMissing };
+}
+
+function computeDocsCoverage(state, modelsOverride) {
+  const models = modelsOverride || state.manifest.models || [];
+  const withSchema = !!state.manifest.project?.with_schema;
+
+  let modelsDescribed = 0;
+  let colsTotal = 0;
+  let colsDoc = 0;
+
+  const perModel = models.map(m => {
+    const described = hasDocs(m);
+    if (described) modelsDescribed += 1;
+
+    let colTotal = 0, colDoc = 0, colMissing = 0;
+    if (withSchema) {
+      const cols = m.columns || [];
+      colTotal = cols.length;
+      colDoc = cols.filter(isColumnDocumented).length;
+      colMissing = colTotal - colDoc;
+      colsTotal += colTotal;
+      colsDoc += colDoc;
+    }
+
+    return {
+      name: m.name,
+      kind: m.kind,
+      path: m.path || "",
+      described,
+      colDoc, colTotal, colMissing,
+    };
+  });
+
+  const undocumented = perModel.filter(p => !p.described || (withSchema && p.colMissing > 0));
+  const missingModelDesc = perModel.filter(p => !p.described);
+  const missingColDocs = perModel.filter(p => withSchema && p.colMissing > 0);
+  const fullyDocumented = perModel.filter(p => p.described && (!withSchema || p.colMissing === 0));
+
+  return {
+    withSchema,
+    modelsTotal: perModel.length,
+    modelsDescribed,
+    colsTotal,
+    colsDoc,
+    perModel,
+    undocumented,
+    missingModelDesc,
+    missingColDocs,
+    fullyDocumented,
+  };
+}
+
+function renderDocsBadges(state, m, { compact = false } = {}) {
+  const st = modelDocsStatus(state, m);
+
+  const modelPill = st.described
+    ? el("span", { class: "pillSmall pillGood" }, compact ? "Model docs" : "Model described")
+    : el("span", { class: "pillSmall pillBad" }, compact ? "No model docs" : "No model docs");
+
+  let colPill = null;
+  if (!st.withSchema) {
+    colPill = el("span", { class: "pillSmall" }, compact ? "Schema off" : "Schema disabled");
+  } else if (!st.colTotal) {
+    colPill = el("span", { class: "pillSmall" }, compact ? "No cols" : "No columns found");
+  } else {
+    const ok = st.colMissing === 0;
+    colPill = el("span", { class: `pillSmall ${ok ? "pillGood" : "pillBad"}` },
+      compact ? `${st.colDoc}/${st.colTotal} cols` : `${st.colDoc}/${st.colTotal} columns documented`
+    );
+  }
+
+  const contracted = hasContract(m);
+  const contractPill = contracted
+    ? el("span", { class:"pillSmall pillGood", title:"Model contract defined" }, "Contracted")
+    : null;
+
+  const cls = compact ? "docPills docPillsCompact" : "docPills docPillsHeader";
+  return el("div", { class: cls }, modelPill, colPill, contractPill);
+}
+
+function renderDocsCoverageCard(state, cov) {
+  const jumpBtn = el("button", {
+    class: "btn",
+    onclick: () => document.getElementById("undocModels")?.scrollIntoView({ behavior: "smooth", block: "start" })
+  }, "Undocumented models ↓");
+
+  const colsNode = cov.withSchema
+    ? el("span", {}, `${cov.colsDoc}/${cov.colsTotal}`)
+    : el("span", { class: "empty" }, "Schema disabled");
+
+  return el("div", { class: "card", id: "docsCoverage" },
+    el("div", { class: "grid2" },
+      el("div", {},
+        el("h2", {}, "Docs coverage"),
+        el("p", { class: "empty" }, "How complete your model + column descriptions are.")
+      ),
+      el("div", {}, jumpBtn)
+    ),
+    el("div", { class: "kv" },
+      el("div", { class: "k" }, "Models described"),
+      el("div", {}, `${cov.modelsDescribed}/${cov.modelsTotal}`),
+
+      el("div", { class: "k" }, "Columns documented"),
+      el("div", {}, colsNode),
+
+      el("div", { class: "k" }, "Undocumented models"),
+      el("div", {}, `${cov.undocumented.length}/${cov.modelsTotal}`)
+    )
+  );
+}
+
+function renderUndocumentedModelsCard(state, cov) {
+  state.coverageUI ||= { tab: "undoc", q: "" };
+  const uiState = state.coverageUI;
+
+  const countNode = el("span", { class: "colCount" }, "");
+
+  const qInput = el("input", {
+    class: "search",
+    type: "search",
+    placeholder: "Filter models… (name or path)",
+    value: uiState.q || "",
+    oninput: (e) => {
+      uiState.q = e.target.value || "";
+      renderList();
+    },
+  });
+
+  const tabs = [
+    ["undoc", "Undocumented"],
+    ["noDesc", "Missing model docs"],
+    ["missingCols", "Undocumented columns"],
+    ["fully", "Fully documented"],
+    ["all", "All models"],
+  ];
+
+  const tabBtns = new Map();
+
+  const tabRow = el("div", { class: "tabs" },
+    ...tabs.map(([id, label]) => {
+      const btn = el("button", {
+        class: `tab ${uiState.tab === id ? "active" : ""}`,
+        onclick: () => {
+          uiState.tab = id;
+          syncTabs();
+          renderList();
+          queueMicrotask(() => qInput.focus());
+        },
+      }, label);
+      tabBtns.set(id, btn);
+      return btn;
+    })
+  );
+
+  function syncTabs() {
+    for (const [id, btn] of tabBtns.entries()) {
+      btn.classList.toggle("active", uiState.tab === id);
+    }
+  }
+
+  const list = el("ul", { class: "docList" });
+
+  function baseRows() {
+    if (uiState.tab === "undoc") return cov.undocumented.slice();
+    if (uiState.tab === "noDesc") return cov.missingModelDesc.slice();
+    if (uiState.tab === "missingCols") return cov.missingColDocs.slice();
+    if (uiState.tab === "fully") return cov.fullyDocumented.slice();
+    return cov.perModel.slice();
+  }
+
+  function getRows() {
+    let rows = baseRows();
+
+    const q = (uiState.q || "").trim().toLowerCase();
+    if (q) {
+      rows = rows.filter(r =>
+        (r.name || "").toLowerCase().includes(q) ||
+        (r.path || "").toLowerCase().includes(q)
+      );
+    }
+
+    // Most "work" first: missing model docs, then missing cols, then name
+    rows.sort((a, b) => {
+      const aw = (a.described ? 0 : 100000) + (a.colMissing || 0);
+      const bw = (b.described ? 0 : 100000) + (b.colMissing || 0);
+      if (bw !== aw) return bw - aw;
+      return String(a.name).localeCompare(String(b.name));
+    });
+
+    return rows;
+  }
+
+  function rowNode(r) {
+    const pills = el("div", { class: "docRowPills" },
+      r.described
+        ? el("span", { class: "pillSmall pillGood" }, "Model described")
+        : el("span", { class: "pillSmall pillBad" }, "No model docs"),
+      cov.withSchema
+        ? (r.colTotal
+            ? el("span", { class: `pillSmall ${r.colMissing ? "pillBad" : "pillGood"}` }, `${r.colDoc}/${r.colTotal} cols`)
+            : el("span", { class: "pillSmall" }, "No cols")
+          )
+        : el("span", { class: "pillSmall" }, "Schema off"),
+    );
+
+    const main = el("div", { class: "docRowMain" },
+      el("div", { class: "docRowTitle" }, el("code", {}, r.name)),
+      r.path ? el("div", { class: "docRowSub" }, r.path) : null
+    );
+
+    return el("li", { class: "docRow" },
+      el("a", {
+        href: routeWithFacets(`#/model/${escapeHashPart(r.name)}`),
+        onclick: (e) => { e.preventDefault(); location.hash = routeWithFacets(`#/model/${escapeHashPart(r.name)}`); },
+        title: r.path || r.name,
+      }, main, pills)
+    );
+  }
+
+  function renderList() {
+    const rows = getRows();
+    countNode.textContent = `${rows.length} model${rows.length === 1 ? "" : "s"}`;
+
+    if (!rows.length) {
+      list.replaceChildren(el("li", { class: "empty" }, "No matches."));
+      return;
+    }
+    list.replaceChildren(...rows.map(rowNode));
+  }
+
+  renderList();
+
+  return el("div", { class: "card", id: "undocModels" },
+    el("h2", {}, "Undocumented models"),
+    el("p", { class: "empty" }, "Jump straight to models that need documentation."),
+    el("div", { class: "colTools" }, qInput, countNode),
+    tabRow,
+    list
+  );
+}
+
+// ----------- Contracts --------------------
+function hasContract(m) {
+  const c = m && m.contract;
+  if (!c) return false;
+  if (c === true) return true;
+  const cols = contractColumnsFrom(m);
+  const tbl = contractTableConstraintsFrom(m);
+  return (cols && cols.length) || (tbl && tbl.length) || (c.enforced != null);
+}
+
+function contractColumnsFrom(m) {
+  const c = m && m.contract;
+  if (!c) return [];
+  if (Array.isArray(c)) return c;
+
+  const colsSpec = c.columns ?? c.schema ?? c.fields;
+  if (!colsSpec) return [];
+
+  if (Array.isArray(colsSpec)) return colsSpec.filter(x => x && typeof x === "object");
+
+  if (colsSpec && typeof colsSpec === "object") {
+    return Object.entries(colsSpec).map(([name, spec]) => {
+      if (spec && typeof spec === "object" && !Array.isArray(spec)) return { name, ...spec };
+      if (typeof spec === "string") return { name, dtype: spec };
+      return { name };
+    });
+  }
+  return [];
+}
+
+function contractTableConstraintsFrom(m) {
+  const c = m && m.contract;
+  if (!c || typeof c !== "object") return [];
+  const v = c.constraints ?? c.table_constraints;
+  if (!v) return [];
+  return Array.isArray(v) ? v : [v];
+}
+
+function normalizeContractCol(col) {
+  const name = String(col?.name || "").trim();
+  if (!name) return null;
+
+  const dtype = col?.dtype ?? col?.type ?? col?.data_type;
+  let nullable = col?.nullable;
+  if (nullable == null && col?.not_null != null) nullable = !col.not_null;
+
+  let constraints = col?.constraints ?? col?.tests ?? [];
+  if (constraints && !Array.isArray(constraints)) constraints = [constraints];
+
+  return {
+    name,
+    dtype: dtype != null ? String(dtype) : "",
+    nullable: (nullable === true || nullable === false) ? nullable : null,
+    constraints: constraints || [],
+  };
+}
+
+function renderConstraintsList(items) {
+  const arr = Array.isArray(items) ? items : (items ? [items] : []);
+  if (!arr.length) return el("span", { class:"empty" }, "—");
+
+  const wrap = el("span", { class:"pillRow" });
+  for (const it of arr) {
+    if (typeof it === "string") {
+      wrap.appendChild(el("span", { class:"pillSmall" }, it));
+    } else if (it && typeof it === "object") {
+      wrap.appendChild(
+        el("details", { style:"display:inline-block;" },
+          el("summary", { class:"codeSummary" }, "constraint"),
+          el("pre", { class:"mono", style:"white-space:pre-wrap; margin:8px 0 0 0;" }, jsonPreview(it))
+        )
+      );
+    }
+  }
+  return wrap;
+}
+
+function canonicalType(t) {
+  const s = String(t || "").trim().toLowerCase();
+  if (!s) return "";
+  // normalize whitespace + strip trailing params like varchar(255), numeric(10,2)
+  return s.replace(/\s+/g, " ").replace(/\(.*\)\s*$/, "").trim();
+}
+
+function computeContractDrift(m, withSchema) {
+  const contracted = hasContract(m);
+  if (!contracted) {
+    return { status: "none", missing: [], extra: [], mismatches: [], byName: new Map(), schemaAvailable: false, constraintsComparable: false };
+  }
+
+  const schemaAvailable = !!withSchema && Array.isArray(m.columns) && m.columns.length > 0;
+  if (!schemaAvailable) {
+    return { status: "unavailable", missing: [], extra: [], mismatches: [], byName: new Map(), schemaAvailable: false, constraintsComparable: false };
+  }
+
+  const contractCols = contractColumnsFrom(m).map(normalizeContractCol).filter(Boolean);
+  const actualCols = (m.columns || []).map(c => ({
+    name: String(c.name || ""),
+    dtype: c.dtype != null ? String(c.dtype) : "",
+    nullable: !!c.nullable,
+    constraints: c.constraints ?? null, // only comparable if your schema collector starts emitting it
+  }));
+
+  const cMap = new Map(); // lowerName -> contract col
+  for (const c of contractCols) cMap.set(c.name.toLowerCase(), c);
+
+  const aMap = new Map(); // lowerName -> actual col
+  for (const a of actualCols) aMap.set(a.name.toLowerCase(), a);
+
+  const constraintsComparable = actualCols.some(a => Array.isArray(a.constraints));
+
+  const missing = [];
+  const mismatches = [];
+  const byName = new Map(); // lowerName -> { missing?:true, extra?:true, issues:[], expected, actual }
+
+  for (const c of contractCols) {
+    const key = c.name.toLowerCase();
+    const a = aMap.get(key);
+
+    if (!a) {
+      missing.push(c.name);
+      byName.set(key, { missing: true, issues: ["missing"], expected: c, actual: null });
+      continue;
+    }
+
+    const issues = [];
+
+    // type mismatch (if contract specifies dtype)
+    if (c.dtype) {
+      const expT = canonicalType(c.dtype);
+      const actT = canonicalType(a.dtype);
+      if (expT && actT && expT !== actT) issues.push("type");
+    }
+
+    // nullability mismatch (if contract specifies nullable)
+    if (c.nullable != null) {
+      if (!!c.nullable !== !!a.nullable) issues.push("nullability");
+    }
+
+    // constraints mismatch (only if warehouse schema exposes constraints)
+    if (constraintsComparable && (c.constraints || []).length) {
+      const exp = JSON.stringify(c.constraints || []);
+      const act = JSON.stringify(a.constraints || []);
+      if (exp !== act) issues.push("constraints");
+    }
+
+    if (issues.length) {
+      mismatches.push({ name: c.name, issues });
+      byName.set(key, { issues, expected: c, actual: a });
+    }
+  }
+
+  const extra = [];
+  for (const a of actualCols) {
+    const key = a.name.toLowerCase();
+    if (!cMap.has(key)) {
+      extra.push(a.name);
+      byName.set(key, { extra: true, issues: ["extra"], expected: null, actual: a });
+    }
+  }
+
+  const status = (missing.length || extra.length || mismatches.length) ? "drift" : "verified";
+  return { status, missing, extra, mismatches, byName, schemaAvailable: true, constraintsComparable };
+}
+
+
+// -------- Code Viewer helpers ---------------------
+
+function copyToClipboard(text) {
+  const s = String(text || "");
+  if (!s) return;
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(s).catch(() => {});
+  } else {
+    // fallback
+    const ta = document.createElement("textarea");
+    ta.value = s;
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand("copy"); } catch {}
+    ta.remove();
+  }
+}
+
+function escapeHtml(s) {
+  return String(s)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+const SQL_KW = new Set([
+  "SELECT","FROM","WHERE","GROUP","BY","ORDER","HAVING","LIMIT","QUALIFY",
+  "JOIN","INNER","LEFT","RIGHT","FULL","CROSS","OUTER","ON","USING",
+  "UNION","ALL","DISTINCT","EXCEPT","INTERSECT",
+  "WITH","AS",
+  "CASE","WHEN","THEN","ELSE","END",
+  "AND","OR","NOT","IN","IS","NULL","LIKE","ILIKE","BETWEEN","EXISTS",
+  "CAST","TRY_CAST",
+  "CREATE","TABLE","VIEW","MATERIALIZED","REPLACE",
+  "INSERT","INTO","VALUES","UPDATE","SET","DELETE",
+  "OVER","PARTITION","ROWS","RANGE","CURRENT","ROW","FOLLOWING","PRECEDING",
+  "TRUE","FALSE"
+]);
+
+function highlightSqlToHtml(sql) {
+  const s = String(sql || "");
+  let i = 0;
+  let out = "";
+
+  const emit = (cls, chunk) => {
+    out += `<span class="${cls}">${escapeHtml(chunk)}</span>`;
+  };
+
+  const isWordStart = (c) => /[A-Za-z_]/.test(c);
+  const isWord = (c) => /[A-Za-z0-9_$]/.test(c);
+  const isDigit = (c) => /[0-9]/.test(c);
+
+  while (i < s.length) {
+    const c = s[i];
+    const n = s[i + 1];
+
+    // line comment --
+    if (c === "-" && n === "-") {
+      let j = i + 2;
+      while (j < s.length && s[j] !== "\n") j++;
+      emit("tok-com", s.slice(i, j));
+      i = j;
+      continue;
+    }
+
+    // block comment /* ... */
+    if (c === "/" && n === "*") {
+      let j = i + 2;
+      while (j < s.length && !(s[j] === "*" && s[j + 1] === "/")) j++;
+      j = Math.min(s.length, j + 2);
+      emit("tok-com", s.slice(i, j));
+      i = j;
+      continue;
+    }
+
+    // single-quoted string '...'
+    if (c === "'") {
+      let j = i + 1;
+      while (j < s.length) {
+        if (s[j] === "'") {
+          // doubled '' escape
+          if (s[j + 1] === "'") { j += 2; continue; }
+          j++;
+          break;
+        }
+        j++;
+      }
+      emit("tok-str", s.slice(i, j));
+      i = j;
+      continue;
+    }
+
+    // quoted identifiers "..." or `...`
+    if (c === '"' || c === "`") {
+      const q = c;
+      let j = i + 1;
+      while (j < s.length) {
+        if (s[j] === q) {
+          // doubled "" or `` escape
+          if (s[j + 1] === q) { j += 2; continue; }
+          j++;
+          break;
+        }
+        j++;
+      }
+      emit("tok-id", s.slice(i, j));
+      i = j;
+      continue;
+    }
+
+    // number
+    if (isDigit(c)) {
+      let j = i + 1;
+      while (j < s.length && /[0-9.]/.test(s[j])) j++;
+      emit("tok-num", s.slice(i, j));
+      i = j;
+      continue;
+    }
+
+    // word: keyword / function / identifier
+    if (isWordStart(c)) {
+      let j = i + 1;
+      while (j < s.length && isWord(s[j])) j++;
+      const word = s.slice(i, j);
+      const upper = word.toUpperCase();
+
+      // peek next non-space for function call
+      let k = j;
+      while (k < s.length && /\s/.test(s[k])) k++;
+      const isFn = s[k] === "(";
+
+      if (SQL_KW.has(upper)) emit("tok-kw", word);
+      else if (isFn) emit("tok-fn", word);
+      else emit("tok-id", word);
+
+      i = j;
+      continue;
+    }
+
+    // everything else (punctuation/whitespace)
+    out += escapeHtml(c);
+    i++;
+  }
+
+  return out;
+}
+
+const PY_KW = new Set([
+  "False","None","True",
+  "and","as","assert","async","await",
+  "break","class","continue",
+  "def","del",
+  "elif","else","except",
+  "finally","for","from",
+  "global","if","import","in","is",
+  "lambda","nonlocal","not",
+  "or","pass",
+  "raise","return",
+  "try","while","with",
+  "yield"
+]);
+
+function highlightPythonToHtml(code) {
+  const s = String(code || "");
+  let i = 0;
+  let out = "";
+
+  const emit = (cls, chunk) => {
+    out += `<span class="${cls}">${escapeHtml(chunk)}</span>`;
+  };
+
+  const isWordStart = (c) => /[A-Za-z_]/.test(c);
+  const isWord = (c) => /[A-Za-z0-9_]/.test(c);
+  const isDigit = (c) => /[0-9]/.test(c);
+
+  // Remember if next identifier should be styled (def/class name)
+  let expectDefName = false;
+  let expectClassName = false;
+
+  const peekNonSpace = (idx) => {
+    let j = idx;
+    while (j < s.length && /\s/.test(s[j])) j++;
+    return s[j] || "";
+  };
+
+  while (i < s.length) {
+    const c = s[i];
+    const n = s[i + 1];
+    const n2 = s[i + 2];
+
+    // Comments: # ... (until newline)
+    if (c === "#") {
+      let j = i + 1;
+      while (j < s.length && s[j] !== "\n") j++;
+      emit("tok-com", s.slice(i, j));
+      i = j;
+      continue;
+    }
+
+    // Strings (single/double, triple, with optional prefix r/u/f/b combos)
+    // Detect prefix only if it immediately precedes a quote and is not part of an identifier.
+    const startsWithQuote = (ch) => ch === "'" || ch === '"';
+    const isPrefixChar = (ch) => /[rRuUbBfF]/.test(ch);
+
+    // Prefix handling: e.g. r"..." f'...' rf"""..."""
+    let prefixStart = i;
+    let prefix = "";
+    if (isPrefixChar(c)) {
+      let j = i;
+      while (j < s.length && isPrefixChar(s[j]) && (j - i) < 3) j++;
+      const q = s[j];
+      // ensure prefix isn't part of a larger identifier (word before prefixStart)
+      const prev = s[prefixStart - 1] || "";
+      if (!isWord(prev) && startsWithQuote(q)) {
+        prefix = s.slice(i, j);
+        i = j; // move i onto the quote
+      }
+    }
+
+    // Triple quotes
+    if ((s[i] === "'" && n === "'" && n2 === "'") || (s[i] === '"' && n === '"' && n2 === '"')) {
+      const quote = s[i];
+      let j = i + 3;
+      while (j < s.length && !(s[j] === quote && s[j + 1] === quote && s[j + 2] === quote)) j++;
+      j = Math.min(s.length, j + 3);
+      emit("tok-str", prefix + s.slice(i, j));
+      i = j;
+      prefix = "";
+      continue;
+    }
+
+    // Single/double quoted strings
+    if (s[i] === "'" || s[i] === '"') {
+      const quote = s[i];
+      let j = i + 1;
+      while (j < s.length) {
+        if (s[j] === "\\") { j += 2; continue; }
+        if (s[j] === quote) { j++; break; }
+        j++;
+      }
+      emit("tok-str", prefix + s.slice(i, j));
+      i = j;
+      prefix = "";
+      continue;
+    }
+
+    // Numbers (simple)
+    if (isDigit(c)) {
+      let j = i + 1;
+      while (j < s.length && /[0-9._]/.test(s[j])) j++;
+      emit("tok-num", s.slice(i, j));
+      i = j;
+      continue;
+    }
+
+    // Decorators
+    if (c === "@") {
+      let j = i + 1;
+      while (j < s.length && s[j] !== "\n") j++;
+      emit("tok-fn", s.slice(i, j)); // reuse tok-fn styling for decorators
+      i = j;
+      continue;
+    }
+
+    // Identifiers / keywords
+    if (isWordStart(c)) {
+      let j = i + 1;
+      while (j < s.length && isWord(s[j])) j++;
+      const word = s.slice(i, j);
+
+      if (expectDefName) {
+        emit("tok-fn", word);
+        expectDefName = false;
+        i = j;
+        continue;
+      }
+      if (expectClassName) {
+        emit("tok-id", word);
+        expectClassName = false;
+        i = j;
+        continue;
+      }
+
+      if (PY_KW.has(word)) {
+        emit("tok-kw", word);
+        if (word === "def") expectDefName = true;
+        if (word === "class") expectClassName = true;
+      } else {
+        // highlight function-like calls: name(...)
+        const next = peekNonSpace(j);
+        if (next === "(") emit("tok-fn", word);
+        else emit("tok-id", word);
+      }
+
+      i = j;
+      continue;
+    }
+
+    // Everything else
+    out += escapeHtml(c);
+    i++;
+  }
+
+  return out;
+}
+
+function renderCodeBlock(text, { wrap = false, lang = "", highlight = false } = {}) {
+  const s = String(text || "");
+  const cls = `codeBlock ${wrap ? "codeWrap" : ""}`;
+
+  if (highlight && lang === "sql") {
+    return el("pre", { class: cls },
+      el("code", { class: "language-sql", html: highlightSqlToHtml(s) })
+    );
+  }
+
+  if (highlight && lang === "python") {
+    return el("pre", { class: cls },
+      el("code", { class: "language-python", html: highlightPythonToHtml(s) })
+    );
+  }
+
+  return el("pre", { class: cls }, s);
+}
+
+function renderModelCodeTab(state, m, codeView) {
+  const isSql = (m.kind || "sql") !== "python";
+
+  const raw = m.raw_sql || m.sql || m.code || "";
+  const rendered = m.rendered_sql || m.compiled_sql || "";
+
+  // Default view: rendered if available, else raw
+  let view = (codeView || "").toLowerCase();
+  if (!["rendered", "raw", "refs"].includes(view)) {
+    view = rendered ? "rendered" : "raw";
+  }
+
+  state.codeUI ||= {};
+  const ui = (state.codeUI[m.name] ||= { wrap: false });
+
+  const setView = (v) => {
+    setModelCodeQuery({ code: v });
+  };
+
+  const headRight = el("div", { class: "row", style: "gap:8px; justify-content:flex-end;" },
+    el("button", {
+      class: "btnTiny",
+      type: "button",
+      onclick: () => { ui.wrap = !ui.wrap; updateMain(); }
+    }, ui.wrap ? "No wrap" : "Wrap"),
+    el("button", {
+      class: "btnTiny",
+      type: "button",
+      onclick: () => {
+        const txt = !isSql
+          ? (m.python_source || m.source || "")
+          : view === "rendered"
+            ? (rendered || "Rendered SQL not available. Enable docs.include_rendered_sql in the generator.")
+            : view === "raw"
+              ? raw
+              : "";
+        copyToClipboard(txt);
+      }
+    }, "Copy")
+  );
+
+  // ---- Python models: no SQL sub-tabs ----
+  if (!isSql) {
+    const py = m.python_source || m.source || "";
+    const body = py
+      ? renderCodeBlock(py, { wrap: ui.wrap, lang: "python", highlight: true })
+      : el("p", { class:"empty" }, "No source available for this model.");
+
+    return el("div", { class:"card" },
+      el("div", { class:"row", style:"align-items:center; justify-content:space-between;" },
+        el("h3", { style:"margin:0;" }, "Python"),
+        headRight
+      ),
+      body
+    );
+  }
+
+  const tabs = el("div", { class: "pillRow" },
+    el("button", { class: `tab ${view === "rendered" ? "active" : ""}`, type:"button", onclick: () => setView("rendered") }, "Rendered"),
+    el("button", { class: `tab ${view === "raw" ? "active" : ""}`, type:"button", onclick: () => setView("raw") }, "Raw"),
+    el("button", { class: `tab ${view === "refs" ? "active" : ""}`, type:"button", onclick: () => setView("refs") }, "Refs resolved"),
+  );
+
+  const body = (() => {
+    if (view === "rendered") {
+      return rendered
+        ? renderCodeBlock(rendered, { wrap: ui.wrap, lang: "sql", highlight: true })
+        : el("p", { class:"empty" }, "Rendered SQL not available. Enable docs.include_rendered_sql in the generator.");
+    }
+
+    if (view === "raw") {
+      return raw
+        ? renderCodeBlock(raw, { wrap: ui.wrap, lang: "sql", highlight: true })
+        : el("p", { class:"empty" }, "Raw SQL not available in the manifest.");
+    }
+
+    // refs resolved
+    // Prefer explicit rendered_refs mapping if provided, else derive from deps/sources_used.
+    const rows = [];
+    const seen = new Set();
+    const pushRow = (r) => {
+      const key = `${r.kind}:${r.name}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      rows.push(r);
+    };
+
+    // Models: prefer rendered_refs, else deps
+    if (m.rendered_refs) {
+      if (Array.isArray(m.rendered_refs)) {
+        for (const r of m.rendered_refs) pushRow({ kind:"model", name:r.name || "", relation:r.relation || "" });
+      } else if (typeof m.rendered_refs === "object") {
+        for (const [k, v] of Object.entries(m.rendered_refs)) pushRow({ kind:"model", name:k, relation:String(v || "") });
+      }
+    } else {
+      const byName = new Map((state.manifest.models || []).map(x => [x.name, x]));
+      for (const d of (m.deps || [])) {
+        const md = byName.get(d);
+        rows.push({ kind:"model", name:d, relation: md?.relation || "" });
+      }
+    }
+
+    // Sources: ALWAYS include
+    for (const s of (m.sources_used || [])) {
+      const nm = `${s.source_name}.${s.table_name}`;
+      rows.push({ 
+        kind: "source",
+        name: `${s.source_name}.${s.table_name}`,
+        source_name: s.source_name,
+        table_name: s.table_name,
+        relation: s.relation || ""
+      });
+    }
+
+    if (!rows.length) return el("p", { class:"empty" }, "No references detected for this model.");
+
+    return el("table", { class:"table" },
+      el("thead", {}, el("tr", {},
+        el("th", {}, "Kind"),
+        el("th", {}, "Reference"),
+        el("th", {}, "Resolved relation"),
+      )),
+      el("tbody", {},
+        ...rows.map(r => {
+          const refCell = (() => {
+            if (r.kind === "model") {
+              const href = routeWithFacets(`#/model/${escapeHashPart(r.name)}`);
+              return el("a", {
+                href,
+                onclick: (e) => { e.preventDefault(); location.hash = href; }
+              }, r.name);
+            }
+
+            if (r.kind === "source") {
+              const href = routeWithFacets(`#/source/${escapeHashPart(r.source_name)}/${escapeHashPart(r.table_name)}`);
+              return el("a", {
+                href,
+                onclick: (e) => { e.preventDefault(); location.hash = href; }
+              }, r.name);
+            }
+
+            return el("span", {}, r.name);
+          })();
+
+          return el("tr", {},
+            el("td", {}, el("span", { class:"pillSmall" }, r.kind)),
+            el("td", {}, refCell),
+            el("td", {}, r.relation ? el("code", {}, r.relation) : el("span", { class:"empty" }, "—"))
+          );
+        })
+      )
+    );
+  })();
+
+  return el("div", { class:"card" },
+    el("div", { class:"row", style:"align-items:center; justify-content:space-between;" },
+      el("h3", { style:"margin:0;" }, isSql ? "SQL" : "Code"),
+      headRight
+    ),
+    tabs,
+    body
+  );
+}
+
+// -------- Landing page (overview dashboard) helpers ---------------------
+
+function setModelFacetsAndGoHome(nextFacets, extra = {}) {
+  const { query } = parseHashWithQuery();
+  const q = new URLSearchParams(query.toString());
+  writeModelFacetsToQuery(q, nextFacets);
+
+  // Optional extra params (e.g. { home: "undoc" })
+  for (const [k, v] of Object.entries(extra || {})) {
+    if (v == null || String(v).trim() === "") q.delete(k);
+    else q.set(k, String(v));
+  }
+
+  const qs = q.toString();
+  location.hash = `#/${qs ? "?" + qs : ""}`;
+}
+
+function getModelChangeTs(m) {
+  const meta = (m && typeof m === "object") ? (m.meta || {}) : {};
+  const candidates = [
+    m.updated_at, m.modified_at, m.last_modified, m.changed_at, m.created_at,
+    meta.updated_at, meta.modified_at, meta.last_modified, meta.changed_at, meta.created_at,
+  ];
+
+  for (const v of candidates) {
+    if (v == null || v === "") continue;
+    if (typeof v === "number" && Number.isFinite(v)) {
+      // seconds vs ms
+      return v < 1e12 ? Math.floor(v * 1000) : Math.floor(v);
+    }
+    const d = new Date(v);
+    if (!Number.isNaN(d.getTime())) return d.getTime();
+  }
+  return null;
+}
+
+function fmtDateShort(ms) {
+  try {
+    return new Date(ms).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "2-digit" });
+  } catch {
+    return "";
+  }
+}
+
+function computeImpactOverview(state, models) {
+  const rows = (models || []).map(m => {
+    const deps = (m.deps || []).length;
+    const usedBy = (m.used_by || []).length;
+    const score = (usedBy + 1) * (deps + 1);
+    return {
+      name: m.name,
+      kind: m.kind,
+      materialized: m.materialized || "",
+      path: m.path || "",
+      deps,
+      usedBy,
+      score,
+    };
+  });
+
+  const topFanOut = rows
+    .slice()
+    .sort((a, b) => (b.usedBy - a.usedBy) || a.name.localeCompare(b.name))
+    .slice(0, 10);
+
+  const topCritical = rows
+    .slice()
+    .sort((a, b) => (b.score - a.score) || (b.usedBy - a.usedBy) || (b.deps - a.deps) || a.name.localeCompare(b.name))
+    .slice(0, 10);
+
+  const edges = rows.reduce((acc, r) => acc + (r.deps || 0), 0);
+
+  return { rows, topFanOut, topCritical, edges };
+}
+
+function computeRecentChangedOverview(models) {
+  const rows = (models || [])
+    .map(m => {
+      const ts = getModelChangeTs(m);
+      return ts ? { name: m.name, kind: m.kind, materialized: m.materialized || "", path: m.path || "", ts } : null;
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.ts - a.ts)
+    .slice(0, 10);
+
+  return { available: rows.length > 0, rows };
+}
+
+function renderRankList(state, rows, metricNode) {
+  const list = el("ul", { class: "docList" });
+
+  if (!rows.length) {
+    list.replaceChildren(el("li", { class: "empty" }, "—"));
+    return list;
+  }
+
+  list.replaceChildren(
+    ...rows.map(r =>
+      el("li", { class: "docRow" },
+        el("a", {
+          href: routeWithFacets(`#/model/${escapeHashPart(r.name)}`),
+          onclick: (e) => { e.preventDefault(); location.hash = routeWithFacets(`#/model/${escapeHashPart(r.name)}`); },
+          title: r.path || r.name,
+        },
+          el("div", { class: "docRowMain" },
+            el("div", { class: "docRowTitle" }, r.name),
+            r.path ? el("div", { class: "docRowSub" }, r.path) : null
+          ),
+          el("div", { class: "docRowPills" },
+            pillForKind(normalizeModelKind(r.kind)),
+            r.materialized ? el("span", { class: "pillSmall" }, r.materialized) : null,
+            metricNode(r)
+          )
+        )
+      )
+    )
+  );
+
+  return list;
+}
+
+function renderOverviewDashboardCard(state, facets, modelsSubset, cov, impact, changed) {
+  const allModels = state.manifest.models || [];
+  const totalModels = allModels.length;
+  const subsetN = (modelsSubset || []).length;
+
+  const pythonN = (modelsSubset || []).filter(m => normalizeModelKind(m.kind) === "python").length;
+
+  const filtN = facetsActiveCount(facets);
+  const filterPills = [];
+  if (filtN) {
+    const kinds = new Set((facets.kinds || []).map(k => (k || "").toLowerCase()));
+    if (!(kinds.has("sql") && kinds.has("python"))) {
+      filterPills.push(el("span", { class: "pillSmall" }, `kind:${(facets.kinds || []).join(",")}`));
+    }
+    if (facets.materialized) filterPills.push(el("span", { class: "pillSmall" }, `mat:${facets.materialized}`));
+    if (facets.pathPrefix) filterPills.push(el("span", { class: "pillSmall" }, `path:${facets.pathPrefix}`));
+  }
+
+  const links = el("div", { style: "display:flex; gap:10px; flex-wrap:wrap; margin-top:10px;" },
+    el("a", {
+      class: "btnTiny",
+      href: routeWithFacets("#/?home=undoc"),
+      onclick: (e) => { e.preventDefault(); location.hash = routeWithFacets("#/?home=undoc"); },
+    }, `Undocumented (${cov.undocumented.length})`),
+
+    el("a", {
+      class: "btnTiny",
+      href: routeWithFacets("#/?home=impact"),
+      onclick: (e) => { e.preventDefault(); location.hash = routeWithFacets("#/?home=impact"); },
+    }, "High impact"),
+
+    el("button", {
+      class: "btnTiny",
+      type: "button",
+      onclick: () => {
+        // Set facets to python-only, clearing other facet constraints.
+        setModelFacetsAndGoHome({ kinds: ["python"], materialized: "", pathPrefix: "" }, { home: "" });
+      },
+    }, `Python models (${(state.manifest.models || []).filter(m => normalizeModelKind(m.kind) === "python").length})`),
+
+    filtN
+      ? el("button", {
+          class: "btnTiny",
+          type: "button",
+          onclick: () => setModelFacetsAndGoHome({ kinds: ["sql", "python"], materialized: "", pathPrefix: "" }, { home: "" }),
+        }, "Clear filters")
+      : null
+  );
+
+  const newestLine = changed.available
+    ? (() => {
+        const r = changed.rows[0];
+        return el("div", {},
+          el("span", { class: "pillSmall" }, "Newest"),
+          " ",
+          el("span", {}, `${r.name} • ${fmtDateShort(r.ts)}`)
+        );
+      })()
+    : el("span", { class: "empty" }, "No change timestamps available in manifest.");
+
+  return el("div", { class: "card" },
+    el("div", { class: "grid2" },
+      el("div", {},
+        el("h2", {}, "Overview dashboard"),
+        el("p", { class: "empty" }, "Stats, impact hotspots, docs coverage, and quick links."),
+        filterPills.length
+          ? el("div", { class: "docPills docPillsCompact", style: "margin-top:8px;" }, ...filterPills)
+          : null,
+        links
+      ),
+      el("div", {},
+        el("h3", {}, "Stats"),
+        el("div", { class: "kv" },
+          el("div", { class: "k" }, "Models"),
+          el("div", {}, filtN ? `${subsetN}/${totalModels}` : `${subsetN}`),
+
+          el("div", { class: "k" }, "Python models"),
+          el("div", {}, String(pythonN)),
+
+          el("div", { class: "k" }, "Edges"),
+          el("div", {}, String(impact.edges)),
+
+          el("div", { class: "k" }, "Model described"),
+          el("div", {}, `${cov.modelsDescribed}/${cov.modelsTotal}`),
+
+          el("div", { class: "k" }, "Columns documented"),
+          el("div", {}, cov.withSchema ? `${cov.colsDoc}/${cov.colsTotal}` : "Schema off"),
+
+          el("div", { class: "k" }, "Undocumented"),
+          el("div", {}, `${cov.undocumented.length}/${cov.modelsTotal}`),
+
+          el("div", { class: "k" }, "Newest/changed"),
+          el("div", {}, newestLine),
+        )
+      )
+    )
+  );
+}
+
+function renderTopFanOutCard(state, modelsSubset, impact) {
+  const rows = (impact.topFanOut || []).filter(r => r.usedBy > 0);
+
+  return el("div", { class: "card", id: "fanoutModels" },
+    el("h2", {}, "Top fan-out nodes"),
+    el("p", { class: "empty" }, "Models with the most downstream consumers (direct)."),
+    renderRankList(state, rows, (r) => el("span", { class: "pillSmall" }, `used by ${r.usedBy}`))
+  );
+}
+
+function renderCriticalModelsCard(state, impact) {
+  const rows = (impact.topCritical || []).slice();
+
+  return el("div", { class: "card", id: "impactModels" },
+    el("h2", {}, "Most critical models"),
+    el("p", { class: "empty" }, "Heuristic score combining upstream deps and downstream usage."),
+    renderRankList(state, rows, (r) => el("span", { class: "pillSmall" }, `score ${r.score}`))
+  );
+}
+
+function renderRecentChangedCard(state, changed) {
+  if (!changed.available) {
+    return el("div", { class: "card", id: "changedModels" },
+      el("h2", {}, "Newest / changed"),
+      el("p", { class: "empty" }, "No per-model change timestamps were found in the manifest."),
+      el("p", { class: "empty" }, "If you add fields like updated_at / modified_at to model entries, this list will populate.")
+    );
+  }
+
+  const rows = changed.rows || [];
+  return el("div", { class: "card", id: "changedModels" },
+    el("h2", {}, "Newest / changed"),
+    el("p", { class: "empty" }, "Models sorted by last change timestamp (if provided)."),
+    renderRankList(state, rows, (r) => el("span", { class: "pillSmall" }, fmtDateShort(r.ts)))
+  );
+}
+
+function filterGraphWithModelFacets(graph, models, facets) {
+  if (!graph || !Array.isArray(graph.nodes)) return graph;
+
+  // Which model names survive facets?
+  const keepModelNames = new Set(
+    filterModelsWithFacets(models || [], facets).map(m => m.name)
+  );
+
+  const byId = new Map((graph.nodes || []).map(n => [n.id, n]));
+
+  // Start with kept model node IDs
+  const keepIds = new Set();
+  for (const n of (graph.nodes || [])) {
+    if (n.kind === "model" && keepModelNames.has(n.name)) keepIds.add(n.id);
+  }
+
+  // Keep edges where all model endpoints are kept; pull in connected sources
+  const edges = [];
+  for (const e of (graph.edges || [])) {
+    const a = byId.get(e.from);
+    const b = byId.get(e.to);
+    if (!a || !b) continue;
+
+    if (a.kind === "model" && !keepIds.has(a.id)) continue;
+    if (b.kind === "model" && !keepIds.has(b.id)) continue;
+
+    // skip source->source noise (shouldn't happen, but safe)
+    if (a.kind !== "model" && b.kind !== "model") continue;
+
+    edges.push({ ...e });
+    keepIds.add(a.id);
+    keepIds.add(b.id);
+  }
+
+  const nodes = (graph.nodes || [])
+    .filter(n => keepIds.has(n.id))
+    .map(n => ({ ...n }));
+
+  // Empty result → small safe bounds so Fit doesn't explode
+  if (!nodes.length) {
+    return { nodes: [], edges: [], direction: graph.direction || "LR", bounds: { minx:0, miny:0, maxx:100, maxy:100, width:100, height:100 } };
+  }
+
+  // Normalize coordinates so min x/y are near PAD (important for your translate-based renderer)
+  const PAD = 24;
+  let minx = Infinity, miny = Infinity, maxx = -Infinity, maxy = -Infinity;
+  for (const n of nodes) {
+    const x = Number(n.x || 0), y = Number(n.y || 0);
+    const w = Number(n.w || 0), h = Number(n.h || 0);
+    minx = Math.min(minx, x);
+    miny = Math.min(miny, y);
+    maxx = Math.max(maxx, x + w);
+    maxy = Math.max(maxy, y + h);
+  }
+  const dx = PAD - minx;
+  const dy = PAD - miny;
+  for (const n of nodes) { n.x = Number(n.x || 0) + dx; n.y = Number(n.y || 0) + dy; }
+  maxx += dx; maxy += dy;
+
+  return {
+    nodes,
+    edges,
+    direction: graph.direction || "LR",
+    bounds: { minx: PAD, miny: PAD, maxx, maxy, width: (maxx - PAD + PAD), height: (maxy - PAD + PAD) }
+  };
+}
+
 function renderHome(state) {
   const { manifest } = state;
-  const graph = manifest.dag?.graph;
+
+  const facets = currentModelFacets();
+  const allModels = manifest.models || [];
+
+  const graphRaw = manifest.dag?.graph;
+  const graphBase = filterGraphWithModelFacets(graphRaw, allModels, facets);
+
+  // If the pinned node got filtered away, clear it (avoids “nothing highlights” confusion)
+  if (state.graphUI.pinned && !(graphBase.nodes || []).some(n => n.id === state.graphUI.pinned)) {
+    state.graphUI.pinned = "";
+  }
+
+  function rerenderMini() {
+    state._graphCtl?.refresh?.();
+  }
 
   const graphHost = el("div", { class: "graphHost" });
   const miniHost  = el("div", { class: "minimapHost" });
@@ -510,7 +1991,11 @@ function renderHome(state) {
   const modeBtn = (id, label) =>
     el("button", {
       class: `btn ${state.graphUI.mode === id ? "active" : ""}`,
-      onclick: () => { state.graphUI.mode = id; state._graphCtl?.refresh?.(); }
+      onclick: () => {
+        state.graphUI.mode = id;
+        syncShareStateToUrl(state);
+        state._graphCtl?.refresh?.();
+      }
     }, label);
 
   const depthPill = el("span", { class: "pill" }, `Depth ${state.graphUI.depth}`);
@@ -519,6 +2004,7 @@ function renderHome(state) {
     value: String(state.graphUI.depth),
     oninput: (e) => {
       state.graphUI.depth = Number(e.target.value || 2);
+      syncShareStateToUrl(state);
       depthPill.textContent = `Depth ${state.graphUI.depth}`;
       rerenderMini();
     }
@@ -541,6 +2027,7 @@ function renderHome(state) {
     if (state.graphUI.dir === dir) return;
 
     state.graphUI.dir = dir;
+    syncShareStateToUrl(state);
 
     // update segmented control UI
     lrBtn.classList.toggle("active", dir === "LR");
@@ -548,7 +2035,7 @@ function renderHome(state) {
     dirPill.textContent = dir === "TB" ? "Top → Bottom" : "Left → Right";
 
     // remount graph
-    const g = graphTransformDirection(state.manifest.dag.graph, dir);
+    const g = graphTransformDirection(graphBase, dir);
     state._graphCtl = mountGraph(state, graphHost, g, { miniHost, showMini: true });
   }
 
@@ -573,6 +2060,7 @@ function renderHome(state) {
 
         el("div", { class: "dagHeaderRight" },
           el("div", { class: "dagToolsRow" },
+            copyLinkBtn(state),
             fitBtn, resetBtn, zoomOutBtn, zoomInBtn,
             layoutTabs
           ),
@@ -593,17 +2081,57 @@ function renderHome(state) {
   );
 
   queueMicrotask(() => {
-    const g0 = graphTransformDirection(graph, state.graphUI.dir);
+    const g0 = graphTransformDirection(graphBase, state.graphUI.dir);
     state._graphCtl = mountGraph(state, graphHost, g0, { miniHost, showMini: true });
 
-    const r = parseRoute();
+    const r = parseRoute(); 
     if (r.route === "home" && r.focus) {
       state._graphCtl?.focus?.(r.focus, { zoom: 1.25, pin: true });
     }
   });
 
-  return graphCard;
+  // Dashboard data respects the current model facets (kind/materialized/path prefix).
+  const modelsSubset = filterModelsWithFacets(allModels, facets);
+
+  // If the URL requests a section, set the default undoc tab.
+  const homeMode = parseHashWithQuery().query.get("home") || "";
+  if (homeMode === "undoc") {
+    state.coverageUI ||= { tab: "undoc", q: "" };
+    state.coverageUI.tab = "undoc";
+  }
+
+  const cov = computeDocsCoverage(state, modelsSubset);
+  const impact = computeImpactOverview(state, modelsSubset);
+  const changed = computeRecentChangedOverview(modelsSubset);
+
+  const dashCard = renderOverviewDashboardCard(state, facets, modelsSubset, cov, impact, changed);
+  const coverageCard = renderDocsCoverageCard(state, cov);
+  const fanOutCard = renderTopFanOutCard(state, modelsSubset, impact);
+  const criticalCard = renderCriticalModelsCard(state, impact);
+  const changedCard = renderRecentChangedCard(state, changed);
+  const undocCard = renderUndocumentedModelsCard(state, cov);
+
+  const root = el("div", { class: "grid" },
+    dashCard,
+    graphCard,
+    coverageCard,
+    fanOutCard,
+    criticalCard,
+    changedCard,
+    undocCard
+  );
+
+  queueMicrotask(() => {
+    if (homeMode === "undoc") document.getElementById("undocModels")?.scrollIntoView?.({ behavior: "smooth", block: "start" });
+    if (homeMode === "impact") document.getElementById("impactModels")?.scrollIntoView?.({ behavior: "smooth", block: "start" });
+    if (homeMode === "changed") document.getElementById("changedModels")?.scrollIntoView?.({ behavior: "smooth", block: "start" });
+    if (homeMode === "fanout") document.getElementById("fanoutModels")?.scrollIntoView?.({ behavior: "smooth", block: "start" });
+  });
+
+  return root;
+
 }
+
 
 function renderModel(state, name, tabFromRoute, colFromRoute) {
   const m = state.byModel.get(name);
@@ -614,7 +2142,7 @@ function renderModel(state, name, tabFromRoute, colFromRoute) {
   const active = (tabFromRoute || state.modelTabDefault || "overview").toLowerCase();
   const hasCol = !!(colFromRoute && String(colFromRoute).trim());
 
-  let tab = ["overview","columns","lineage","code","meta"].includes(active) ? active : "overview";
+  let tab = ["overview","columns","contract","lineage","code","meta"].includes(active) ? active : "overview";
   // Only force columns if col is present AND the URL didn't explicitly set a tab
   if (hasCol && !tabFromRoute) tab = "columns";
 
@@ -622,13 +2150,15 @@ function renderModel(state, name, tabFromRoute, colFromRoute) {
     el("div", { class: "grid2" },
       el("div", {},
         el("h2", {}, m.name),
-        el("p", { class: "empty" }, m.relation ? `Relation: ${m.relation}` : "")
+        el("p", { class: "empty" }, m.relation ? `Relation: ${m.relation}` : ""),
+        renderDocsBadges(state, m)
       ),
       el("div", {},
         el("button", {
           class: "btn",
           onclick: () => { location.hash = routeWithFacets("#/"); }
         }, "← Overview"),
+        copyLinkBtn(state, "btn"),
         el("button", {
           class: "btn",
           onclick: async () => { try { await navigator.clipboard.writeText(m.path || ""); } catch {} }
@@ -656,11 +2186,12 @@ function renderModel(state, name, tabFromRoute, colFromRoute) {
 function renderModelPanel(state, m, tab, colFromRoute) {
   if (tab === "overview") {
     const deps = (m.deps || []).map(d => el("a", { href: routeWithFacets(`#/model/${escapeHashPart(d)}`) }, d));
-    const usedBy = (m.used_by || []).map(u => el("a", { href: `#/model/${escapeHashPart(u)}` }, u));
+    const usedBy = (m.used_by || []).map(u => el("a", { href: routeWithFacets(`#/model/${escapeHashPart(u)}`) }, u));
     const sourcesUsed = (m.sources_used || []).map(s =>
       el("a", { href: routeWithFacets(`#/source/${escapeHashPart(s.source_name)}/${escapeHashPart(s.table_name)}`) }, `${s.source_name}.${s.table_name}`)
     );
     const modelId = m.name;
+    const healthCard = renderHealthCardForModel(state, m);
 
     // --- Neighborhood mini-graph (MODEL PAGE) ---
     state.modelMini = state.modelMini || { mode: "both", depth: 2 };
@@ -730,11 +2261,16 @@ function renderModelPanel(state, m, tab, colFromRoute) {
           el("div", { class: "k" }, "Kind"), el("div", {}, m.kind),
           el("div", { class: "k" }, "Materialized"), el("div", {}, m.materialized || "—"),
           el("div", { class: "k" }, "Path"), el("div", {}, el("code", {}, m.path || "—")),
+          el("div", { class: "k" }, "Model docs"), el("div", {}, modelDocsStatus(state, m).described ? el("span", { class: "pillSmall pillGood" }, "Model described") : el("span", { class: "pillSmall pillBad" }, "No model docs")),
+          el("div", { class: "k" }, "Columns docs"), el("div", {}, (() => { const st = modelDocsStatus(state, m); if (!st.withSchema) return el("span", { class: "empty" }, "Schema disabled"); if (!st.colTotal) return el("span", { class: "empty" }, "No columns found"); return el("span", { class: `pillSmall ${st.colMissing ? "pillBad" : "pillGood"}` }, `${st.colDoc}/${st.colTotal} columns documented`); })()),
           el("div", { class: "k" }, "Deps"), el("div", {}, deps.length ? joinInline(deps) : el("span", { class: "empty" }, "—")),
           el("div", { class: "k" }, "Used by"), el("div", {}, usedBy.length ? joinInline(usedBy) : el("span", { class: "empty" }, "—")),
           el("div", { class: "k" }, "Sources"), el("div", {}, sourcesUsed.length ? joinInline(sourcesUsed) : el("span", { class: "empty" }, "—")),
         )
       ),
+      healthCard ? healthCard : null,
+      renderModelConfigMetaCard(m),
+      renderPythonModelCard(state, m),
       miniPanel,
       m.description_html
         ? el("div", { class: "card" }, el("h3", {}, "Description"), el("div", { class: "desc", html: m.description_html }))
@@ -748,50 +2284,58 @@ function renderModelPanel(state, m, tab, colFromRoute) {
 
   if (tab === "lineage") {
     const cols = m.columns || [];
-    const rows = cols
+    const colRows = cols
       .filter(c => (c.lineage || []).length)
       .map(c =>
         el("tr", {},
-          el("td", {}, el("code", {}, c.name)),
-          el("td", {}, renderLineage(c.lineage || []))
+          el("td", {},
+            (() => {
+              const href = routeWithFacets(`#/model/${escapeHashPart(m.name)}?tab=columns&col=${encodeURIComponent(c.name)}`);
+              return el("a", { href, onclick:(e)=>{ e.preventDefault(); location.hash = href; } }, el("code", {}, c.name));
+            })()
+          ),
+          el("td", {}, renderLineage(state, c.lineage || []))
+        )
+      )
+
+    const inferred = m.inferred_lineage || {};
+    const infRows = Object.entries(inferred)
+      .filter(([_, lin]) => Array.isArray(lin) && lin.length)
+      .map(([outCol, lin]) =>
+        el("tr", {},
+          el("td", {}, el("code", {}, outCol)),
+          el("td", {}, renderLineage(state, lin || []))
         )
       );
 
+    const rows = colRows.length ? colRows : infRows;
+    const title = colRows.length ? "Column lineage" : "Inferred lineage";
+
     return el("div", { class: "card" },
-      el("h3", {}, "Column lineage"),
+      el("h3", {}, title),
       rows.length
         ? el("table", { class: "table" },
             el("thead", {}, el("tr", {}, el("th", {}, "Column"), el("th", {}, "Lineage"))),
             el("tbody", {}, ...rows)
           )
-        : el("p", { class: "empty" }, "No lineage available for this model’s columns.")
+        : el("p", { class: "empty" }, "No lineage available for this model.")
     );
   }
 
   if (tab === "code") {
-    // Placeholder until we add compiled SQL / python source to manifest
-    return el("div", { class: "card" },
-      el("h3", {}, "Code"),
-      el("p", { class: "empty" }, "Code view not yet available. Next step: include rendered SQL / Python source in the manifest.")
-    );
+    const { query } = parseHashWithQuery();
+    const codeView = query.get("code") || "";
+    return renderModelCodeTab(state, m, codeView);
   }
 
   if (tab === "meta") {
-    // Show a structured dump of whatever we have
-    const meta = {
-      name: m.name,
-      kind: m.kind,
-      relation: m.relation,
-      materialized: m.materialized,
-      path: m.path,
-      deps: m.deps || [],
-      used_by: m.used_by || [],
-      sources_used: m.sources_used || [],
-    };
-    return el("div", { class: "card" },
-      el("h3", {}, "Meta"),
-      el("pre", { class: "mono", style: "white-space:pre-wrap; margin:0;" }, JSON.stringify(meta, null, 2))
+    return el("div", {},
+      renderModelConfigMetaCard(m, { includeRaw: true })
     );
+  }
+
+  if (tab === "contract") {
+    return buildContractCard(state, m);
   }
 
   return el("div", { class: "card" }, el("p", { class: "empty" }, "Unknown tab."));
@@ -809,28 +2353,44 @@ function renderSource(state, sourceName, tableName) {
     return el("div", { class: "card" }, el("h2", {}, "Source not found"), el("p", { class: "empty" }, key));
   }
 
-  const consumers = (s.consumers || []).map(m => el("a", { href: routeWithFacets(`#/model/${escapeHashPart(m)}`) }, m));
+  const consumers = (s.consumers || []).map(m =>
+    el("a", { href: routeWithFacets(`#/model/${escapeHashPart(m)}`) }, m)
+  );
 
-  const freshness = (() => {
-    const warn = s.warn_after_minutes != null ? `${s.warn_after_minutes}m warn` : null;
-    const err = s.error_after_minutes != null ? `${s.error_after_minutes}m error` : null;
-    const parts = [warn, err].filter(Boolean);
-    return parts.length ? parts.join(" • ") : "—";
-  })();
+  const fc = sourceFreshnessConfig(s);
+
+  const statusBadge = fc.configured
+    ? el("span", { class: "pillSmall pillGood", title: fc.reason }, "Configured")
+    : el("span", { class: "pillSmall pillBad", title: fc.reason }, "Missing freshness");
+
+  const loadedAtNode = fc.loadedAtField
+    ? el("code", {}, fc.loadedAtField)
+    : el("span", { class: "empty" }, "—");
+
+  const warnNode = fc.warnMinutes != null
+    ? el("span", { class: "pillSmall pillWarn", title: `${Math.round(fc.warnMinutes)} minutes` }, `Warn after ${formatMinutesCompact(fc.warnMinutes)}`)
+    : el("span", { class: "empty" }, "—");
+
+  const errNode = fc.errorMinutes != null
+    ? el("span", { class: "pillSmall pillBad", title: `${Math.round(fc.errorMinutes)} minutes` }, `Error after ${formatMinutesCompact(fc.errorMinutes)}`)
+    : el("span", { class: "empty" }, "—");
 
   return el("div", { class: "grid" },
     el("div", { class: "card" },
       el("div", { class: "grid2" },
         el("div", {}, el("h2", {}, key)),
         el("div", {},
-          el("button", { class: "btn", onclick: () => { location.hash = "#/"; } }, "← Overview")
+          el("button", { class: "btn", onclick: () => { location.hash = routeWithFacets("#/"); } }, "← Overview"),
+          copyLinkBtn(state, "btn"),
         )
       ),
       el("div", { class: "kv" },
         el("div", { class: "k" }, "Relation"), el("div", {}, el("code", {}, s.relation || "—")),
-        el("div", { class: "k" }, "Loaded at field"), el("div", {}, el("code", {}, s.loaded_at_field || "—")),
-        el("div", { class: "k" }, "Freshness"), el("div", {}, freshness),
-        el("div", { class: "k" }, "Consumers"), el("div", {}, consumers.length ? joinInline(consumers) : el("span", { class: "empty" }, "—")),
+        el("div", { class: "k" }, "Freshness"), el("div", {}, statusBadge),
+        el("div", { class: "k" }, "Loaded at field"), el("div", {}, loadedAtNode),
+        el("div", { class: "k" }, "Warn threshold"), el("div", {}, warnNode),
+        el("div", { class: "k" }, "Error threshold"), el("div", {}, errNode),
+        el("div", { class: "k" }, "Consumers"), el("div", {}, consumers.length ? joinInline(consumers) : el("span", { class: "empty" }, "—"))
       )
     ),
     s.description_html
@@ -839,26 +2399,170 @@ function renderSource(state, sourceName, tableName) {
   );
 }
 
-function renderMacros(state) {
+function macroSourceText(m) {
+  if (!m) return "";
+  return (
+    m.source ||
+    m.raw_sql ||
+    m.sql ||
+    m.definition ||
+    m.code ||
+    (m.meta && (m.meta.source || m.meta.raw_sql || m.meta.sql || m.meta.code)) ||
+    ""
+  );
+}
+
+function renderMacros(state, qFromRoute) {
   const ms = state.manifest.macros || [];
+  const wrap = el("div", { class: "card" }, el("h2", {}, "Macros"));
+
+  if (!ms.length) {
+    wrap.appendChild(el("p", { class: "empty" }, "No macros discovered."));
+    return wrap;
+  }
+
+  const q0 = (qFromRoute || "").trim();
+  state.macroQuery = q0;
+
+  const countEl = el("div", { class: "muted", style: "margin-top:6px;" }, "");
+  const list = el("ul", { class: "docList" });
+
+  const input = el("input", {
+    class: "search",
+    type: "search",
+    placeholder: "Search macros…",
+    value: q0,
+  });
+
+  const apply = () => {
+    const q = (input.value || "").trim().toLowerCase();
+
+    const filtered = q
+      ? ms.filter(m => {
+          const name = (m.name || "").toLowerCase();
+          const kind = (m.kind || "").toLowerCase();
+          const path = (m.path || "").toLowerCase();
+          const src = macroSourceText(m).toLowerCase();
+          return name.includes(q) || kind.includes(q) || path.includes(q) || src.includes(q);
+        })
+      : ms.slice();
+
+    filtered.sort((a, b) => (a.name || "").localeCompare(b.name || ""));
+
+    countEl.textContent = q
+      ? `${filtered.length} of ${ms.length} macros`
+      : `${ms.length} macros`;
+
+    list.replaceChildren(
+      ...filtered.map(m => {
+        const src = macroSourceText(m);
+        const snip = q ? makeSnippet(src, q, 90) : "";
+        const subParts = [
+          (m.kind || "macro").toUpperCase(),
+          m.path ? `• ${m.path}` : "",
+          snip ? `• ${snip}` : "",
+        ].filter(Boolean).join(" ");
+
+        const href = routeWithFacets(`#/macro/${escapeHashPart(m.name)}`);
+
+        return el("li", { class: "docRow" },
+          el("a", {
+            href,
+            onclick: (e) => { e.preventDefault(); location.hash = href; },
+            title: m.path || m.name,
+          },
+            el("div", { class: "docRowMain" },
+              el("div", { class: "docRowTitle" }, m.name),
+              el("div", { class: "docRowSub" }, subParts)
+            ),
+            el("div", { class: "docRowPills" },
+              el("span", { class: "pillSmall" }, m.kind || "macro")
+            )
+          ),
+          copyLinkBtn(state, "btn"),
+        );
+      })
+    );
+  };
+
+  const syncUrl = debounce(() => {
+    const v = (input.value || "").trim();
+    replaceHashQuery((q) => {
+      if (v) q.set("mq", v);
+      else q.delete("mq");
+    });
+  }, 200);
+
+  input.oninput = () => {
+    syncUrl();
+    apply();
+  };
+
+  input.onkeydown = (e) => {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      input.value = "";
+      syncUrl();
+      apply();
+    }
+  };
+
+  wrap.appendChild(input);
+  wrap.appendChild(countEl);
+  wrap.appendChild(list);
+
+  apply();
+  return wrap;
+}
+
+function renderMacro(state, name) {
+  const ms = state.manifest.macros || [];
+  const m =
+    ms.find(x => x.name === name) ||
+    ms.find(x => (x.name || "").toLowerCase() === (name || "").toLowerCase());
+
+  const back = state.macroQuery
+    ? `#/macros?mq=${encodeURIComponent(state.macroQuery)}`
+    : "#/macros";
+
+  if (!m) {
+    return el("div", { class: "card" },
+      el("div", { class: "row" },
+        el("a", {
+          class: "btn",
+          href: routeWithFacets(back),
+          onclick: (e) => { e.preventDefault(); location.hash = routeWithFacets(back); }
+        }, "← Macros")
+      ),
+      el("h2", {}, "Macro not found"),
+      el("p", { class: "empty" }, name)
+    );
+  }
+
+  const src = macroSourceText(m);
+  const maxChars = 16000;
+  const clipped = src && src.length > maxChars ? (src.slice(0, maxChars) + "\n\n… (truncated)") : src;
+
   return el("div", { class: "card" },
-    el("h2", {}, "Macros"),
-    ms.length
-      ? el("table", { class: "table" },
-          el("thead", {}, el("tr", {},
-            el("th", {}, "Name"),
-            el("th", {}, "Kind"),
-            el("th", {}, "Path"),
-          )),
-          el("tbody", {},
-            ...ms.map(m => el("tr", {},
-              el("td", {}, el("code", {}, m.name)),
-              el("td", {}, m.kind),
-              el("td", {}, el("code", {}, m.path)),
-            ))
-          )
+    el("div", { class: "row" },
+      el("a", {
+        class: "btn",
+        href: routeWithFacets(back),
+        onclick: (e) => { e.preventDefault(); location.hash = routeWithFacets(back); }
+      }, "← Macros"),
+      el("span", { class: "pill" }, m.kind || "macro")
+    ),
+    el("h2", {}, m.name),
+    el("div", { class: "kvRows" },
+      el("div", { class: "kvRow" }, el("span", { class: "k" }, "Kind"), el("span", { class: "v" }, m.kind || "macro")),
+      el("div", { class: "kvRow" }, el("span", { class: "k" }, "Path"), el("span", { class: "v" }, m.path ? el("code", {}, m.path) : "—"))
+    ),
+    clipped
+      ? el("details", { class: "codeDetails" },
+          el("summary", { class: "codeSummary" }, "Show macro source"),
+          el("pre", { class: "codeBlock" }, clipped)
         )
-      : el("p", { class: "empty" }, "No macros discovered.")
+      : el("p", { class: "empty" }, "No macro source available in manifest.")
   );
 }
 
@@ -871,15 +2575,195 @@ function joinInline(nodes) {
   return wrap;
 }
 
-function renderLineage(items) {
-  if (!items || !items.length) return el("span", { class: "empty" }, "—");
-  // items are already normalized by docs.py lineage logic:
-  // { from_relation, from_column, transformed }
-  const ul = el("ul", { style: "margin:0; padding-left:16px;" });
-  for (const it of items) {
-    const label = `${it.from_relation}.${it.from_column}` + (it.transformed ? " (xform)" : "");
-    ul.appendChild(el("li", {}, el("code", {}, label)));
+// -------- Structured meta/config panel ---------------------------------
+
+function tryParseRelationParts(rel) {
+  const s = String(rel || "").trim();
+  if (!s) return {};
+  // Avoid guessing when relation contains quoting or brackets
+  if (/[`"\[\]]/.test(s)) return {};
+  const parts = s.split(".").map(p => p.trim()).filter(Boolean);
+  if (parts.length === 3) return { database: parts[0], schema: parts[1], identifier: parts[2] };
+  if (parts.length === 2) return { schema: parts[0], identifier: parts[1] };
+  return {};
+}
+
+function asStringArray(v) {
+  if (!v) return [];
+  if (Array.isArray(v)) return v.map(x => String(x)).filter(Boolean);
+  if (typeof v === "string") {
+    // allow comma-separated
+    return v.split(",").map(s => s.trim()).filter(Boolean);
   }
+  return [String(v)];
+}
+
+function renderPillList(values) {
+  const vs = asStringArray(values);
+  if (!vs.length) return el("span", { class: "empty" }, "—");
+  return joinInline(vs.map(x => el("span", { class: "pillSmall" }, x)));
+}
+
+function jsonPreview(obj, maxChars = 6000) {
+  let s;
+  try { s = JSON.stringify(obj, null, 2); }
+  catch { s = String(obj); }
+  if (s.length > maxChars) s = s.slice(0, maxChars) + "\n… (truncated)";
+  return s;
+}
+
+function renderMetaValue(v) {
+  if (v == null || v === "") return el("span", { class: "empty" }, "—");
+  if (typeof v === "boolean") return el("span", { class: "pillSmall" }, v ? "true" : "false");
+  if (typeof v === "number") return el("code", {}, String(v));
+  if (Array.isArray(v)) return renderPillList(v);
+  if (typeof v === "object") {
+    return el("details", {},
+      el("summary", { class: "codeSummary" }, "View"),
+      el("pre", { class: "mono", style: "white-space:pre-wrap; margin:8px 0 0 0;" }, jsonPreview(v))
+    );
+  }
+  const s = String(v);
+  // prefer code styling for short config-y strings
+  return s.length <= 80 && !/\s/.test(s) ? el("code", {}, s) : el("span", {}, s);
+}
+
+function pick(obj, keys) {
+  for (const k of keys) {
+    const v = obj && obj[k];
+    if (v != null && String(v).trim() !== "") return v;
+  }
+  return "";
+}
+
+function renderModelConfigMetaCard(m, { includeRaw = false } = {}) {
+  const relParts = tryParseRelationParts(m.relation);
+
+  const database = pick(m, ["database"]) || relParts.database || "";
+  const schema = pick(m, ["schema"]) || relParts.schema || "";
+  const alias = pick(m, ["alias", "identifier", "name"]) || relParts.identifier || "";
+
+  const tags = pick(m, ["tags"]) || (m.meta && (m.meta.tags || m.meta.tag)) || "";
+  const owners = pick(m, ["owners", "owner"]) || (m.meta && (m.meta.owners || m.meta.owner)) || "";
+
+  const reserved = new Set([
+    "name","kind","relation","materialized","path",
+    "database","schema","alias","identifier",
+    "tags","tag","owners","owner",
+  ]);
+
+  // Custom meta/config: show whatever else is present without duplicating known fields.
+  const custom = {};
+  const metaObj = (m.meta && typeof m.meta === "object" && !Array.isArray(m.meta)) ? m.meta : null;
+  const cfgObj = (m.config && typeof m.config === "object" && !Array.isArray(m.config)) ? m.config : null;
+
+  function addCustomFrom(obj) {
+    if (!obj) return;
+    for (const [k, v] of Object.entries(obj)) {
+      if (reserved.has(k)) continue;
+      if (v == null || v === "" || (Array.isArray(v) && !v.length)) continue;
+      if (custom[k] == null) custom[k] = v;
+    }
+  }
+  addCustomFrom(cfgObj);
+  addCustomFrom(metaObj);
+
+  const customKeys = Object.keys(custom).sort((a, b) => a.localeCompare(b));
+
+  const customDetails = customKeys.length
+    ? el("details", {},
+        el("summary", { class: "codeSummary" }, `Custom meta (${customKeys.length})`),
+        el("table", { class: "table", style: "margin-top:10px;" },
+          el("thead", {}, el("tr", {}, el("th", {}, "Key"), el("th", {}, "Value"))),
+          el("tbody", {},
+            ...customKeys.map(k =>
+              el("tr", {},
+                el("td", {}, el("code", {}, k)),
+                el("td", {}, renderMetaValue(custom[k]))
+              )
+            )
+          )
+        )
+      )
+    : el("p", { class: "empty", style: "margin:10px 0 0 0;" }, "No custom meta.");
+
+  const rawBlock = includeRaw
+    ? el("details", { class: "codeDetails", style: "margin-top:10px;" },
+        el("summary", { class: "codeSummary" }, "Raw meta/config JSON"),
+        el("pre", { class: "mono", style: "white-space:pre-wrap; margin:8px 0 0 0;" },
+          jsonPreview({ config: cfgObj || null, meta: metaObj || null })
+        )
+      )
+    : null;
+
+  return el("div", { class: "card" },
+    el("h3", {}, "Config & meta"),
+    el("div", { class: "kv" },
+      el("div", { class: "k" }, "Materialized"), el("div", {}, renderMetaValue(m.materialized || "")),
+      el("div", { class: "k" }, "Database"), el("div", {}, renderMetaValue(database)),
+      el("div", { class: "k" }, "Schema"), el("div", {}, renderMetaValue(schema)),
+      el("div", { class: "k" }, "Alias"), el("div", {}, renderMetaValue(alias)),
+      el("div", { class: "k" }, "Relation"), el("div", {}, m.relation ? el("code", {}, m.relation) : el("span", { class: "empty" }, "—")),
+      el("div", { class: "k" }, "Path"), el("div", {}, el("code", {}, m.path || "—")),
+      el("div", { class: "k" }, "Tags"), el("div", {}, renderPillList(tags)),
+      el("div", { class: "k" }, "Owners"), el("div", {}, renderPillList(owners)),
+    ),
+    customDetails,
+    rawBlock
+  );
+}
+
+function renderPythonModelCard(state, m) {
+  if ((m.kind || "sql") !== "python") return null;
+
+  const sig = (m.python_signature || "").trim();
+  const doc = (m.python_docstring || "").trim();
+  const req = m.python_requires || {};
+
+  const reqRows = Object.entries(req)
+    .sort((a,b) => a[0].localeCompare(b[0]))
+    .map(([dep, cols]) =>
+      el("tr", {},
+        el("td", {}, el("a", { href: routeWithFacets(`#/model/${escapeHashPart(dep)}`) }, dep)),
+        el("td", {}, (cols && cols.length)
+          ? el("code", {}, cols.join(", "))
+          : el("span", { class: "empty" }, "—")
+        ),
+      )
+    );
+
+  return el("div", { class: "card" },
+    el("h3", {}, "Python model"),
+    el("div", { class: "k" }, "Function signature"),
+    sig ? renderCodeBlock(sig, { wrap: true }) : el("p", { class: "empty" }, "Signature not available."),
+    el("div", { class: "k", style: "margin-top:10px;" }, "Docstring"),
+    doc ? el("pre", { class: "codeBlock codeWrap" }, doc) : el("p", { class: "empty" }, "No docstring."),
+    el("div", { class: "k", style: "margin-top:10px;" }, "Required inputs (best-effort)"),
+    reqRows.length
+      ? el("table", { class: "table" },
+          el("thead", {}, el("tr", {}, el("th", {}, "Dependency"), el("th", {}, "Required columns"))),
+          el("tbody", {}, ...reqRows)
+        )
+      : el("p", { class: "empty" }, "No required-column hints found.")
+  );
+}
+
+function renderLineage(state, items) {
+  const ul = el("ul", { class: "lineage" });
+
+  for (const it of (items || [])) {
+    const conf = (it.confidence || "inferred").toLowerCase();
+
+    ul.append(
+      el("li", {},
+        renderRelationColRef(state, it.from_relation, it.from_column),
+        " ",
+        renderConfPill(conf),
+        it.transformed ? el("span", { class: "pillSmall" }, "XFORM") : ""
+      )
+    );
+  }
+
   return ul;
 }
 
@@ -908,6 +2792,7 @@ function renderTabs(active, onPick) {
   const tabs = [
     ["overview", "Overview"],
     ["columns", "Columns"],
+    ["contract", "Contract"], 
     ["lineage", "Lineage"],
     ["code", "Code"],
     ["meta", "Meta"],
@@ -966,7 +2851,7 @@ function buildColumnsCard(state, m, colFromRoute) {
   const tools = el("div", { class: "colTools" });
 
   const qInput = el("input", {
-    class: "input",
+    class: "search",
     type: "search",
     placeholder: "Filter columns…",
     value: uiState.q || "",
@@ -1079,7 +2964,7 @@ function buildColumnsCard(state, m, colFromRoute) {
 
     const lin = c.lineage || [];
     const linNode = lin.length
-      ? renderLineage(lin)
+      ? renderLineage(state, lin)
       : el("span", { class: "empty" }, "No lineage available.");
 
     const copyName = el("button", {
@@ -1119,11 +3004,71 @@ function buildColumnsCard(state, m, colFromRoute) {
       onclick: async (e) => {
         e.stopPropagation();
         const rows = (lin || []).map(x =>
-          [x.from_relation ?? "", x.from_column ?? "", x.transformed ? "1" : "0"].join(",")
+          [x.from_relation ?? "", x.from_column ?? "", (x.confidence ?? "inferred"), x.transformed ? "1" : "0"].join(",")
         );
-        await copyText(["from_relation,from_column,transformed", ...rows].join("\n"));
+        await copyText(["from_relation,from_column,confidence,transformed", ...rows].join("\n"));
       }
     }, "Copy lineage CSV");
+
+    ensureLineageIndex(state);
+    const idx = state.lineageIndex;
+    const selfKey = colKey(m.relation || "", c.name);
+
+    const upstream = idx.forward.get(selfKey) || [];
+    const downstream = idx.reverse.get(selfKey) || [];
+
+    // dedupe downstream by model+col
+    const seenDown = new Set();
+    const downRows = [];
+    for (const e of downstream) {
+      const k = `${e.to_model}::${e.to_column}`;
+      if (seenDown.has(k)) continue;
+      seenDown.add(k);
+      downRows.push(e);
+    }
+
+    const impactNode = el("div", {},
+      el("div", { style: "margin-bottom:10px;" },
+        el("div", { class: "drawerTitle", style: "margin-bottom:6px;" }, "Upstream columns"),
+        upstream.length
+          ? el("ul", { class: "lineage" },
+              ...upstream.map(e =>
+                el("li", {},
+                  renderRelationColRef(state, e.from_relation, e.from_column),
+                  " ",
+                  renderConfPill(e.confidence),
+                  e.transformed ? el("span", { class: "pillSmall" }, "XFORM") : ""
+                )
+              )
+            )
+          : el("span", { class: "empty" }, "No upstream columns detected.")
+      ),
+
+      el("div", {},
+        el("div", { class: "drawerTitle", style: "margin-bottom:6px;" }, "Used downstream in"),
+        downRows.length
+          ? el("table", { class: "table" },
+              el("thead", {}, el("tr", {},
+                el("th", {}, "Model"),
+                el("th", {}, "Column"),
+                el("th", {}, "Confidence"),
+              )),
+              el("tbody", {},
+                ...downRows.map(e => {
+                  const href = routeWithFacets(`#/model/${escapeHashPart(e.to_model)}?tab=columns&col=${encodeURIComponent(e.to_column)}`);
+                  return el("tr", {},
+                    el("td", {},
+                      el("a", { href, onclick:(ev)=>{ ev.preventDefault(); location.hash = href; } }, e.to_model)
+                    ),
+                    el("td", {}, el("code", {}, e.to_column)),
+                    el("td", {}, renderConfPill(e.confidence)),
+                  );
+                })
+              )
+            )
+          : el("span", { class: "empty" }, "No downstream usage detected.")
+      )
+    );
 
     return el("div", { class: "drawer" },
       el("div", { class: "colTools" },
@@ -1146,6 +3091,10 @@ function buildColumnsCard(state, m, colFromRoute) {
         el("div", { class: "drawerBox" },
           el("div", { class: "drawerTitle" }, "Lineage"),
           linNode
+        ),
+        el("div", { class: "drawerBox" },
+          el("div", { class: "drawerTitle" }, "Impact analysis"),
+          impactNode
         )
       )
     );
@@ -1324,6 +3273,202 @@ function buildColumnsCard(state, m, colFromRoute) {
   card.append(el("h3", {}, `Columns (${cols.length})`), tools, table);
   renderHead();
   renderBody();
+
+  return card;
+}
+
+function buildContractCard(state, m) {
+  const withSchema = !!state.manifest.project?.with_schema;
+  const drift = computeContractDrift(m, withSchema);
+
+  const rawCols = contractColumnsFrom(m).map(normalizeContractCol).filter(Boolean);
+  const tblConstraints = contractTableConstraintsFrom(m);
+
+  // UI state per model
+  state.contractUI ||= {};
+  const uiState = (state.contractUI[m.name] ||= { q: "" });
+
+  const card = el("div", { class:"card" });
+
+  const tools = el("div", { class:"colTools" });
+  const qInput = el("input", {
+    class:"search",
+    type:"search",
+    placeholder:"Filter contract columns…",
+    value: uiState.q || "",
+    oninput: (e) => { uiState.q = e.target.value || ""; renderBody(); }
+  });
+
+  const headRow = el("div", { class:"row", style:"align-items:center; justify-content:space-between;" },
+    el("h3", { style:"margin:0;" }, "Contract"),
+    hasContract(m)
+      ? el("div", { class:"pillRow" },
+          el("span", { class:"pillSmall pillGood" }, "Contracted"),
+          drift.status === "verified"
+         ? el("span", { class:"pillSmall pillGood", title:"Contract matches warehouse schema" }, "Verified")
+         : drift.status === "drift"
+           ? el("span", { class:"pillSmall pillBad", title:"Contract differs from warehouse schema" }, "Drift detected")
+           : el("span", { class:"pillSmall pillWarn", title:"Warehouse schema not available (run with schema collection enabled)" }, "Schema unavailable"),
+          (m.contract && typeof m.contract === "object" && m.contract.enforced != null)
+            ? el("span", { class:"pillSmall" }, m.contract.enforced ? "enforced" : "not enforced")
+            : null
+        )
+      : null
+  );
+
+  tools.appendChild(qInput);
+
+  const body = el("div", {});
+
+  function renderBody() {
+    const q = (uiState.q || "").trim().toLowerCase();
+
+    const rows = rawCols
+      .filter(c => {
+        if (!q) return true;
+        const cstr = [
+          c.name,
+          c.dtype || "",
+          (c.nullable === true ? "nullable" : c.nullable === false ? "not null" : ""),
+          JSON.stringify(c.constraints || []),
+        ].join(" ").toLowerCase();
+        return cstr.includes(q);
+      })
+      .sort((a,b) => a.name.localeCompare(b.name))
+      .map(c => {
+        // Optional: show “missing/mismatch” if schema is available
+        let statusNode = null;
+        if (drift.schemaAvailable) {
+          const key = c.name.toLowerCase();
+          const rec = drift.byName.get(key);
+          if (!rec || rec.missing) {
+            statusNode = el("span", { class:"pillSmall pillBad" }, "missing");
+          } else if (rec.issues && rec.issues.length) {
+            const title = (() => {
+              const exp = rec.expected ? `${rec.expected.dtype || "—"} / ${rec.expected.nullable == null ? "—" : (rec.expected.nullable ? "nullable" : "not null")}` : "";
+              const act = rec.actual ? `${rec.actual.dtype || "—"} / ${(rec.actual.nullable ? "nullable" : "not null")}` : "";
+              return (exp && act) ? `expected: ${exp}\nactual: ${act}` : "";
+            })();
+            statusNode = el("span", { class:"pillSmall pillWarn", title }, `mismatch: ${rec.issues.join(", ")}`);
+          } else {
+            statusNode = el("span", { class:"pillSmall pillGood" }, "ok");
+          }
+        } else if (withSchema) {
+          // with_schema enabled but no columns returned for this model
+          statusNode = el("span", { class:"pillSmall pillWarn" }, "unavailable");
+        }
+
+        const colLink = routeWithFacets(
+          `#/model/${escapeHashPart(m.name)}?tab=columns&col=${encodeURIComponent(c.name)}`
+        );
+
+        return el("tr", {},
+          el("td", {},
+            el("a", {
+              href: colLink,
+              onclick: (e) => { e.preventDefault(); location.hash = colLink; },
+              style:"text-decoration:none;"
+            }, el("code", {}, c.name))
+          ),
+          el("td", {}, c.dtype ? el("code", {}, c.dtype) : el("span", { class:"empty" }, "—")),
+          el("td", {},
+            c.nullable === true ? el("span", { class:"pillSmall" }, "nullable") :
+            c.nullable === false ? el("span", { class:"pillSmall pillBad" }, "not null") :
+            el("span", { class:"empty" }, "—")
+          ),
+          el("td", {}, renderConstraintsList(c.constraints)),
+          el("td", {}, statusNode || el("span", { class:"empty" }, "—"))
+        );
+      });
+
+    const hasAnything = rawCols.length || (tblConstraints && tblConstraints.length);
+
+    body.replaceChildren(
+      !hasAnything
+        ? el("p", { class:"empty", style:"margin:10px 0 0 0;" },
+            "No contract defined for this model."
+          )
+        : el("div", {},
+            drift.status !== "none"
+            ? el("div", { style:"margin:10px 0 14px 0;" },
+                el("div", { class:"k", style:"margin-bottom:6px;" }, "Drift summary"),
+                drift.status === "unavailable"
+                  ? el("p", { class:"empty", style:"margin:0;" }, "Schema unavailable for diff. Enable schema collection to verify the contract.")
+                  : el("div", { class:"pillRow" },
+                      el("span", { class:"pillSmall" }, `missing: ${drift.missing.length}`),
+                      el("span", { class:"pillSmall" }, `extra: ${drift.extra.length}`),
+                      el("span", { class:"pillSmall" }, `mismatched: ${drift.mismatches.length}`),
+                      (!drift.constraintsComparable && rawCols.some(c => (c.constraints || []).length))
+                        ? el("span", { class:"pillSmall pillWarn", title:"Warehouse schema does not include constraints yet" }, "constraints: not verifiable")
+                        : null
+                    )
+              )
+            : null,
+
+            (tblConstraints && tblConstraints.length)
+              ? el("div", { style:"margin:10px 0 14px 0;" },
+                  el("div", { class:"k", style:"margin-bottom:6px;" }, "Table constraints"),
+                  el("div", {}, renderConstraintsList(tblConstraints))
+                )
+              : null,
+
+            (drift.status !== "unavailable" && drift.extra.length)
+              ? el("div", { style:"margin:10px 0 14px 0;" },
+                  el("div", { class:"k", style:"margin-bottom:6px;" }, "Extra columns in warehouse (not in contract)"),
+                  el("div", {},
+                    joinInline(
+                      drift.extra
+                        .slice(0, 60)
+                        .map(nm => {
+                          const href = routeWithFacets(`#/model/${escapeHashPart(m.name)}?tab=columns&col=${encodeURIComponent(nm)}`);
+                          return el("a", { href, onclick:(e)=>{ e.preventDefault(); location.hash = href; } }, nm);
+                        })
+                    ),
+                    drift.extra.length > 60 ? el("span", { class:"empty" }, ` … +${drift.extra.length - 60} more`) : null
+                  )
+                )
+              : null,
+
+            rawCols.length
+              ? el("table", { class:"table" },
+                  el("thead", {}, el("tr", {},
+                    el("th", {}, "Column"),
+                    el("th", {}, "Type"),
+                    el("th", {}, "Nullability"),
+                    el("th", {}, "Constraints"),
+                    el("th", {}, withSchema ? "Status vs actual" : "Status"),
+                  )),
+                  el("tbody", {}, ...rows)
+                )
+              : el("p", { class:"empty" }, "No contract columns specified.")
+          )
+    );
+  }
+
+  renderBody();
+  card.appendChild(headRow);
+  card.appendChild(tools);
+  card.appendChild(body);
+
+  // Small “how to define” hint (kept lightweight + collapsible)
+  card.appendChild(
+    el("details", { class:"codeDetails", style:"margin-top:12px;" },
+      el("summary", { class:"codeSummary" }, "How to define a contract"),
+      el("pre", { class:"mono", style:"white-space:pre-wrap; margin:8px 0 0 0;" },
+`# project.yml
+docs:
+  models:
+    ${m.name}:
+      contract:
+        enforced: true
+        columns:
+          some_col:
+            dtype: text
+            nullable: false
+            constraints: ["unique"]`
+      )
+    )
+  );
 
   return card;
 }
@@ -1523,6 +3668,7 @@ function mountGraph(state, host, graph, opts = {}) {
 
   function setPinned(id) {
     state.graphUI.pinned = id || "";
+    syncShareStateToUrl(state);
     applyHighlight();
   }
 
@@ -1897,6 +4043,422 @@ function mountGraph(state, host, graph, opts = {}) {
   };
 }
 
+function normRel(r) {
+  return String(r || "")
+    .trim()
+    .replace(/["`]/g, "")
+    .replace(/\s+/g, " ")
+    .toLowerCase();
+}
+function normCol(c) {
+  return String(c || "").trim().toLowerCase();
+}
+function colKey(rel, col) {
+  return `${normRel(rel)}::${normCol(col)}`;
+}
+
+function buildLineageIndex(manifest) {
+  const relToEntity = new Map();
+
+  for (const m of (manifest.models || [])) {
+    if (m.relation) relToEntity.set(normRel(m.relation), { kind: "model", name: m.name, relation: m.relation });
+  }
+  for (const s of (manifest.sources || [])) {
+    if (s.relation) relToEntity.set(normRel(s.relation), { kind: "source", source_name: s.source_name, table_name: s.table_name, relation: s.relation });
+  }
+
+  const forward = new Map(); // toKey -> edges[]
+  const reverse = new Map(); // fromKey -> edges[]
+
+  const push = (mp, k, v) => {
+    if (!mp.has(k)) mp.set(k, []);
+    mp.get(k).push(v);
+  };
+
+  for (const m of (manifest.models || [])) {
+    if (!m.relation) continue;
+    for (const c of (m.columns || [])) {
+      const toKey = colKey(m.relation, c.name);
+      for (const it of (c.lineage || [])) {
+        const fromRel = it.from_relation || "";
+        const fromCol = it.from_column || "";
+        if (!fromRel || !fromCol) continue;
+
+        const fromKey = colKey(fromRel, fromCol);
+        const edge = {
+          from_relation: fromRel,
+          from_column: fromCol,
+          confidence: (it.confidence || "inferred").toLowerCase(),
+          transformed: !!it.transformed,
+
+          // downstream target
+          to_model: m.name,
+          to_column: c.name,
+          to_relation: m.relation,
+
+          fromKey,
+          toKey,
+        };
+
+        push(forward, toKey, edge);
+        push(reverse, fromKey, edge);
+      }
+    }
+  }
+
+  return { relToEntity, forward, reverse };
+}
+
+function ensureLineageIndex(state) {
+  if (!state.lineageIndex) state.lineageIndex = buildLineageIndex(state.manifest);
+}
+
+function renderConfPill(conf) {
+  const c = String(conf || "inferred").toLowerCase();
+  if (c === "annotated") return el("span", { class: "pillSmall pillGood", title: "Annotated (manual override / YAML)" }, "ANNOTATED");
+  if (c === "inferred") return el("span", { class: "pillSmall pillWarn", title: "Inferred from SQL/Python" }, "INFERRED");
+  return el("span", { class: "pillSmall" }, c.toUpperCase());
+}
+
+function renderRelationColRef(state, rel, col) {
+  ensureLineageIndex(state);
+  const ent = state.lineageIndex.relToEntity.get(normRel(rel));
+
+  if (ent?.kind === "model") {
+    const href = routeWithFacets(`#/model/${escapeHashPart(ent.name)}?tab=columns&col=${encodeURIComponent(col)}`);
+    return el("a", {
+      href,
+      onclick: (e) => { e.preventDefault(); location.hash = href; }
+    }, `${ent.name}.${col}`);
+  }
+
+  if (ent?.kind === "source") {
+    const href = routeWithFacets(`#/source/${escapeHashPart(ent.source_name)}/${escapeHashPart(ent.table_name)}`);
+    return el("a", {
+      href,
+      onclick: (e) => { e.preventDefault(); location.hash = href; }
+    }, `${ent.source_name}.${ent.table_name}.${col}`);
+  }
+
+  return el("code", {}, `${rel}.${col}`);
+}
+
+// -------- Health helpers -----------------------------------------
+
+function fmtDateTime(v) {
+  const d = (typeof v === "number") ? new Date(v) : new Date(String(v || ""));
+  if (Number.isNaN(d.getTime())) return "";
+  return d.toLocaleString(undefined, {
+    year: "numeric", month: "short", day: "2-digit",
+    hour: "2-digit", minute: "2-digit",
+  });
+}
+
+function fmtDurationMs(ms) {
+  ms = Number(ms || 0);
+  if (!Number.isFinite(ms) || ms <= 0) return "—";
+  const s = Math.round(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60), rs = s % 60;
+  if (m < 60) return `${m}m ${rs}s`;
+  const h = Math.floor(m / 60), rm = m % 60;
+  return `${h}h ${rm}m`;
+}
+
+function testBucket(t) {
+  const st = String(t.status || t.state || "").toLowerCase();
+  if (st === "pass" || st === "ok" || st === "success") return "pass";
+  if (st === "warn" || st === "warning") return "warn";
+  if (st === "skip" || st === "skipped") return "skip";
+  // fallback if you ever store boolean ok
+  if (t.ok === true) return "pass";
+  if (t.ok === false) return "fail";
+  return "fail";
+}
+
+function buildTestIndex(state) {
+  const tests = (state.testResults?.results || state.testResults?.tests || []);
+  const relToEnt = new Map();
+
+  for (const m of (state.manifest.models || [])) {
+    if (m.relation) relToEnt.set(normRel(m.relation), { kind: "model", name: m.name });
+  }
+  for (const s of (state.manifest.sources || [])) {
+    if (s.relation) relToEnt.set(normRel(s.relation), {
+      kind: "source",
+      key: `${s.source_name}.${s.table_name}`,
+      source_name: s.source_name,
+      table_name: s.table_name,
+    });
+  }
+
+  const byModel = new Map();
+  const bySource = new Map();
+  const byModelCol = new Map();
+  const summary = { pass: 0, warn: 0, fail: 0, skip: 0, total: 0 };
+
+  for (const t of tests) {
+    const bucket = testBucket(t);
+    summary[bucket] = (summary[bucket] || 0) + 1;
+    summary.total++;
+
+    // Figure out the target entity
+    let ent = null;
+
+    if (t.model_name) {
+      ent = { kind: "model", name: String(t.model_name) };
+    } else if (t.source_name && t.table_name) {
+      ent = { kind: "source", key: `${t.source_name}.${t.table_name}`, source_name: t.source_name, table_name: t.table_name };
+    } else {
+      const rel = normRel(t.relation || t.table || t.target_relation || t.target_table || "");
+      ent = rel ? relToEnt.get(rel) : null;
+    }
+
+    if (!ent) continue;
+
+    const rec = { ...t, _bucket: bucket };
+    const col = String(t.column || t.target_column || "").trim();
+
+    if (ent.kind === "model") {
+      const arr = byModel.get(ent.name) || [];
+      arr.push(rec);
+      byModel.set(ent.name, arr);
+
+      if (col) {
+        const k = `${ent.name}.${col}`;
+        const arr2 = byModelCol.get(k) || [];
+        arr2.push(rec);
+        byModelCol.set(k, arr2);
+      }
+    } else if (ent.kind === "source") {
+      const arr = bySource.get(ent.key) || [];
+      arr.push(rec);
+      bySource.set(ent.key, arr);
+    }
+  }
+
+  return { byModel, bySource, byModelCol, summary };
+}
+
+function utestBucket(t) {
+  const st = String(t.status || t.state || "").toLowerCase();
+  if (st === "pass" || st === "ok" || st === "success") return "pass";
+  if (st === "skip" || st === "skipped") return "skip";
+  if (st === "error") return "error";
+  if (st === "fail" || st === "failed") return "fail";
+  if (t.ok === true) return "pass";
+  if (t.ok === false) return "fail";
+  return st || "fail";
+}
+
+function buildUTestIndex(state) {
+  const tests = (state.utestResults?.results || state.utestResults?.tests || []);
+  const byModel = new Map();
+  const summary = { pass: 0, fail: 0, error: 0, skip: 0, total: 0 };
+
+  for (const t of tests) {
+    const model = String(t.model || t.model_name || "").trim();
+    if (!model) continue;
+
+    const bucket = utestBucket(t);
+    summary[bucket] = (summary[bucket] || 0) + 1;
+    summary.total++;
+
+    const rec = { ...t, _bucket: bucket };
+    const arr = byModel.get(model) || [];
+    arr.push(rec);
+    byModel.set(model, arr);
+  }
+
+  return { byModel, summary };
+}
+
+function pillForRunStatus(status) {
+  const st = String(status || "").toLowerCase();
+  const cls =
+    (st === "success" || st === "ok" || st === "pass") ? "pillGood" :
+    (st === "skipped" || st === "warn" || st === "warning") ? "pillWarn" :
+    (st ? "pillBad" : "pill");
+  return el("span", { class: `pillSmall ${cls}` }, st || "unknown");
+}
+
+function pillForTestBucket(bucket) {
+  const cls =
+    bucket === "pass" ? "pillGood" :
+    bucket === "warn" ? "pillWarn" :
+    bucket === "skip" ? "" :
+    "pillBad";
+  return el("span", { class: `pillSmall ${cls}` }, bucket);
+}
+
+function pillForUTestBucket(bucket) {
+  const cls =
+    bucket === "pass" ? "pillGood" :
+    bucket === "skip" ? "" :
+    "pillBad"; // fail + error both bad
+  return el("span", { class: `pillSmall ${cls}` }, bucket);
+}
+
+function renderHealthCardForModel(state, m) {
+  const hasRuns = !!state.runResults;
+  const hasTests = !!state.testResults;
+  const hasUTests = !!state.utestResults;
+
+  if (!hasRuns && !hasTests && !hasUTests) return null;
+
+  const run = state.byRun?.[m.name] || state.byRun?.get?.(m.name);
+  const tests = state.testIndex?.byModel?.get?.(m.name) || [];
+  const utests = state.utestIndex?.byModel?.get?.(m.name) || [];
+
+  const runBlock = (() => {
+    if (!hasRuns) return el("p", { class: "empty" }, "No run results were loaded.");
+    if (!run) return el("p", { class: "empty" }, "No run info found for this model in run_results.json.");
+
+    return el("div", { class: "kv" },
+      el("div", { class: "k" }, "Status"),
+      el("div", {}, pillForRunStatus(run.status)),
+
+      el("div", { class: "k" }, "Finished"),
+      el("div", {}, fmtDateTime(run.finished_at || run.started_at) || "—"),
+
+      el("div", { class: "k" }, "Duration"),
+      el("div", {}, fmtDurationMs(run.duration_ms)),
+
+      el("div", { class: "k" }, "Rows"),
+      el("div", {}, (run.rows == null ? "—" : String(run.rows))),
+
+      el("div", { class: "k" }, "Bytes scanned"),
+      el("div", {}, (run.bytes_scanned == null ? "—" : String(run.bytes_scanned))),
+    );
+  })();
+
+  const testsBlock = (() => {
+    if (!hasTests) return el("p", { class: "empty" }, "No test results were loaded.");
+    if (!tests.length) return el("p", { class: "empty" }, "No tests recorded for this model.");
+
+    const counts = { pass: 0, warn: 0, fail: 0, skip: 0 };
+    for (const t of tests) counts[t._bucket] = (counts[t._bucket] || 0) + 1;
+
+    const header = el("div", { class: "row", style: "gap:8px; flex-wrap:wrap;" },
+      el("span", { class: "pillSmall pillGood" }, `pass ${counts.pass || 0}`),
+      el("span", { class: "pillSmall pillWarn" }, `warn ${counts.warn || 0}`),
+      el("span", { class: "pillSmall pillBad" }, `fail ${counts.fail || 0}`),
+      el("span", { class: "pillSmall" }, `skip ${counts.skip || 0}`),
+    );
+
+    const rows = tests
+      .slice()
+      .sort((a, b) => String(a._bucket).localeCompare(String(b._bucket))) // keeps fails near top-ish
+      .slice(0, 50);
+
+    return el("div", {},
+      header,
+      el("details", { style: "margin-top:10px;" },
+        el("summary", {}, "Show test details"),
+        el("table", { class: "table", style: "margin-top:10px;" },
+          el("thead", {}, el("tr", {},
+            el("th", {}, "Status"),
+            el("th", {}, "Test"),
+            el("th", {}, "Column"),
+            el("th", {}, "Message"),
+          )),
+          el("tbody", {},
+            ...rows.map(t => el("tr", {},
+              el("td", {}, pillForTestBucket(t._bucket)),
+              el("td", {}, el("code", {}, String(t.name || t.test_name || t.test || t.kind || "test"))),
+              el("td", {}, t.column ? el("code", {}, String(t.column)) : el("span", { class: "empty" }, "—")),
+              el("td", {}, String(t.message || t.msg || t.error || "")),
+            ))
+          )
+        )
+      )
+    );
+  })();
+
+  const utestsBlock = (() => {
+    if (!hasUTests) return el("p", { class: "empty" }, "No unit test results were loaded.");
+    if (!utests.length) return el("p", { class: "empty" }, "No unit tests recorded for this model.");
+
+    const counts = { pass: 0, fail: 0, error: 0, skip: 0 };
+    for (const t of utests) counts[t._bucket] = (counts[t._bucket] || 0) + 1;
+
+    const header = el("div", { class: "row", style: "gap:8px; flex-wrap:wrap;" },
+      el("span", { class: "pillSmall pillGood" }, `pass ${counts.pass || 0}`),
+      el("span", { class: "pillSmall pillBad" }, `fail ${counts.fail || 0}`),
+      el("span", { class: "pillSmall pillBad" }, `error ${counts.error || 0}`),
+      el("span", { class: "pillSmall" }, `skip ${counts.skip || 0}`),
+    );
+
+    const rows = utests
+      .slice()
+      .sort((a, b) => String(a._bucket).localeCompare(String(b._bucket)))
+      .slice(0, 50);
+
+    return el("div", {},
+      header,
+      el("details", { style: "margin-top:10px;" },
+        el("summary", {}, "Show unit test details"),
+        el("table", { class: "table", style: "margin-top:10px;" },
+          el("thead", {}, el("tr", {},
+            el("th", {}, "Status"),
+            el("th", {}, "Case"),
+            el("th", {}, "Duration"),
+            el("th", {}, "Cache"),
+            el("th", {}, "Message"),
+          )),
+          el("tbody", {},
+            ...rows.map(t => el("tr", {},
+              el("td", {}, pillForUTestBucket(t._bucket)),
+              el("td", {}, el("code", {}, String(t.case || ""))),
+              el("td", {}, fmtDurationMs(t.duration_ms)),
+              el("td", {}, t.cache_hit ? el("span", { class: "pillSmall" }, "hit") : el("span", { class: "empty" }, "—")),
+              el("td", {}, String(t.message || "")),
+            ))
+          )
+        )
+      )
+    );
+  })();
+
+  return el("div", { class: "card" },
+    el("h3", { style: "margin-top:0;" }, "Health"),
+
+    el("div", { class: "healthStack" },
+      // Row 1: Last run (always visible)
+      el("div", { class: "healthRow" },
+        el("div", { class: "healthRowHead" }, el("h4", { style:"margin:0;" }, "Last run")),
+        el("div", { class: "healthRowBody" }, runBlock)
+      ),
+
+      // Row 2: Tests (collapsible)
+      hasTests ? el("details", { class: "healthRow", open: false },
+        el("summary", { class: "healthRowSummary" },
+          el("div", { class: "healthRowHead" }, el("h4", { style:"margin:0;" }, "Tests")),
+        ),
+        el("div", { class: "healthRowBody" }, testsBlock)
+      ) : null,
+
+      // Row 3: Unit tests (collapsible)
+      hasUTests ? el("details", { class: "healthRow", open: false },
+        el("summary", { class: "healthRowSummary" },
+          el("div", { class: "healthRowHead" }, el("h4", { style:"margin:0;" }, "Unit tests")),
+        ),
+        el("div", { class: "healthRowBody" }, utestsBlock)
+      ) : null
+    )
+  );
+}
+
+async function loadOptionalJson(url) {
+  try {
+    const res = await fetch(url, { cache: "no-store" });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
 async function copyText(text) {
   try { await navigator.clipboard.writeText(String(text ?? "")); return true; }
   catch { return false; }
@@ -1913,12 +4475,25 @@ async function main() {
   app.textContent = "Loading…";
 
   const manifest = await loadManifest();
+    const [runResults, testResults, utestResults] = await Promise.all([
+    loadOptionalJson(RUN_RESULTS_URL),
+    loadOptionalJson(TEST_RESULTS_URL),
+    loadOptionalJson(UTEST_RESULTS_URL),
+  ]);
+
   const state = {
     manifest,
     filter: "",
     byModel: byName(manifest.models || [], (m) => m.name),
     bySource: byName(manifest.sources || [], (s) => `${s.source_name}.${s.table_name}`),
+    runResults,
+    testResults,
+    utestResults,
   };
+  state.byRun = byName((runResults?.results || []), (r) => r.name);
+  state.testIndex = buildTestIndex(state);
+  state.utestIndex = buildUTestIndex(state);
+
   state.sidebarMatches = { models: 0, sources: 0 };
   state.graphUI = {
     mode: "both",   // "up" | "down" | "both" | "off"
@@ -1936,6 +4511,7 @@ async function main() {
     paletteList: null,
   };
   state.ui = ui;
+  state.lineageIndex = buildLineageIndex(state.manifest);
 
   // Mount shell once
   const shell = el("div", { class: "shell" },
@@ -1956,10 +4532,15 @@ async function main() {
     paletteQuery: `fft_docs:${projKey}:palette_query`,
   };
   STORE.modelTab = `fft_docs:${projKey}:model_tab_default`;
+  STORE.modelCodeView = `fft_docs:${projKey}:model_code_view_default`;
+
   state.modelTabDefault = safeGet(STORE.modelTab) || "overview";
+  state.modelCodeViewDefault = safeGet(STORE.modelCodeView) || "";
   state.STORE = STORE;
+
   // Allow replaceHashQuery() (global) to keep lastHash in sync even when we use history.replaceState.
   window.__fftLastHashKey = STORE.lastHash;
+
 
   // Persisted UI state
   state.filter = safeGet(STORE.filter) ?? "";
@@ -1977,6 +4558,7 @@ async function main() {
 
   // Initialize model facets from URL (shareable filters)
   state.modelFacets = currentModelFacets();
+  readShareStateFromUrl(state);
 
   toastOnce({
     key: `fft_docs_search_toast_seen:${projKey}`,
@@ -2102,32 +4684,6 @@ async function main() {
     const sel = Math.max(0, Math.min(state.search.selected || 0, results.length - 1));
 
     const q = (state.search.query || "").trim();
-    // const sub = (() => {
-    //   if (r.kind === "column") {
-    //     const parts = [
-    //       "COLUMN",
-    //       r.model || "",
-    //       r.relation ? `• ${r.relation}` : "",
-    //       r.dtype ? `• ${r.dtype}` : "",
-    //     ].filter(Boolean).join(" ");
-    //     const snip = makeSnippet(r.descText || "", q, 90);
-    //     return snip ? `${parts} • ${snip}` : parts;
-    //   }
-    //   if (r.kind === "model") {
-    //     const snip = makeSnippet((r.descText || ""), q, 90);
-    //     return snip ? `MODEL • ${r.subtitle || ""} • ${snip}` : `MODEL • ${r.subtitle || ""}`;
-    //   }
-    //   if (r.kind === "source") {
-    //     const snip = makeSnippet((r.descText || ""), q, 90);
-    //     return snip ? `SOURCE • ${r.subtitle || ""} • ${snip}` : `SOURCE • ${r.subtitle || ""}`;
-    //   }
-    //   return `${(r.kind || "").toUpperCase()} • ${r.subtitle || ""}`;
-    // })();
-
-    // const right = r.kind === "column" && r.dtype
-    //   ? el("span", { class: "pill" }, r.dtype)
-    //   : el("div", { class: "kbd" }, "↵");
-
     const subFor = (r) => {
       if (r.kind === "column") {
         const parts = [
@@ -2152,8 +4708,8 @@ async function main() {
 
     const rightFor = (r) =>
       (r.kind === "column" && r.dtype)
-        ? el("span", { class: "pill" }, r.dtype)
-        : el("div", { class: "kbd" }, "↵");
+      ? el("span", { class: "pill" }, r.dtype)
+      : el("div", { class: "kbd" }, "↵");
 
     state.ui.paletteList.replaceChildren(
       ...(results.length
@@ -2357,211 +4913,285 @@ async function main() {
   }
 
   function buildSidebar() {
-    if (ui.sidebar.root) return;
+  if (ui.sidebar.root) return;
 
-    ui.sidebar.input = el("input", {
-      class: "search",
-      type: "search",
-      placeholder: "Filter sidebar… (press /)",
-      value: state.filter || "",
-      oninput: (e) => {
-        state.filter = e.target.value || "";
-        safeSet(STORE.filter, state.filter);
-        updateSidebarLists();
-      },
-      onkeydown: (e) => {
-        if (e.key !== "Enter") return;
+  ui.sidebar.input = el("input", {
+    class: "search",
+    type: "search",
+    placeholder: "Filter sidebar… (press /)",
+    value: state.filter || "",
+    oninput: (e) => {
+      state.filter = e.target.value || "";
+      safeSet(STORE.filter, state.filter);
+      syncShareStateToUrl(state);
+      updateSidebarLists();
+    },
+    onkeydown: (e) => {
+      if (e.key !== "Enter") return;
 
-        const q = (state.filter || "").trim();
-        const total = (state.sidebarMatches.models || 0) + (state.sidebarMatches.sources || 0);
+      const q = (state.filter || "").trim();
+      const total = (state.sidebarMatches.models || 0) + (state.sidebarMatches.sources || 0);
 
-        if (!q) {
-          e.preventDefault();
-          openPalette("");
-          return;
-        }
+      if (!q) {
+        e.preventDefault();
+        openPalette("");
+        return;
+      }
 
-        if (total === 0) {
-          e.preventDefault();
-          openPalette(q);
-          return;
-        }
-      },
-    });
+      if (total === 0) {
+        e.preventDefault();
+        openPalette(q);
+        return;
+      }
+    },
+  });
 
-    // --- Facets live next to the sidebar search (not under Models) ---
-    const applyFacetsToUrl = () => {
-      replaceHashQuery((q) => writeModelFacetsToQuery(q, state.modelFacets));
-      // keep state in sync (routeWithFacets reads from URL)
-      state.modelFacets = currentModelFacets();
-    };
+  // --- Facets live next to the sidebar search (not under Models) ---
+  const applyFacetsToUrl = () => {
+    replaceHashQuery((q) => writeModelFacetsToQuery(q, state.modelFacets));
+    // keep state in sync (routeWithFacets reads from URL)
+    state.modelFacets = currentModelFacets();
+  };
 
-    const debouncedPath = debounce((val) => {
-      state.modelFacets.pathPrefix = (val || "").trim();
+  const debouncedPath = debounce((val) => {
+    state.modelFacets.pathPrefix = (val || "").trim();
+    applyFacetsToUrl();
+    updateSidebarLists();
+  }, 180);
+
+  ui.sidebar.kindSqlBtn = el("button", {
+    class: "facetChip",
+    type: "button",
+    onclick: () => {
+      const kinds = new Set(state.modelFacets.kinds || ["sql", "python"]);
+      if (kinds.has("sql")) kinds.delete("sql"); else kinds.add("sql");
+      if (kinds.size === 0) { kinds.add("sql"); kinds.add("python"); } // avoid empty selection
+      state.modelFacets.kinds = Array.from(kinds);
+
       applyFacetsToUrl();
       updateSidebarLists();
-    }, 180);
+    }
+  }, "SQL");
 
-    ui.sidebar.kindSqlBtn = el("button", {
-      class: "facetChip",
-      type: "button",
-      onclick: () => {
-        const kinds = new Set(state.modelFacets.kinds || ["sql", "python"]);
-        if (kinds.has("sql")) kinds.delete("sql"); else kinds.add("sql");
-        if (kinds.size === 0) { kinds.add("sql"); kinds.add("python"); } // avoid empty selection
-        state.modelFacets.kinds = Array.from(kinds);
+  ui.sidebar.kindPyBtn = el("button", {
+    class: "facetChip",
+    type: "button",
+    onclick: () => {
+      const kinds = new Set(state.modelFacets.kinds || ["sql", "python"]);
+      if (kinds.has("python")) kinds.delete("python"); else kinds.add("python");
+      if (kinds.size === 0) { kinds.add("sql"); kinds.add("python"); }
+      state.modelFacets.kinds = Array.from(kinds);
 
-        applyFacetsToUrl();
-        updateSidebarLists();
-      }
-    }, "SQL");
+      applyFacetsToUrl();
+      updateSidebarLists();
+    }
+  }, "Python");
 
-    ui.sidebar.kindPyBtn = el("button", {
-      class: "facetChip",
-      type: "button",
-      onclick: () => {
-        const kinds = new Set(state.modelFacets.kinds || ["sql", "python"]);
-        if (kinds.has("python")) kinds.delete("python"); else kinds.add("python");
-        if (kinds.size === 0) { kinds.add("sql"); kinds.add("python"); }
-        state.modelFacets.kinds = Array.from(kinds);
+  ui.sidebar.matSelect = el("select", {
+    class: "facetSelect",
+    onchange: (e) => {
+      state.modelFacets.materialized = normalizeMaterialized(e.target.value || "");
+      applyFacetsToUrl();
+      updateSidebarLists();
+    }
+  });
 
-        applyFacetsToUrl();
-        updateSidebarLists();
-      }
-    }, "Python");
+  ui.sidebar.pathDatalist = el("datalist", { id: "modelPathPrefixes" });
+  ui.sidebar.pathInput = el("input", {
+    class: "facetInput",
+    type: "search",
+    placeholder: "Path prefix…",
+    list: "modelPathPrefixes",
+    value: state.modelFacets.pathPrefix || "",
+    oninput: (e) => debouncedPath(e.target.value || ""),
+    onkeydown: (e) => {
+      if (e.key !== "Enter") return;
+      debouncedPath.cancel();
+      state.modelFacets.pathPrefix = (e.target.value || "").trim();
+      applyFacetsToUrl();
+      updateSidebarLists();
+    }
+  });
 
-    ui.sidebar.matSelect = el("select", {
-      class: "facetSelect",
-      onchange: (e) => {
-        state.modelFacets.materialized = normalizeMaterialized(e.target.value || "");
-        applyFacetsToUrl();
-        updateSidebarLists();
-      }
-    });
+  ui.sidebar.clearFacetsBtn = el("button", {
+    class: "facetClear",
+    type: "button",
+    onclick: () => {
+      debouncedPath.cancel();
+      state.modelFacets = {
+        kinds: ["sql", "python"],
+        materialized: "",
+        pathPrefix: "",
+        tags: [],
+        owners: [],
+        groupBy: ""
+      };
+      ui.sidebar.pathInput.value = "";
+      applyFacetsToUrl();
+      updateSidebarLists();
+    }
+  }, "Clear");
 
-    ui.sidebar.pathDatalist = el("datalist", { id: "modelPathPrefixes" });
-    ui.sidebar.pathInput = el("input", {
-      class: "facetInput",
-      type: "search",
-      placeholder: "Path prefix…",
-      list: "modelPathPrefixes",
-      value: state.modelFacets.pathPrefix || "",
-      oninput: (e) => debouncedPath(e.target.value || ""),
-      onkeydown: (e) => {
-        if (e.key !== "Enter") return;
-        debouncedPath.cancel();
-        state.modelFacets.pathPrefix = (e.target.value || "").trim();
-        applyFacetsToUrl();
-        updateSidebarLists();
-      }
-    });
+  ui.sidebar.groupSelect = el("select", { class:"facetSelect", onchange:(e)=>{
+    state.modelFacets.groupBy = (e.target.value === "owner" || e.target.value === "domain") ? e.target.value : "";
+    replaceHashQuery((q)=> writeModelFacetsToQuery(q, state.modelFacets));
+    state.modelFacets = currentModelFacets();
+    updateSidebarLists();
+  }});
+  ui.sidebar.tagBox = el("div", { class:"facetChips facetChipsWrap" });
+  ui.sidebar.tagInput = el("input", { class:"facetInput", placeholder:"Add tag…", list:"modelTags" });
+  ui.sidebar.tagDatalist = el("datalist", { id:"modelTags" });
+  ui.sidebar.groupSelect.replaceChildren(
+    el("option", { value:"" }, "No grouping"),
+    el("option", { value:"owner" }, "Group: owner"),
+    el("option", { value:"domain" }, "Group: domain"),
+  );
+  ui.sidebar.tagInput.onkeydown = (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      const t = (ui.sidebar.tagInput.value || "").trim();
+      if (!t) return;
+      const tags = new Set(state.modelFacets.tags || []);
+      tags.add(t);
+      state.modelFacets.tags = Array.from(tags);
+      ui.sidebar.tagInput.value = "";
+      replaceHashQuery((q)=> writeModelFacetsToQuery(q, state.modelFacets));
+      state.modelFacets = currentModelFacets();
+      updateSidebarLists();
+    }
+    if (e.key === "Escape") {
+      e.preventDefault();
+      ui.sidebar.tagInput.value = "";
+    }
+  };
 
-    ui.sidebar.clearFacetsBtn = el("button", {
-      class: "facetClear",
-      type: "button",
-      onclick: () => {
-        debouncedPath.cancel();
-        state.modelFacets = { kinds: ["sql", "python"], materialized: "", pathPrefix: "" };
-        ui.sidebar.pathInput.value = "";
-        applyFacetsToUrl();
-        updateSidebarLists();
-      }
-    }, "Clear");
 
-    ui.sidebar.facetBox = el("div", { class: "facetBox" },
-      el("div", { class: "facetRow" },
-        el("div", { class: "facetChips" }, ui.sidebar.kindSqlBtn, ui.sidebar.kindPyBtn),
-        ui.sidebar.matSelect
-      ),
-      el("div", { class: "facetRow" },
-        ui.sidebar.pathInput,
-        ui.sidebar.clearFacetsBtn
-      ),
-      ui.sidebar.pathDatalist
+  ui.sidebar.ownerBox = el("div", { class:"facetChips facetChipsWrap" });
+  ui.sidebar.ownerInput = el("input", { class:"facetInput", placeholder:"Add owner…", list:"modelOwners" });
+  ui.sidebar.ownerDatalist = el("datalist", { id:"modelOwners" });
+
+  ui.sidebar.ownerInput.onkeydown = (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      const o = (ui.sidebar.ownerInput.value || "").trim();
+      if (!o) return;
+      const owners = new Set(state.modelFacets.owners || []);
+      owners.add(o);
+      state.modelFacets.owners = Array.from(owners);
+      ui.sidebar.ownerInput.value = "";
+      replaceHashQuery((q)=> writeModelFacetsToQuery(q, state.modelFacets));
+      state.modelFacets = currentModelFacets();
+      updateSidebarLists();
+    }
+  };
+
+  ui.sidebar.facetBox = el("div", { class:"facetBox" },
+    el("div", { class:"facetRow" },
+      el("div", { class:"facetChips" }, ui.sidebar.kindSqlBtn, ui.sidebar.kindPyBtn),
+      ui.sidebar.matSelect,
+      ui.sidebar.groupSelect
+    ),
+    el("div", { class:"facetRow" },
+      ui.sidebar.pathInput,
+      ui.sidebar.clearFacetsBtn
+    ),
+    el("div", { class:"facetRow" },
+      el("div", { class:"facetLabel" }, "Tags"),
+      ui.sidebar.tagInput
+    ),
+    ui.sidebar.tagBox,
+    ui.sidebar.tagDatalist,
+    el("div", { class:"facetRow" },
+      el("div", { class:"facetLabel" }, "Owners"),
+      ui.sidebar.ownerInput
+    ),
+    ui.sidebar.ownerBox,
+    ui.sidebar.ownerDatalist,
+    ui.sidebar.pathDatalist
+  );
+
+  const overviewSection = el("div", { class: "section" },
+    el("div", {},
+      (ui.sidebar.overviewLink = el("a", {
+        href: routeWithFacets("#/"),
+        onclick: (e) => { e.preventDefault(); location.hash = routeWithFacets("#/"); },
+        class: "itemLink",
+        style: "display:flex; align-items:center; justify-content:space-between; padding:8px 10px; border:1px solid var(--border); border-radius:12px; text-decoration:none; color:inherit;"
+      },
+        el("span", {}, "Overview (DAG)"),
+        el("span", { class: "pill" }, "Home")
+      ))
+    )
+  );
+
+  ui.sidebar.modelsTitle = el("div");
+  ui.sidebar.sourcesTitle = el("div");
+  ui.sidebar.macrosTitle = el("div");
+
+  ui.sidebar.modelsList = el("ul", { class: "list" });
+  ui.sidebar.sourcesList = el("ul", { class: "list" });
+  ui.sidebar.macrosList = el("ul", { class: "list" });
+
+  ui.sidebar.modelsSection = el("div", { class: "section" }, ui.sidebar.modelsTitle, ui.sidebar.modelsList);
+  ui.sidebar.sourcesSection = el("div", { class: "section" }, ui.sidebar.sourcesTitle, ui.sidebar.sourcesList);
+  ui.sidebar.macrosSection = el("div", { class: "section" }, ui.sidebar.macrosTitle, ui.sidebar.macrosList);
+
+  ui.sidebar.projectTitle = el("div");
+  const statRow = (k, v) =>
+    el("div", { class: "kvRow" },
+      el("span", { class: "k" }, k),
+      el("span", { class: "v" }, v)
     );
 
-    const overviewSection = el("div", { class: "section" },
-      el("div", {},
-        (ui.sidebar.overviewLink = el("a", {
-          href: routeWithFacets("#/"),
-          onclick: (e) => { e.preventDefault(); location.hash = routeWithFacets("#/"); },
-          class: "itemLink",
-          style: "display:flex; align-items:center; justify-content:space-between; padding:8px 10px; border:1px solid var(--border); border-radius:12px; text-decoration:none; color:inherit;"
-        },
-          el("span", {}, "Overview (DAG)"),
-          el("span", { class: "pill" }, "Home")
-        ))
-      )
-    );
+  ui.sidebar.projectBody = el("div", { class: "kvRows" },
+    statRow("Models", String((state.manifest.models || []).length)),
+    statRow("Sources", String((state.manifest.sources || []).length)),
+    statRow("Macros", String((state.manifest.macros || []).length)),
+    statRow("Schema", state.manifest.project?.with_schema ? "enabled" : "disabled"),
+    statRow("Generated", state.manifest.project?.generated_at || "—"),
+  );
 
-    ui.sidebar.modelsTitle = el("div");
-    ui.sidebar.sourcesTitle = el("div");
-    ui.sidebar.macrosTitle = el("div");
+  ui.sidebar.projectSection = el("div", { class: "section" },
+    ui.sidebar.projectTitle,
+    ui.sidebar.projectBody
+  );
 
-    ui.sidebar.modelsList = el("ul", { class: "list" });
-    ui.sidebar.sourcesList = el("ul", { class: "list" });
-    ui.sidebar.macrosList = el("ul", { class: "list" });
-
-    ui.sidebar.modelsSection = el("div", { class: "section" }, ui.sidebar.modelsTitle, ui.sidebar.modelsList);
-    ui.sidebar.sourcesSection = el("div", { class: "section" }, ui.sidebar.sourcesTitle, ui.sidebar.sourcesList);
-    ui.sidebar.macrosSection = el("div", { class: "section" }, ui.sidebar.macrosTitle, ui.sidebar.macrosList);
-
-    ui.sidebar.projectTitle = el("div");
-    const statRow = (k, v) =>
-      el("div", { class: "kvRow" },
-        el("span", { class: "k" }, k),
-        el("span", { class: "v" }, v)
-      );
-
-    ui.sidebar.projectBody = el("div", { class: "kvRows" },
-      statRow("Models", String((state.manifest.models || []).length)),
-      statRow("Sources", String((state.manifest.sources || []).length)),
-      statRow("Macros", String((state.manifest.macros || []).length)),
-      statRow("Schema", state.manifest.project?.with_schema ? "enabled" : "disabled"),
-      statRow("Generated", state.manifest.project?.generated_at || "—"),
-    );
-
-    ui.sidebar.projectSection = el("div", { class: "section" },
-      ui.sidebar.projectTitle,
-      ui.sidebar.projectBody
-    );
-
-    ui.sidebar.root = el(
+  ui.sidebar.root = el(
+    "div",
+    { class: "sidebar" },
+    el(
       "div",
-      { class: "sidebar" },
-      el(
-        "div",
-        { class: "brand" },
-        (ui.sidebar.brandLink = el("a", {
-          href: routeWithFacets("#/"),
-          style: "color:inherit; text-decoration:none;",
-          onclick: (e) => { e.preventDefault(); location.hash = routeWithFacets("#/"); }
-        }, el("h1", {}, state.manifest.project?.name || "Docs"))),
-        el("span", { class: "badge", title: `Generated: ${state.manifest.project?.generated_at || ""}` }, "SPA")
-      ),
-      el(
-        "div",
-        { class: "searchWrap" },
-        ui.sidebar.input,
-        el("span", { class: "searchKbd kbd" }, "/")
-      ),
-      ui.sidebar.facetBox,
-      el("div", { class: "searchTip" }, "Tip: Press / (or Ctrl+K) to search everything (models, sources, columns)."),
-      overviewSection,
-      ui.sidebar.projectSection,
-      ui.sidebar.modelsSection,
-      ui.sidebar.sourcesSection,
-      ui.sidebar.macrosSection,
-    );
+      { class: "brand" },
+      (ui.sidebar.brandLink = el("a", {
+        href: routeWithFacets("#/"),
+        style: "color:inherit; text-decoration:none;",
+        onclick: (e) => { e.preventDefault(); location.hash = routeWithFacets("#/"); }
+      }, el("h1", {}, state.manifest.project?.name || "Docs"))),
+      el("span", { class: "badge", title: `Generated: ${state.manifest.project?.generated_at || ""}` }, "SPA")
+    ),
+    el(
+      "div",
+      { class: "searchWrap" },
+      ui.sidebar.input,
+      el("span", { class: "searchKbd kbd" }, "/")
+    ),
+    ui.sidebar.facetBox,
+    el("div", { class: "searchTip" }, "Tip: Press / (or Ctrl+K) to search everything (models, sources, columns)."),
+    overviewSection,
+    ui.sidebar.projectSection,
+    ui.sidebar.modelsSection,
+    ui.sidebar.sourcesSection,
+    ui.sidebar.macrosSection,
+  );
 
-    ui.sidebarHost.replaceChildren(ui.sidebar.root);
+  ui.sidebarHost.replaceChildren(ui.sidebar.root);
 
-    // Turn titles into toggle headers
-    sectionHeader(ui.sidebar.modelsTitle, "models", "Models");
-    sectionHeader(ui.sidebar.sourcesTitle, "sources", "Sources");
-    sectionHeader(ui.sidebar.macrosTitle, "macros", "Macros");
-    sectionHeader(ui.sidebar.projectTitle, "project", "Project");
-  }
+  // Turn titles into toggle headers
+  sectionHeader(ui.sidebar.modelsTitle, "models", "Models");
+  sectionHeader(ui.sidebar.sourcesTitle, "sources", "Sources");
+  sectionHeader(ui.sidebar.macrosTitle, "macros", "Macros");
+  sectionHeader(ui.sidebar.projectTitle, "project", "Project");
+}
 
   function applySidebarCollapse() {
     const c = state.sidebarCollapsed || {};
@@ -2574,6 +5204,7 @@ async function main() {
   function updateSidebarLists() {
     // Keep facets in sync with URL in case of back/forward or manual edits
     state.modelFacets = currentModelFacets();
+    ui.sidebar.groupSelect.value = state.modelFacets.groupBy || "";
 
     const q = (state.filter || "").trim().toLowerCase();
     const models = state.manifest.models || [];
@@ -2675,6 +5306,19 @@ async function main() {
     ui.sidebar.clearFacetsBtn.textContent = activeN ? `Clear (${activeN})` : "Clear";
     ui.sidebar.clearFacetsBtn.disabled = activeN === 0;
 
+    const baseForTags = filterModelsWithFacets(modelsAfterText, { ...state.modelFacets, tags: [] });
+    const tagCounts = new Map();
+    for (const m of baseForTags) {
+      for (const t of (Array.isArray(m.tags) ? m.tags : [])) {
+        const key = String(t).trim();
+        if (!key) continue;
+        tagCounts.set(key, (tagCounts.get(key) || 0) + 1);
+      }
+    }
+    const topTags = Array.from(tagCounts.entries())
+      .sort((a,b)=> (b[1]-a[1]) || a[0].localeCompare(b[0]))
+      .slice(0, 30);
+
     // Keep "home" hrefs up-to-date for copy/open-in-new-tab
     if (ui.sidebar.brandLink) ui.sidebar.brandLink.href = routeWithFacets("#/");
     if (ui.sidebar.overviewLink) ui.sidebar.overviewLink.href = routeWithFacets("#/");
@@ -2683,20 +5327,127 @@ async function main() {
     ui.sidebar.modelsTitle.textContent = `Models (${filteredModels.length})`;
     ui.sidebar.sourcesTitle.textContent = `Sources (${filteredSources.length})`;
 
-    ui.sidebar.modelsList.replaceChildren(
-      ...filteredModels.map(m =>
-        el("li", { class: "item" },
-          el("a", {
-            href: routeWithFacets(`#/model/${escapeHashPart(m.name)}`),
-            onclick: (e) => { e.preventDefault(); location.hash = routeWithFacets(`#/model/${escapeHashPart(m.name)}`); },
-            title: [m.description_short || "", m.path ? `(${m.path})` : ""].filter(Boolean).join(" ") || m.name,
-          },
-            el("span", {}, m.name),
-            pillForKind(m.kind === "python" ? "python" : "sql")
-          )
-        )
-      )
+    ui.sidebar.tagDatalist.replaceChildren(
+      ...topTags.map(([t,n]) => el("option", { value:t }, `${t} (${n})`))
     );
+    
+    const activeTags = new Set((state.modelFacets.tags || []).map(x => x.toLowerCase()));
+
+    ui.sidebar.tagBox.replaceChildren(
+      ...topTags.map(([t,n]) => {
+        const on = activeTags.has(t.toLowerCase());
+        const b = el("button", {
+          class: `facetChip ${on ? "active" : ""}`,
+          type:"button",
+          onclick: () => {
+            const tags = new Set(state.modelFacets.tags || []);
+            if (on) {
+              // remove case-insensitively
+              for (const x of Array.from(tags)) if (String(x).toLowerCase() === t.toLowerCase()) tags.delete(x);
+            } else {
+              tags.add(t);
+            }
+            state.modelFacets.tags = Array.from(tags);
+            replaceHashQuery((q)=> writeModelFacetsToQuery(q, state.modelFacets));
+            state.modelFacets = currentModelFacets();
+            updateSidebarLists();
+          }
+        }, `${t} (${n})`);
+        return b;
+      })
+    );
+
+    const baseForOwners = filterModelsWithFacets(modelsAfterText, { ...state.modelFacets, owners: [] });
+    const ownerCounts = new Map();
+    for (const m of baseForOwners) {
+      for (const o of (Array.isArray(m.owners) ? m.owners : [])) {
+        const key = String(o).trim();
+        if (!key) continue;
+        ownerCounts.set(key, (ownerCounts.get(key) || 0) + 1);
+      }
+    }
+    const topOwners = Array.from(ownerCounts.entries())
+      .sort((a,b)=> (b[1]-a[1]) || a[0].localeCompare(b[0]))
+      .slice(0, 30);
+
+    ui.sidebar.ownerDatalist.replaceChildren(
+      ...topOwners.map(([o,n]) => el("option", { value:o }, `${o} (${n})`))
+    );
+
+    const activeOwners = new Set((state.modelFacets.owners || []).map(x => String(x).toLowerCase()));
+    ui.sidebar.ownerBox.replaceChildren(
+      ...topOwners.map(([o,n]) => {
+        const on = activeOwners.has(o.toLowerCase());
+        return el("button", {
+          class: `facetChip ${on ? "active" : ""}`,
+          type:"button",
+          onclick: () => {
+            const owners = new Set(state.modelFacets.owners || []);
+            if (on) {
+              for (const x of Array.from(owners)) if (String(x).toLowerCase() === o.toLowerCase()) owners.delete(x);
+            } else {
+              owners.add(o);
+            }
+            state.modelFacets.owners = Array.from(owners);
+            replaceHashQuery((q)=> writeModelFacetsToQuery(q, state.modelFacets));
+            state.modelFacets = currentModelFacets();
+            updateSidebarLists();
+          }
+        }, `${o} (${n})`);
+      })
+    );
+
+    function modelGroupKey(m) {
+      if (state.modelFacets.groupBy === "owner") {
+        const owners = Array.isArray(m.owners) ? m.owners : [];
+        return owners.length ? String(owners[0]) : "(unowned)";
+      }
+      if (state.modelFacets.groupBy === "domain") {
+        return (m.domain || stripModelsPrefix(m.path || "").split("/")[0] || "(no domain)");
+      }
+      return "";
+    }
+
+    function renderModelLi(m) {
+      const href = routeWithFacets(`#/model/${escapeHashPart(m.name)}`);
+      return el("li", { class:"item" },
+        el("a", {
+          href,
+          onclick:(e)=>{ e.preventDefault(); location.hash = href; },
+          title: [m.description_short || "", m.path ? `(${m.path})` : ""].filter(Boolean).join(" ") || m.name,
+        },
+          el("span", {}, m.name),
+          pillForKind(m.kind === "python" ? "python" : "sql")
+        )
+      );
+    }
+
+    if (!state.modelFacets.groupBy) {
+      ui.sidebar.modelsList.replaceChildren(...filteredModels.map(renderModelLi));
+    } else {
+      const groups = new Map();
+      for (const m of filteredModels) {
+        const k = modelGroupKey(m);
+        if (!groups.has(k)) groups.set(k, []);
+        groups.get(k).push(m);
+      }
+      const keys = Array.from(groups.keys()).sort((a,b)=> a.localeCompare(b));
+
+      const children = [];
+      for (const k of keys) {
+        const items = groups.get(k);
+        items.sort((a,b)=> (a.name||"").localeCompare(b.name||""));
+
+        children.push(el("li", { class:"groupHeader" },
+          el("div", { class:"groupHeaderRow" },
+            el("span", {}, k),
+            el("span", { class:"pill" }, String(items.length))
+          )
+        ));
+        for (const m of items) children.push(renderModelLi(m));
+      }
+      ui.sidebar.modelsList.replaceChildren(...children);
+    }
 
     ui.sidebar.sourcesList.replaceChildren(
       ...filteredSources.map(s => {
@@ -2721,8 +5472,8 @@ async function main() {
       ...macros.map(m =>
         el("li", { class: "item" },
           el("a", {
-            href: routeWithFacets("#/macros"),
-            onclick: (e) => { e.preventDefault(); location.hash = routeWithFacets("#/macros"); },
+            href: routeWithFacets(`#/macro/${escapeHashPart(m.name)}`),
+            onclick: (e) => { e.preventDefault(); location.hash = routeWithFacets(`#/macro/${escapeHashPart(m.name)}`); },
             title: m.path || m.name,
           },
             el("span", {}, m.name),
@@ -2741,30 +5492,47 @@ async function main() {
   }
 
   function updateMain() {
-    const route = parseRoute();
-    let view;
-    if (route.route === "model") view = renderModel(state, route.name, route.tab, route.col);
-    else if (route.route === "source") view = renderSource(state, route.source, route.table);
-    else if (route.route === "macros") view = renderMacros(state);
-    else view = renderHome(state);
+    try {
+      const route = parseRoute();
+      let view;
+      if (route.route === "model") view = renderModel(state, route.name, route.tab, route.col);
+      else if (route.route === "source") view = renderSource(state, route.source, route.table);
+      else if (route.route === "macro") view = renderMacro(state, route.name);
+      else if (route.route === "macros") { state.macroQuery = route.q || ""; view = renderMacros(state, state.macroQuery); }
+      else view = renderHome(state);
 
-    state.ui.mainHost.replaceChildren(view);
+      state.ui.mainHost.replaceChildren(view);
 
-    // If home view contains mermaid, render it now (same as before)
-    if (route.route === "home") {
-      queueMicrotask(async () => {
-        const target = document.getElementById("mermaidTarget");
-        if (!target) return;
-        const dagSrc = state.manifest.dag?.mermaid || "";
-        if (!state.mermaid) {
-          target.textContent = dagSrc;
-          return;
-        }
-        target.innerHTML = `<pre class="mermaid">${dagSrc}</pre>`;
-        try { await state.mermaid.run({ querySelector: "#mermaidTarget .mermaid" }); } catch {}
-      });
+      // If home view contains mermaid, render it now (same as before)
+      if (route.route === "home") {
+        queueMicrotask(async () => {
+          const target = document.getElementById("mermaidTarget");
+          if (!target) return;
+          const dagSrc = state.manifest.dag?.mermaid || "";
+          if (!state.mermaid) {
+            target.textContent = dagSrc;
+            return;
+          }
+          target.innerHTML = `<pre class="mermaid">${dagSrc}</pre>`;
+          try { await state.mermaid.run({ querySelector: "#mermaidTarget .mermaid" }); } catch {}
+        });
+      }
+    } catch (e) {
+      console.error(e);
+      state.ui.mainHost.replaceChildren(
+        el("div", { class: "main" },
+          el("div", { class: "card" },
+            el("h2", {}, "Render failed"),
+            el("p", { class: "empty" }, String(e?.message || e)),
+            el("pre", { class: "mono", style: "white-space:pre-wrap; margin:10px 0 0 0;" },
+              String(e?.stack || "")
+            )
+          )
+        )
+      );
     }
   }
+  
 
   window.addEventListener("keydown", (e) => {
     const tag = e.target?.tagName?.toLowerCase();
@@ -2783,8 +5551,11 @@ async function main() {
 
   window.addEventListener("hashchange", () => {
     safeSet(STORE.lastHash, location.hash || "#/");
-    closePalette();
-    updateSidebarLists(); // facets live in URL query params
+    closePalette();   // optional: close palette on navigation
+
+    readShareStateFromUrl(state);
+    
+    updateSidebarLists();
     updateMain();
   });
 

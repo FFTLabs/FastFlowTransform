@@ -132,6 +132,24 @@ class SeedsBlock(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+class DocsColumnConfig(BaseModel):
+    """Column-level docs surfaced in generated documentation."""
+
+    model_config = ConfigDict(extra="allow")
+
+    description: str | None = None
+
+
+class DocsModelConfig(BaseModel):
+    """Model-level docs surfaced in generated documentation."""
+
+    # Allow extra keys so docs stay flexible.
+    model_config = ConfigDict(extra="allow")
+
+    description: str | None = None
+    columns: dict[str, DocsColumnConfig] = Field(default_factory=dict)
+
+
 class DocsConfig(BaseModel):
     """
     Optional documentation-related configuration.
@@ -140,11 +158,19 @@ class DocsConfig(BaseModel):
 
     docs:
       dag_dir: "site/dag"
+      include_rendered_sql: true
+      models:
+        users:
+          description: "Raw users table"
+          columns:
+            id: "Primary key"
     """
 
     model_config = ConfigDict(extra="forbid")
 
     dag_dir: str | None = None
+    include_rendered_sql: bool = Field(default=False)
+    models: dict[str, DocsModelConfig] = Field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
