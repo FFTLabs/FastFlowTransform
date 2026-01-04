@@ -3,6 +3,21 @@ import pandas as pd
 from fastflowtransform import engine_model
 
 
+__lineage__ = {
+    "email_domain": [
+        {
+            "from_relation": "seed_users",
+            "from_column": "email",
+            "transformed": True,
+            "confidence": "annotated",
+        }
+    ],
+    "latest_signup_date": [
+        {"from_relation": "seed_users", "from_column": "signup_date", "confidence": "annotated"}
+    ],
+}
+
+
 @engine_model(
     only="duckdb",
     name="mart_latest_signup",

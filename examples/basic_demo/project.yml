@@ -16,6 +16,11 @@ docs:
           description: "Lowercased domain extracted from email."
     mart_users_by_domain.ff:
       description: "Aggregates signup counts per email domain."
+      lineage:
+        user_count:
+          transformed: true
+          from:
+            - { table: users_clean, column: user_id }
 
 # Project-level variables accessible via {{ var('key') }} inside models.
 # Example:

@@ -14,6 +14,21 @@ else:
     WindowSpec = Any
 
 
+__lineage__ = {
+    "email_domain": [
+        {
+            "from_relation": "seed_users",
+            "from_column": "email",
+            "transformed": True,
+            "confidence": "annotated",
+        }
+    ],
+    "latest_signup_date": [
+        {"from_relation": "seed_users", "from_column": "signup_date", "confidence": "annotated"}
+    ],
+}
+
+
 def _get_snowpark_utils() -> tuple[Any, Any]:
     try:
         from snowflake.snowpark import functions as _F

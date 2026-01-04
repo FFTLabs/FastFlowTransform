@@ -11,6 +11,12 @@
     ],
 ) }}
 
+/* lineage:
+  user_count   <- {{ ref('users_clean.ff') }}.user_id xform
+  first_signup <- {{ ref('users_clean.ff') }}.signup_date xform
+  last_signup  <- {{ ref('users_clean.ff') }}.signup_date xform
+*/
+
 with base as (
     select
         email_domain,

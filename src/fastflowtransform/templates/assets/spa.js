@@ -2759,7 +2759,7 @@ function renderLineage(state, items) {
         renderRelationColRef(state, it.from_relation, it.from_column),
         " ",
         renderConfPill(conf),
-        it.transformed ? el("span", { class: "pillSmall" }, "XFORM") : ""
+        it.transformed ? el("span", { class: "pillSmall" }, "TRANSFORMED") : ""
       )
     );
   }
@@ -3037,7 +3037,7 @@ function buildColumnsCard(state, m, colFromRoute) {
                   renderRelationColRef(state, e.from_relation, e.from_column),
                   " ",
                   renderConfPill(e.confidence),
-                  e.transformed ? el("span", { class: "pillSmall" }, "XFORM") : ""
+                  e.transformed ? el("span", { class: "pillSmall" }, "TRANSFORMED") : ""
                 )
               )
             )
