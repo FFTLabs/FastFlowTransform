@@ -11,6 +11,9 @@
     ],
 ) }}
 
+-- lineage: email_domain <- {{ source('crm','users') }}.email xform
+-- lineage: signup_date  <- {{ source('crm','users') }}.signup_date
+
 with raw_users as (
     select
         cast(id as integer) as user_id,

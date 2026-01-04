@@ -832,6 +832,63 @@ def _clean_lineage(lin: dict[str, list[dict[str, Any]]]) -> dict[str, list[dict[
     return out
 
 
+def _build_lineage_ref_map(models: list[ModelDoc], sources: list[SourceDoc]) -> dict[str, str]:
+    """
+    Build a mapping of "friendly"/logical relation names -> fully qualified relation strings
+    that exist in the docs manifest (so the SPA can link them).
+
+    Examples it tries to cover:
+      - model name: "users_clean.ff"          -> "<schema>.users_clean"
+      - model name without ".ff": "users_clean" -> "<schema>.users_clean"
+      - relation tail: "users_clean"          -> "<schema>.users_clean"
+      - source key: "crm.users"               -> "<schema>.seed_users"
+      - relation tail: "seed_users"           -> "<schema>.seed_users"
+    """
+    ref_map: dict[str, str] = {}
+
+    def add(alias: str | None, target_rel: str | None) -> None:
+        a = str(alias or "").strip()
+        t = str(target_rel or "").strip()
+        if not a or not t:
+            return
+        # preserve first writer to reduce accidental collisions
+        ref_map.setdefault(a, t)
+        ref_map.setdefault(a.lower(), t)
+        ref_map.setdefault(a.upper(), t)
+
+    def add_relation_tails(rel: str, target_rel: str) -> None:
+        rel_s = str(rel or "").strip()
+        if not rel_s:
+            return
+        # Add last identifier and last two identifiers (schema.table) as aliases
+        # (works for db.schema.table too)
+        parts = [p for p in rel_s.replace("`", "").replace('"', "").split(".") if p]
+        if not parts:
+            return
+        add(parts[-1], target_rel)
+        if len(parts) >= 2:
+            add(".".join(parts[-2:]), target_rel)
+
+    # Models
+    for m in models or []:
+        add(m.name, m.relation)
+        if m.name.endswith(".ff"):
+            add(m.name[:-3], m.relation)  # "users_clean.ff" -> "users_clean"
+        else:
+            add(m.name + ".ff", m.relation)  # "users_clean" -> "users_clean.ff" (best-effort)
+        add(m.relation, m.relation)
+        add_relation_tails(m.relation, m.relation)
+
+    # Sources
+    for s in sources or []:
+        add(f"{s.source_name}.{s.table_name}", s.relation)
+        add(s.table_name, s.relation)
+        add(s.relation, s.relation)
+        add_relation_tails(s.relation, s.relation)
+
+    return ref_map
+
+
 def _infer_and_attach_lineage(
     models: list[ModelDoc],
     executor: Any | None,
@@ -840,6 +897,7 @@ def _infer_and_attach_lineage(
     *,
     with_schema: bool,
     rendered_sql_by_model: dict[str, str] | None = None,
+    lineage_ref_map: dict[str, str] | None = None,
 ) -> None:
     """Best-effort Lineage ermitteln (SQL/Python) und auf Columns mappen."""
     for m in models:
@@ -870,7 +928,7 @@ def _infer_and_attach_lineage(
             elif m.kind == "python":
                 func = getattr(REGISTRY, "py_funcs", {}).get(m.name)
                 src = m.python_source or (inspect.getsource(func) if callable(func) else "")
-                inferred = infer_py_lineage(src)
+                inferred = infer_py_lineage(src, ref_map=lineage_ref_map)
                 _mark_lineage_confidence(inferred, "inferred")
         except Exception:
             inferred = {}
@@ -1076,6 +1134,8 @@ def render_site(
     cols_by_table = _collect_columns(executor) if (executor and with_schema) else {}
 
     _apply_descriptions_to_models(models, docs_meta, cols_by_table, with_schema=with_schema)
+    lineage_ref_map = _build_lineage_ref_map(models, sources)
+
     _infer_and_attach_lineage(
         models,
         executor,
@@ -1083,6 +1143,7 @@ def render_site(
         cols_by_table,
         with_schema=with_schema,
         rendered_sql_by_model=(rendered_sql_by_model or None),
+        lineage_ref_map=lineage_ref_map,
     )
 
     used_by = _reverse_deps(nodes)
