@@ -41,12 +41,19 @@ class DuckExecutor(SqlIdentifierMixin, BaseExecutor[pd.DataFrame]):
         self.con = duckdb.connect(db_path)
         self.schema = schema.strip() if isinstance(schema, str) and schema.strip() else None
         catalog_override = catalog.strip() if isinstance(catalog, str) and catalog.strip() else None
-        self.catalog = self._detect_catalog()
-        if catalog_override:
-            if self._apply_catalog_override(catalog_override):
+
+        # If a catalog override is provided, connect in-memory and attach the file once
+        # under the requested alias to avoid DuckDB's auto-attached filename catalog.
+        self.catalog: str | None = None
+        if catalog_override and db_path != ":memory:" and "://" not in db_path:
+            connected = self._connect_with_catalog_override(catalog_override)
+            if connected:
                 self.catalog = catalog_override
             else:
                 self.catalog = self._detect_catalog()
+        else:
+            self.catalog = self._detect_catalog()
+
         self.runtime_query_stats = DuckQueryStatsRuntime(self)
         self.runtime_budget = DuckBudgetRuntime(self)
         self.runtime_contracts = DuckRuntimeContracts(self)
@@ -127,6 +134,27 @@ class DuckExecutor(SqlIdentifierMixin, BaseExecutor[pd.DataFrame]):
             stats_runtime=self.runtime_query_stats,
             rowcount_extractor=_rows,
         )
+
+    def _connect_with_catalog_override(self, alias: str) -> bool:
+        """
+        Recreate the connection in-memory and attach the target DB under the
+        requested catalog alias, so DuckDB does not auto-name it after the file.
+        """
+        try:
+            resolved = str(Path(self.db_path).resolve())
+            # New in-memory connection, then attach the file once under the alias.
+            self.con = duckdb.connect()
+            self._execute_basic(
+                f"attach database '{resolved}' as {_q_ident(alias)} (READ_ONLY FALSE)"
+            )
+            self._execute_basic(f"set catalog '{alias}'")
+            return True
+        except Exception:
+            # Leave the existing connection in place; caller will fall back.
+            with suppress(Exception):
+                self.con.close()
+            self.con = duckdb.connect(self.db_path)
+            return False
 
     def _detect_catalog(self) -> str | None:
         rows = self._execute_basic("PRAGMA database_list").fetchall()
