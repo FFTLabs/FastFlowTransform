@@ -1,0 +1,5 @@
+# Packages bring in external models and macros. See docs/Packages.md.
+packages:
+  # - name: shared_macros
+  #   path: "../shared_macros"
+  #   models_dir: "models"

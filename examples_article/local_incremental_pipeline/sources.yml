@@ -1,0 +1,8 @@
+# Source declarations describe external tables.
+version: 1
+
+sources:
+  - name: raw
+    tables:
+      - name: events
+        identifier: seed_events

@@ -1,0 +1,4 @@
+dev_duckdb:
+  engine: duckdb
+  duckdb:
+    path: "{{ env('FF_DUCKDB_PATH', '.local/incremental_demo.duckdb') }}"
