@@ -120,7 +120,6 @@ class DuckRuntimeContracts(BaseRuntimeContracts):
         - Only for pandas.DataFrame
         - Uses expected_physical_schema to build CAST expressions
         """
-        print(ctx)
         mode = ctx.config.mode
         if mode == "off":
             return False

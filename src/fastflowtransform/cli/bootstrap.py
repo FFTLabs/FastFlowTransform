@@ -74,7 +74,7 @@ def _resolve_project_path(project_arg: str) -> Path:
     if not models.exists() or not models.is_dir():
         raise typer.BadParameter(
             f"Invalid project at {p}\n"
-            "Expected eian subfolder 'models/'.\n"
+            "Expected a subfolder 'models/'.\n"
             "Tip: change directory to the root and use '.'."
         )
     return p
