@@ -9,7 +9,7 @@ from typing import Annotated, Any, Literal, cast
 
 import yaml
 from jinja2 import Environment, StrictUndefined
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from fastflowtransform.errors import ProfileConfigError
@@ -31,6 +31,30 @@ class DuckDBConfig(BaseConfig):
 class PostgresConfig(BaseConfig):
     dsn: str | None = None  # e.g. postgresql+psycopg://user:pass@host:5432/db
     db_schema: str = "public"
+
+
+class ArtifactsPostgresConfig(BaseConfig):
+    dsn: str | None = None
+    db_schema: str | None = Field(default=None, alias="schema")
+
+
+class ArtifactsConfig(BaseConfig):
+    mode: Literal["files", "db", "both"] = "files"
+    engine: Literal["postgres"] = "postgres"
+    postgres: ArtifactsPostgresConfig | None = None
+
+    @model_validator(mode="after")
+    def _validate_postgres_required(self) -> ArtifactsConfig:
+        if self.mode in {"db", "both"}:
+            if self.engine != "postgres":
+                raise ValueError("artifacts.engine must be 'postgres' for db/both mode.")
+            if self.postgres is None:
+                raise ValueError("artifacts.postgres must be set for db/both mode.")
+            if not self.postgres.dsn or not str(self.postgres.dsn).strip():
+                raise ValueError("artifacts.postgres.dsn must be set for db/both mode.")
+            if not self.postgres.db_schema or not str(self.postgres.db_schema).strip():
+                raise ValueError("artifacts.postgres.db_schema must be set for db/both mode.")
+        return self
 
 
 class BigQueryConfig(BaseConfig):
@@ -67,26 +91,31 @@ class SnowflakeSnowparkConfig(BaseConfig):
 class DuckDBProfile(BaseConfig):
     engine: Literal["duckdb"]
     duckdb: DuckDBConfig
+    artifacts: ArtifactsConfig | None = None
 
 
 class PostgresProfile(BaseConfig):
     engine: Literal["postgres"]
     postgres: PostgresConfig
+    artifacts: ArtifactsConfig | None = None
 
 
 class BigQueryProfile(BaseConfig):
     engine: Literal["bigquery"]
     bigquery: BigQueryConfig
+    artifacts: ArtifactsConfig | None = None
 
 
 class DatabricksSparkProfile(BaseConfig):
     engine: Literal["databricks_spark"]
     databricks_spark: DatabricksSparkConfig
+    artifacts: ArtifactsConfig | None = None
 
 
 class SnowflakeSnowparkProfile(BaseConfig):
     engine: Literal["snowflake_snowpark"]
     snowflake_snowpark: SnowflakeSnowparkConfig
+    artifacts: ArtifactsConfig | None = None
 
 
 Profile = Annotated[
@@ -117,6 +146,11 @@ class EnvSettings(BaseSettings):
     # Postgres
     PG_DSN: str | None = None
     PG_SCHEMA: str | None = None
+
+    # Artifacts
+    ARTIFACTS_MODE: str | None = None
+    ARTIFACTS_PG_DSN: str | None = None
+    ARTIFACTS_PG_SCHEMA: str | None = None
 
     # bigquery
     BQ_PROJECT: str | None = None
@@ -341,6 +375,7 @@ def _apply_env_overrides(raw: dict[str, Any], env: EnvSettings) -> None:
     handler = handlers.get(eng)
     if handler:
         handler(raw, env)
+    _ov_artifacts(raw, env)
 
 
 def _set_if(d: dict[str, Any], key: str, value: Any | None) -> None:
@@ -413,6 +448,28 @@ def _ov_snowflake_snowpark(raw: dict[str, Any], env: EnvSettings) -> None:
             sf["allow_create_schema"] = acs.strip().lower() in {"1", "true", "yes", "on"}
         else:
             sf["allow_create_schema"] = bool(acs)
+
+
+def _ov_artifacts(raw: dict[str, Any], env: EnvSettings) -> None:
+    mode = getattr(env, "ARTIFACTS_MODE", None)
+    pg_dsn = getattr(env, "ARTIFACTS_PG_DSN", None)
+    pg_schema = getattr(env, "ARTIFACTS_PG_SCHEMA", None)
+    if mode is None and pg_dsn is None and pg_schema is None:
+        return
+
+    artifacts = raw.setdefault("artifacts", {})
+    if mode is not None:
+        artifacts["mode"] = mode
+
+    engine = artifacts.get("engine") or "postgres"
+    artifacts["engine"] = engine
+
+    if engine == "postgres":
+        pg = artifacts.setdefault("postgres", {})
+        if pg_dsn is not None:
+            pg["dsn"] = pg_dsn
+        if pg_schema is not None:
+            pg["db_schema"] = pg_schema
 
 
 # ---------- Sanity Checks ----------

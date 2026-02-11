@@ -41,6 +41,10 @@ def docgen(
         out.mkdir(parents=True, exist_ok=True)
 
     ctx = _prepare_context(project, env_name, engine, vars)
+    if (ctx.artifacts_mode or "files").strip().lower() == "db":
+        raise typer.BadParameter(
+            "Docs generation is disabled when artifacts.mode=db (no asset files allowed)."
+        )
     ex, *_ = ctx.make_executor()
     dag_out = _resolve_dag_out_dir(ctx.project, out)
     dag_out.mkdir(parents=True, exist_ok=True)

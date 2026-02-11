@@ -14,6 +14,8 @@ import yaml
 from dotenv import dotenv_values
 from jinja2 import Environment
 
+from fastflowtransform.artifacts.config import resolve_artifacts_db
+from fastflowtransform.artifacts.postgres_store import PostgresArtifactsStore
 from fastflowtransform.config.budgets import BudgetsConfig, load_budgets_config
 from fastflowtransform.contracts.core import _load_project_contracts, load_contracts
 from fastflowtransform.core import REGISTRY
@@ -32,15 +34,31 @@ from fastflowtransform.settings import (
 @dataclass
 class CLIContext:
     project: Path
+    env_name: str
     jinja_env: Environment
     env_settings: EnvSettings
     profile: Profile
     budgets_cfg: BudgetsConfig | None = None
+    artifacts_mode: str = "files"
+    artifacts_pg_dsn: str | None = None
+    artifacts_pg_schema: str | None = None
 
     def make_executor(self) -> tuple[BaseExecutor, Callable, Callable]:
         executor, run_sql, run_py = _make_executor(self.profile, self.jinja_env)
         self._configure_budget_limit(executor)
         return executor, run_sql, run_py
+
+    def make_artifacts_store(self) -> PostgresArtifactsStore | None:
+        """
+        Create a PostgresArtifactsStore if artifacts.mode is 'db' or 'both'.
+        Warn+continue behavior is applied at call sites (or via store.safe_call).
+        """
+        mode = (self.artifacts_mode or "files").lower().strip()
+        if mode not in ("db", "both"):
+            return None
+        if not self.artifacts_pg_dsn or not self.artifacts_pg_schema:
+            return None
+        return PostgresArtifactsStore(dsn=self.artifacts_pg_dsn, schema=self.artifacts_pg_schema)
 
     def _configure_budget_limit(self, executor: Any) -> None:
         if executor is None or not hasattr(executor, "configure_query_budget_limit"):
@@ -300,12 +318,27 @@ def _prepare_context(
     except Exception as exc:
         raise typer.BadParameter(f"Failed to parse budgets.yml: {exc}") from exc
 
+    # ---- artifacts DB config (profiles.yml: <env>.artifacts.*) ----
+    artifacts_mode = os.getenv("FF_ARTIFACTS_MODE", "").strip().lower() or "files"
+    artifacts_pg_dsn = os.getenv("FF_ARTIFACTS_PG_DSN")
+    artifacts_pg_schema = os.getenv("FF_ARTIFACTS_PG_SCHEMA")
+
+    resolved = resolve_artifacts_db(proj, env_name)
+    if resolved:
+        artifacts_mode = resolved.mode or artifacts_mode
+        artifacts_pg_dsn = artifacts_pg_dsn or resolved.dsn
+        artifacts_pg_schema = artifacts_pg_schema or resolved.db_schema
+
     return CLIContext(
         project=proj,
+        env_name=env_name,
         jinja_env=jenv,
         env_settings=env_settings,
         profile=prof,
         budgets_cfg=budgets_cfg,
+        artifacts_mode=artifacts_mode,
+        artifacts_pg_dsn=artifacts_pg_dsn,
+        artifacts_pg_schema=artifacts_pg_schema,
     )
 
 

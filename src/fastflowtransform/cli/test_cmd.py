@@ -4,7 +4,6 @@ from __future__ import annotations
 import re
 import time
 from collections.abc import Callable, Iterable, Mapping
-from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -12,7 +11,8 @@ from typing import Any
 
 import typer
 
-from fastflowtransform.artifacts import TestResult, write_test_results
+from fastflowtransform.artifacts import TestResult
+from fastflowtransform.artifacts.emitter import emit_test_results
 from fastflowtransform.cli.bootstrap import _prepare_context, configure_executor_contracts
 from fastflowtransform.cli.options import (
     EngineOpt,
@@ -511,28 +511,30 @@ def test(
 
     finished_at = datetime.now(UTC).isoformat(timespec="seconds")
 
-    # Persist for docs (best-effort; never fail the command because of artifact IO)
-    with suppress(Exception):
-        write_test_results(
-            ctx.project,
-            started_at=started_at,
-            finished_at=finished_at,
-            results=[
-                TestResult(
-                    kind=r.kind,
-                    table=r.table,
-                    relation=r.relation,
-                    column=r.column,
-                    ok=bool(r.ok),
-                    severity=str(r.severity),
-                    duration_ms=int(r.ms),
-                    msg=r.msg,
-                    param_str=r.param_str,
-                    example_sql=r.example_sql,
-                )
-                for r in results
-            ],
-        )
+    emit_test_results(
+        ctx.project,
+        artifacts_mode=ctx.artifacts_mode,
+        artifacts_store=ctx.make_artifacts_store(),
+        env_name=ctx.env_name,
+        model_engine=getattr(ctx.profile, "engine", None),
+        started_at=started_at,
+        finished_at=finished_at,
+        results=[
+            TestResult(
+                kind=r.kind,
+                table=r.table,
+                relation=r.relation,
+                column=r.column,
+                ok=bool(r.ok),
+                severity=str(r.severity),
+                duration_ms=int(r.ms),
+                msg=r.msg,
+                param_str=r.param_str,
+                example_sql=r.example_sql,
+            )
+            for r in results
+        ],
+    )
 
     # Exit code: count only ERROR fails
     failed = sum((not r.ok) and (r.severity != "warn") for r in results)

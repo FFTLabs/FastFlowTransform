@@ -1077,7 +1077,10 @@ def render_site(
     spa: bool = True,
     legacy_pages: bool = False,
     include_rendered_sql: bool | None = None,
+    allow_assets: bool = True,
 ) -> None:
+    if not allow_assets:
+        raise RuntimeError("Docs generation disabled when assets are not allowed.")
     out_dir.mkdir(parents=True, exist_ok=True)
     _copy_template_assets(out_dir)
     env = _init_jinja()

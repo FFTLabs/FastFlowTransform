@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import os
 from collections.abc import Callable, Iterable
+from pathlib import Path
 from typing import Any, cast
 
+from fastflowtransform.artifacts.config import resolve_artifacts_db
+from fastflowtransform.artifacts.postgres_store import PostgresArtifactsStore
 from fastflowtransform.core import REGISTRY, relation_for
 
 
@@ -54,8 +58,7 @@ def _build_predicates(tokens: list[str]) -> list[Callable[[Any], bool]]:
         wrn: set[str] = set()
         try:
             proj = REGISTRY.get_project_dir()
-            path = proj / ".fastflowtransform" / "target" / "run_results.json"
-            data = json.loads(path.read_text(encoding="utf-8"))
+            data = _load_run_results_from_files_or_db(proj)
             for r in data.get("results") or []:
                 name = r.get("name")
                 status = (r.get("status") or "").lower()
@@ -135,6 +138,36 @@ def _build_predicates(tokens: list[str]) -> list[Callable[[Any], bool]]:
                 )
             )
     return preds
+
+
+def _load_run_results_from_files_or_db(project_dir: Any) -> dict[str, Any]:
+    project_dir = Path(project_dir)
+    # 1) Try local file first
+    path = project_dir / ".fastflowtransform" / "target" / "run_results.json"
+    if path.exists():
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    # 2) Fallback to DB if configured
+    env_name = os.getenv("FF_ENV") or "dev"
+    engine = REGISTRY._current_engine()
+    mode = os.getenv("FF_ARTIFACTS_MODE", "").strip().lower()
+
+    dsn = os.getenv("FF_ARTIFACTS_PG_DSN")
+    schema = os.getenv("FF_ARTIFACTS_PG_SCHEMA")
+
+    if not dsn or not schema:
+        resolved = resolve_artifacts_db(project_dir, env_name)
+        if resolved:
+            mode = mode or resolved.mode
+            dsn = dsn or resolved.dsn
+            schema = schema or resolved.db_schema
+
+    if mode != "db" or not dsn or not schema:
+        return {}
+
+    store = PostgresArtifactsStore(dsn=dsn, schema=schema)
+    payload = store.get_latest_artifact("run_results", env_name, engine)
+    return payload if isinstance(payload, dict) else {}
 
 
 def _downstream_closure(names: set[str]) -> set[str]:

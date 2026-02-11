@@ -18,6 +18,13 @@ dev_postgres:
     dsn: "{{ env('FF_PG_DSN') }}"
     db_schema: "{{ env('FF_PG_SCHEMA', 'public') }}"
 
+  artifacts:
+    mode: both          # files | db | both   (default: files)
+    engine: postgres    # currently only postgres supported
+    postgres:
+      dsn: "{{ env('FF_PG_DSN') }}"
+      db_schema: "{{ env('FF_PG_SCHEMA', 'public') }}"
+
 dev_postgres_utest:
   engine: postgres        # same engine
   postgres:
