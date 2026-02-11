@@ -34,6 +34,7 @@ class PostgresConfig(BaseConfig):
 
 
 class ArtifactsPostgresConfig(BaseConfig):
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
     dsn: str | None = None
     db_schema: str | None = Field(default=None, alias="schema")
 

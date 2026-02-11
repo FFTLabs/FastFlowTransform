@@ -113,7 +113,7 @@ class PostgresArtifactsStore:
         payload = meta or {}
         sql = """
         INSERT INTO ff_artifacts_runs (run_id, env_name, model_engine, meta)
-        VALUES (:run_id, :env_name, :model_engine, :meta::jsonb)
+        VALUES (:run_id, :env_name, :model_engine, CAST(:meta AS jsonb))
         ON CONFLICT (run_id) DO UPDATE
         SET env_name = EXCLUDED.env_name,
             model_engine = EXCLUDED.model_engine,
@@ -142,7 +142,7 @@ class PostgresArtifactsStore:
         # 1) raw
         raw_sql = """
         INSERT INTO ff_artifacts_raw (run_id, artifact_type, payload)
-        VALUES (:run_id, :artifact_type, :payload::jsonb)
+        VALUES (:run_id, :artifact_type, CAST(:payload AS jsonb))
         ON CONFLICT (run_id, artifact_type) DO UPDATE
         SET payload = EXCLUDED.payload,
             inserted_at = now()
@@ -166,7 +166,7 @@ class PostgresArtifactsStore:
 
         rec_sql = """
         INSERT INTO ff_artifacts_records (run_id, artifact_type, record_type, record_id, payload)
-        VALUES (:run_id, :artifact_type, :record_type, :record_id, :payload::jsonb)
+        VALUES (:run_id, :artifact_type, :record_type, :record_id, CAST(:payload AS jsonb))
         ON CONFLICT (run_id, artifact_type, record_type, record_id) DO UPDATE
         SET payload = EXCLUDED.payload,
             inserted_at = now()

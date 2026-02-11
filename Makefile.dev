@@ -65,3 +65,16 @@ export-demo:
 
 show-structure:
 	tree -a -I '.git|.venv|__pycache__|.pytest_cache|.mypy_cache|.ruff_cache|node_modules|dist|build|htmlcov|site|.fastflowtransform|.DS_Store|.idea|.vscode|.local|metastore_db|.uv-cache|_exports|_scripts|articles|examples_article|tickets'
+
+spinup-pg:
+	docker rm -f ff_pg
+	docker volume rm pgdata
+	docker volume create pgdata
+
+	docker run -d --name ff_pg \
+	-e POSTGRES_USER=postgres \
+	-e POSTGRES_PASSWORD=postgres \
+	-e POSTGRES_DB=ffdb \
+	-p 5432:5432 \
+	-v pgdata:/var/lib/postgresql/data \
+	postgres:17
