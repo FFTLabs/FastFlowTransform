@@ -8,6 +8,27 @@
   <link rel="stylesheet" href="assets/spa.css"/>
   <script>
     window.__FFT_MANIFEST_PATH__ = "{{ manifest_path }}";
+    {% if artifacts_api_base is defined and artifacts_api_base %}
+    window.__FFT_ARTIFACTS_API_BASE__ = "{{ artifacts_api_base }}";
+    {% endif %}
+    {% if artifacts_env is defined and artifacts_env %}
+    window.__FFT_ENV__ = "{{ artifacts_env }}";
+    {% endif %}
+    {% if artifacts_engine is defined and artifacts_engine %}
+    window.__FFT_ENGINE__ = "{{ artifacts_engine }}";
+    {% endif %}
+    {% if artifacts_run_id is defined and artifacts_run_id %}
+    window.__FFT_RUN_ID__ = "{{ artifacts_run_id }}";
+    {% endif %}
+    {% if run_results_path is defined and run_results_path %}
+    window.__FFT_RUN_RESULTS_PATH__ = "{{ run_results_path }}";
+    {% endif %}
+    {% if test_results_path is defined and test_results_path %}
+    window.__FFT_TEST_RESULTS_PATH__ = "{{ test_results_path }}";
+    {% endif %}
+    {% if utest_results_path is defined and utest_results_path %}
+    window.__FFT_UTEST_RESULTS_PATH__ = "{{ utest_results_path }}";
+    {% endif %}
   </script>
 </head>
 <body>

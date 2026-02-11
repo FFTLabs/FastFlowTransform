@@ -58,6 +58,34 @@ Validation rules:
 - `mode: files` does not require any Postgres settings.
 - `mode: db` or `both` requires `artifacts.engine=postgres` and a valid `dsn` + `db_schema`.
 
+Frontend contract (SPA data sources):
+- The SPA reads globals (if present) to resolve artifact URLs:
+  - `__FFT_MANIFEST_PATH__`
+  - `__FFT_RUN_RESULTS_PATH__`
+  - `__FFT_TEST_RESULTS_PATH__`
+  - `__FFT_UTEST_RESULTS_PATH__`
+  - `__FFT_ARTIFACTS_API_BASE__`
+  - `__FFT_ENV__`
+  - `__FFT_ENGINE__`
+  - `__FFT_RUN_ID__`
+- URL resolution order:
+  1. Explicit `__FFT_*_PATH__` globals
+  2. API base + params (`__FFT_ARTIFACTS_API_BASE__` with env/engine/run_id)
+  3. Query params (`?manifest=...&run=...&test=...&utest=...`)
+  4. Local assets (`assets/*.json`)
+- Expected endpoint shapes (examples):
+  - Latest by env/engine:
+    - `/artifacts/latest/docs_manifest?env=<env>&engine=<engine>`
+    - `/artifacts/latest/run_results?env=<env>&engine=<engine>`
+    - `/artifacts/latest/test_results?env=<env>&engine=<engine>`
+    - `/artifacts/latest/utest_results?env=<env>&engine=<engine>`
+  - Specific run:
+    - `/artifacts/run/<run_id>/docs_manifest`
+    - `/artifacts/run/<run_id>/run_results`
+    - `/artifacts/run/<run_id>/test_results`
+    - `/artifacts/run/<run_id>/utest_results`
+- Response payload can be either raw JSON or wrapped as `{ payload: {...} }` or `{ data: {...} }`.
+
 ### Classic (DAG-only)
 
 ```bash

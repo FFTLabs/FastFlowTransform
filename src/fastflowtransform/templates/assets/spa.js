@@ -1,7 +1,59 @@
-const MANIFEST_URL = window.__FFT_MANIFEST_PATH__ || "assets/docs_manifest.json";
-const RUN_RESULTS_URL  = window.__FFT_RUN_RESULTS_PATH__  || "assets/run_results.json";
-const TEST_RESULTS_URL = window.__FFT_TEST_RESULTS_PATH__ || "assets/test_results.json";
-const UTEST_RESULTS_URL = window.__FFT_UTEST_RESULTS_PATH__ || "assets/utest_results.json";
+function resolveArtifactUrls() {
+  const qs = new URLSearchParams(window.location.search || "");
+  const qsManifest = qs.get("manifest");
+  const qsRun = qs.get("run");
+  const qsTest = qs.get("test");
+  const qsUTest = qs.get("utest");
+
+  const globalManifest = window.__FFT_MANIFEST_PATH__;
+  const globalRun = window.__FFT_RUN_RESULTS_PATH__;
+  const globalTest = window.__FFT_TEST_RESULTS_PATH__;
+  const globalUTest = window.__FFT_UTEST_RESULTS_PATH__;
+
+  const apiBase = window.__FFT_ARTIFACTS_API_BASE__;
+  const envName = window.__FFT_ENV__;
+  const engineName = window.__FFT_ENGINE__;
+  const runId = window.__FFT_RUN_ID__;
+
+  function apiUrl(kind) {
+    if (!apiBase) return null;
+    if (runId) return `${apiBase}/artifacts/run/${encodeURIComponent(runId)}/${kind}`;
+    const params = new URLSearchParams();
+    if (envName) params.set("env", envName);
+    if (engineName) params.set("engine", engineName);
+    const suffix = params.toString();
+    return `${apiBase}/artifacts/latest/${kind}${suffix ? "?" + suffix : ""}`;
+  }
+
+  return {
+    manifest:
+      globalManifest ||
+      apiUrl("docs_manifest") ||
+      qsManifest ||
+      "assets/docs_manifest.json",
+    run_results:
+      globalRun ||
+      apiUrl("run_results") ||
+      qsRun ||
+      "assets/run_results.json",
+    test_results:
+      globalTest ||
+      apiUrl("test_results") ||
+      qsTest ||
+      "assets/test_results.json",
+    utest_results:
+      globalUTest ||
+      apiUrl("utest_results") ||
+      qsUTest ||
+      "assets/utest_results.json",
+  };
+}
+
+const ARTIFACT_URLS = resolveArtifactUrls();
+const MANIFEST_URL = ARTIFACT_URLS.manifest;
+const RUN_RESULTS_URL = ARTIFACT_URLS.run_results;
+const TEST_RESULTS_URL = ARTIFACT_URLS.test_results;
+const UTEST_RESULTS_URL = ARTIFACT_URLS.utest_results;
 
 function el(tag, attrs = {}, ...children) {
   const n = document.createElement(tag);
@@ -4312,7 +4364,7 @@ function renderHealthCardForModel(state, m) {
 
   const runBlock = (() => {
     if (!hasRuns) return el("p", { class: "empty" }, "No run results were loaded.");
-    if (!run) return el("p", { class: "empty" }, "No run info found for this model in run_results.json.");
+    if (!run) return el("p", { class: "empty" }, "No run info found for this model.");
 
     return el("div", { class: "kv" },
       el("div", { class: "k" }, "Status"),
@@ -4453,7 +4505,12 @@ async function loadOptionalJson(url) {
   try {
     const res = await fetch(url, { cache: "no-store" });
     if (!res.ok) return null;
-    return await res.json();
+    const body = await res.json();
+    if (body && typeof body === "object") {
+      if (body.payload && typeof body.payload === "object") return body.payload;
+      if (body.data && typeof body.data === "object") return body.data;
+    }
+    return body;
   } catch {
     return null;
   }
@@ -4467,7 +4524,12 @@ async function copyText(text) {
 async function loadManifest() {
   const res = await fetch(MANIFEST_URL, { cache: "no-store" });
   if (!res.ok) throw new Error(`Failed to load manifest: ${res.status}`);
-  return await res.json();
+  const body = await res.json();
+  if (body && typeof body === "object") {
+    if (body.payload && typeof body.payload === "object") return body.payload;
+    if (body.data && typeof body.data === "object") return body.data;
+  }
+  return body;
 }
 
 async function main() {
