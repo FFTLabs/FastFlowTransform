@@ -15,13 +15,8 @@ from uuid import uuid4
 
 import typer
 
-from fastflowtransform.artifacts import (
-    RunNodeResult,
-    load_last_run_durations,
-    write_catalog,
-    write_manifest,
-    write_run_results,
-)
+from fastflowtransform.artifacts import RunNodeResult, load_last_run_durations
+from fastflowtransform.artifacts.emitter import emit_run_artifacts
 from fastflowtransform.cache import FingerprintCache, can_skip_node
 from fastflowtransform.ci.changed_since import (
     compute_affected_models,
@@ -1652,7 +1647,13 @@ def _run_schedule(
 
     # Best-effort: use previous run timings to batch small models per worker.
     try:
-        prev_durations_s = load_last_run_durations(ctx.project)
+        prev_durations_s = load_last_run_durations(
+            ctx.project,
+            artifacts_mode=ctx.artifacts_mode,
+            artifacts_store=ctx.make_artifacts_store(),
+            env_name=ctx.env_name,
+            model_engine=getattr(ctx.profile, "engine", None),
+        )
     except Exception:
         prev_durations_s = {}
 
@@ -1686,8 +1687,6 @@ def _write_artifacts(
     engine_: _RunEngine,
     budgets: dict[str, Any] | None,
 ) -> None:
-    write_manifest(ctx.project)
-
     node_results: list[RunNodeResult] = []
     failed = result.failed or {}
     all_names = set(result.per_node_s.keys()) | set(failed.keys())
@@ -1720,21 +1719,29 @@ def _write_artifacts(
             )
         )
 
-    write_run_results(
+    execu = None
+    try:
+        execu, _, _ = ctx.make_executor()
+    except Exception:
+        execu = None
+
+    emit_run_artifacts(
         ctx.project,
+        artifacts_mode=ctx.artifacts_mode,
+        artifacts_store=ctx.make_artifacts_store(),
+        env_name=ctx.env_name,
+        model_engine=getattr(ctx.profile, "engine", None),
         started_at=started_at,
         finished_at=finished_at,
         node_results=node_results,
         budgets=budgets,
+        executor=execu,
+        include_catalog=execu is not None,
     )
 
 
 def _attempt_catalog(ctx: CLIContext) -> None:
-    try:
-        execu, _, _ = ctx.make_executor()
-        write_catalog(ctx.project, execu)
-    except Exception:
-        pass
+    return
 
 
 def _emit_logs_and_errors(logq: LogQueue, result: ScheduleResult, engine_: _RunEngine) -> None:

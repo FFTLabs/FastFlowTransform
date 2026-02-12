@@ -69,17 +69,15 @@ def _json_dump(path: Path, obj: Any) -> None:
 # ---------- MANIFEST ----------
 
 
-def write_manifest(project_dir: Path) -> Path:
+def build_manifest(project_dir: Path) -> dict[str, Any]:
     """
-    Write manifest.json with minimal compatibility:
+    Build manifest.json payload with minimal compatibility:
       - nodes: {name, path, deps, materialized, relation, kind}
       - macros: {name -> path}
       - sources: verbatim REGISTRY.sources
       - generated_at
     """
     project_dir = Path(project_dir)
-    out_dir = _target_dir(project_dir)
-    manifest_path = out_dir / "manifest.json"
 
     nodes = {}
     for name, node in sorted(REGISTRY.nodes.items(), key=lambda x: x[0]):
@@ -106,6 +104,14 @@ def write_manifest(project_dir: Path) -> Path:
         "macros": macros,
         "sources": REGISTRY.sources or {},
     }
+    return data
+
+
+def write_manifest(project_dir: Path) -> Path:
+    project_dir = Path(project_dir)
+    out_dir = _target_dir(project_dir)
+    manifest_path = out_dir / "manifest.json"
+    data = build_manifest(project_dir)
     _json_dump(manifest_path, data)
     return manifest_path
 
@@ -129,22 +135,18 @@ class RunNodeResult:
     query_duration_ms: int | None = None
 
 
-def write_run_results(
+def build_run_results(
     project_dir: Path,
     *,
     started_at: str,
     finished_at: str,
     node_results: list[RunNodeResult],
     budgets: dict[str, Any] | None = None,
-) -> Path:
+) -> dict[str, Any]:
     """
-    Write run_results.json containing run envelope and per-node results.
+    Build run_results.json payload containing run envelope and per-node results.
     Optionally includes a 'budgets' summary block.
     """
-    project_dir = Path(project_dir)
-    out_dir = _target_dir(project_dir)
-    results_path = out_dir / "run_results.json"
-
     data = {
         "metadata": {"tool": "fastflowtransform", "generated_at": _iso_now()},
         "run_started_at": started_at,
@@ -155,6 +157,27 @@ def write_run_results(
     if budgets is not None:
         data["budgets"] = budgets
 
+    return data
+
+
+def write_run_results(
+    project_dir: Path,
+    *,
+    started_at: str,
+    finished_at: str,
+    node_results: list[RunNodeResult],
+    budgets: dict[str, Any] | None = None,
+) -> Path:
+    project_dir = Path(project_dir)
+    out_dir = _target_dir(project_dir)
+    results_path = out_dir / "run_results.json"
+    data = build_run_results(
+        project_dir,
+        started_at=started_at,
+        finished_at=finished_at,
+        node_results=node_results,
+        budgets=budgets,
+    )
     _json_dump(results_path, data)
     return results_path
 
@@ -288,14 +311,12 @@ def _try_columns_for(executor: Any, table: str) -> list[dict[str, Any]]:
     return []
 
 
-def write_catalog(project_dir: Path, executor: Any) -> Path:
+def build_catalog(project_dir: Path, executor: Any) -> dict[str, Any]:
     """
-    Write catalog.json:
+    Build catalog.json payload:
       - relations: map of relation -> {columns:[{name,dtype,nullable}]}
     """
     project_dir = Path(project_dir)
-    out_dir = _target_dir(project_dir)
-    catalog_path = out_dir / "catalog.json"
 
     relations: dict[str, Any] = {}
     rel_names = sorted([relation_for(n) for n in REGISTRY.nodes])
@@ -311,6 +332,14 @@ def write_catalog(project_dir: Path, executor: Any) -> Path:
         "metadata": {"tool": "fastflowtransform", "generated_at": _iso_now()},
         "relations": relations,
     }
+    return data
+
+
+def write_catalog(project_dir: Path, executor: Any) -> Path:
+    project_dir = Path(project_dir)
+    out_dir = _target_dir(project_dir)
+    catalog_path = out_dir / "catalog.json"
+    data = build_catalog(project_dir, executor)
     _json_dump(catalog_path, data)
     return catalog_path
 
@@ -318,21 +347,37 @@ def write_catalog(project_dir: Path, executor: Any) -> Path:
 # ---------- READ DURATIONS ----------
 
 
-def load_last_run_durations(project_dir: Path) -> dict[str, float]:
+def load_last_run_durations(
+    project_dir: Path,
+    *,
+    artifacts_mode: str | None = None,
+    artifacts_store: Any | None = None,
+    env_name: str | None = None,
+    model_engine: str | None = None,
+) -> dict[str, float]:
     """
     Best-effort reader for the last run_results.json.
 
     Returns: { model_name: duration_in_seconds }.
     On any error or missing file: {}.
     """
-    path = _target_dir(project_dir)
-    if not path.exists():
-        return {}
+    mode = (artifacts_mode or "files").strip().lower()
+    raw: dict[str, Any] | None = None
 
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    if mode == "db" and artifacts_store is not None:
+        try:
+            raw = artifacts_store.get_latest_artifact("run_results", env_name, model_engine)
+        except Exception:
+            return {}
+
+    if raw is None:
+        path = _target_dir(project_dir)
+        if not path.exists():
+            return {}
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
 
     # tolerate a few possible shapes
     items: list[dict[str, Any]] = (
@@ -367,6 +412,25 @@ class TestResult:
     example_sql: str | None = None
 
 
+def build_test_results(
+    project_dir: Path,
+    *,
+    started_at: str,
+    finished_at: str,
+    results: list[TestResult],
+) -> dict[str, Any]:
+    """
+    Build test_results.json payload containing a run envelope + individual test outcomes.
+    """
+    data = {
+        "metadata": {"tool": "fastflowtransform", "generated_at": _iso_now()},
+        "test_started_at": started_at,
+        "test_finished_at": finished_at,
+        "results": [asdict(r) for r in results],
+    }
+    return data
+
+
 def write_test_results(
     project_dir: Path,
     *,
@@ -374,19 +438,15 @@ def write_test_results(
     finished_at: str,
     results: list[TestResult],
 ) -> Path:
-    """
-    Write test_results.json containing a run envelope + individual test outcomes.
-    """
     project_dir = Path(project_dir)
     out_dir = _target_dir(project_dir)
     path = out_dir / "test_results.json"
-
-    data = {
-        "metadata": {"tool": "fastflowtransform", "generated_at": _iso_now()},
-        "test_started_at": started_at,
-        "test_finished_at": finished_at,
-        "results": [asdict(r) for r in results],
-    }
+    data = build_test_results(
+        project_dir,
+        started_at=started_at,
+        finished_at=finished_at,
+        results=results,
+    )
     _json_dump(path, data)
     return path
 
@@ -407,6 +467,29 @@ class UTestResult:
     spec_path: str = ""
 
 
+def build_utest_results(
+    project_dir: Path,
+    *,
+    started_at: str,
+    finished_at: str,
+    failures: int,
+    results: list[UTestResult],
+    engine: str | None = None,
+) -> dict[str, Any]:
+    """
+    Build utest_results.json payload containing a run envelope + per-case results.
+    """
+    data = {
+        "metadata": {"tool": "fastflowtransform", "generated_at": _iso_now()},
+        "utest_started_at": started_at,
+        "utest_finished_at": finished_at,
+        "engine": engine or "",
+        "failures": int(failures or 0),
+        "results": [asdict(r) for r in results],
+    }
+    return data
+
+
 def write_utest_results(
     project_dir: Path,
     *,
@@ -416,20 +499,16 @@ def write_utest_results(
     results: list[UTestResult],
     engine: str | None = None,
 ) -> Path:
-    """
-    Write utest_results.json containing a run envelope + per-case results.
-    """
     project_dir = Path(project_dir)
     out_dir = _target_dir(project_dir)
     path = out_dir / "utest_results.json"
-
-    data = {
-        "metadata": {"tool": "fastflowtransform", "generated_at": _iso_now()},
-        "utest_started_at": started_at,
-        "utest_finished_at": finished_at,
-        "engine": engine or "",
-        "failures": int(failures or 0),
-        "results": [asdict(r) for r in results],
-    }
+    data = build_utest_results(
+        project_dir,
+        started_at=started_at,
+        finished_at=finished_at,
+        failures=failures,
+        results=results,
+        engine=engine,
+    )
     _json_dump(path, data)
     return path

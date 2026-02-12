@@ -30,6 +30,62 @@ fft docgen . --env dev --out site/docs --emit-json site/docs/docs_manifest.json
 
 This generates the SPA and also writes a manifest you can use for CI checks or custom tooling.
 
+Note: If `artifacts.mode` is set to `db`, docs generation is disabled because it would create local asset files (SPA JS/CSS and JSON). Switch to `files` or `both` to generate docs.
+
+Artifacts configuration lives in your `profiles.yml` under the selected environment. Example:
+
+```yaml
+dev_postgres:
+  engine: postgres
+  postgres:
+    dsn: "{{ env('FF_PG_DSN') }}"
+    db_schema: "{{ env('FF_PG_SCHEMA', 'public') }}"
+
+  artifacts:
+    mode: both          # files | db | both
+    engine: postgres    # currently only postgres supported
+    postgres:
+      dsn: "{{ env('FF_ARTIFACTS_PG_DSN') }}"
+      db_schema: "{{ env('FF_ARTIFACTS_PG_SCHEMA', 'public') }}"  # or `schema: ...`
+```
+
+Env overrides:
+- `FF_ARTIFACTS_MODE` overrides `artifacts.mode`.
+- `FF_ARTIFACTS_PG_DSN` overrides `artifacts.postgres.dsn`.
+- `FF_ARTIFACTS_PG_SCHEMA` overrides `artifacts.postgres.db_schema` (or `schema`).
+
+Validation rules:
+- `mode: files` does not require any Postgres settings.
+- `mode: db` or `both` requires `artifacts.engine=postgres` and a valid `dsn` + `db_schema`.
+
+Frontend contract (SPA data sources):
+- The SPA reads globals (if present) to resolve artifact URLs:
+  - `__FFT_MANIFEST_PATH__`
+  - `__FFT_RUN_RESULTS_PATH__`
+  - `__FFT_TEST_RESULTS_PATH__`
+  - `__FFT_UTEST_RESULTS_PATH__`
+  - `__FFT_ARTIFACTS_API_BASE__`
+  - `__FFT_ENV__`
+  - `__FFT_ENGINE__`
+  - `__FFT_RUN_ID__`
+- URL resolution order:
+  1. Explicit `__FFT_*_PATH__` globals
+  2. API base + params (`__FFT_ARTIFACTS_API_BASE__` with env/engine/run_id)
+  3. Query params (`?manifest=...&run=...&test=...&utest=...`)
+  4. Local assets (`assets/*.json`)
+- Expected endpoint shapes (examples):
+  - Latest by env/engine:
+    - `/artifacts/latest/docs_manifest?env=<env>&engine=<engine>`
+    - `/artifacts/latest/run_results?env=<env>&engine=<engine>`
+    - `/artifacts/latest/test_results?env=<env>&engine=<engine>`
+    - `/artifacts/latest/utest_results?env=<env>&engine=<engine>`
+  - Specific run:
+    - `/artifacts/run/<run_id>/docs_manifest`
+    - `/artifacts/run/<run_id>/run_results`
+    - `/artifacts/run/<run_id>/test_results`
+    - `/artifacts/run/<run_id>/utest_results`
+- Response payload can be either raw JSON or wrapped as `{ payload: {...} }` or `{ data: {...} }`.
+
 ### Classic (DAG-only)
 
 ```bash
@@ -353,6 +409,7 @@ If your build outputs runtime artifacts (run results, tests), the portal can dis
 - optional unit test results
 
 This is intended to be lightweight and opt-in: docs remain usable without it.
+In `artifacts.mode=db`, runtime artifacts are stored in Postgres and the docs site is not generated, so the health strip is unavailable.
 
 ---
 

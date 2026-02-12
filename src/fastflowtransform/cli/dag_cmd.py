@@ -43,6 +43,10 @@ def dag(
     filtered_nodes = {k: v for k, v in REGISTRY.nodes.items() if pred(v)}
 
     if html:
+        if (ctx.artifacts_mode or "files").strip().lower() == "db":
+            raise typer.BadParameter(
+                "HTML DAG generation is disabled when artifacts.mode=db (no asset files allowed)."
+            )
         ex, *_ = ctx.make_executor()
         try:
             render_site(dag_out, filtered_nodes, executor=ex, with_schema=with_schema)
